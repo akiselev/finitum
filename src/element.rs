@@ -8,7 +8,7 @@ pub struct QuadraturePoint {
 }
 
 /// Concrete basis and quadrature data prepared for one reference element.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PreparedElement {
     dimension: usize,
     basis_count: usize,
@@ -27,27 +27,47 @@ impl PreparedElement {
         basis_values: Vec<f64>,
         basis_gradients: Vec<f64>,
     ) -> Result<Self, FinitumError> {
-        if dimension == 0 || basis_count == 0 {
+        if !(1..=3).contains(&dimension) || basis_count == 0 || quadrature.is_empty() {
             return Err(FinitumError::InvalidElementShape(
-                "dimension and basis count must be non-zero".into(),
+                "dimension must be in 1..=3; basis and quadrature counts must be non-zero".into(),
             ));
         }
-        for point in &quadrature {
+        for (point_index, point) in quadrature.iter().enumerate() {
             if point.coordinates.len() != dimension {
                 return Err(FinitumError::InvalidElementShape(format!(
                     "quadrature coordinate has dimension {}, expected {dimension}",
                     point.coordinates.len()
                 )));
             }
+            if !point.weight.is_finite() || point.coordinates.iter().any(|value| !value.is_finite())
+            {
+                return Err(FinitumError::NonFiniteElementData {
+                    location: format!("quadrature point {point_index}"),
+                });
+            }
         }
-        let values = quadrature.len() * basis_count;
-        let gradients = values * dimension;
+        let values = quadrature.len().checked_mul(basis_count).ok_or_else(|| {
+            FinitumError::InvalidElementShape("basis table extent overflows usize".into())
+        })?;
+        let gradients = values.checked_mul(dimension).ok_or_else(|| {
+            FinitumError::InvalidElementShape("gradient table extent overflows usize".into())
+        })?;
         if basis_values.len() != values || basis_gradients.len() != gradients {
             return Err(FinitumError::InvalidElementShape(format!(
                 "got {} values and {} gradients; expected {values} and {gradients}",
                 basis_values.len(),
                 basis_gradients.len()
             )));
+        }
+        if let Some(index) = basis_values.iter().position(|value| !value.is_finite()) {
+            return Err(FinitumError::NonFiniteElementData {
+                location: format!("basis value {index}"),
+            });
+        }
+        if let Some(index) = basis_gradients.iter().position(|value| !value.is_finite()) {
+            return Err(FinitumError::NonFiniteElementData {
+                location: format!("basis gradient {index}"),
+            });
         }
         Ok(Self {
             dimension,

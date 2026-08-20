@@ -15,8 +15,9 @@ pub struct AffineConstraint {
     pub offset: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ConstraintSet {
+    dof_count: usize,
     constraints: BTreeMap<DofId, AffineConstraint>,
 }
 
@@ -30,14 +31,37 @@ impl ConstraintSet {
             if constraint.target.0 >= dof_count {
                 return Err(FinitumError::InvalidConstraintTarget(constraint.target.0));
             }
+            let mut dependencies = BTreeSet::new();
             for dependency in &constraint.dependencies {
                 if dependency.dof.0 >= dof_count {
                     return Err(FinitumError::InvalidConstraintDependency(dependency.dof.0));
                 }
+                if !dependencies.insert(dependency.dof) {
+                    return Err(FinitumError::DuplicateConstraintDependency {
+                        target: constraint.target.0,
+                        dependency: dependency.dof.0,
+                    });
+                }
+                if !dependency.weight.is_finite() {
+                    return Err(FinitumError::InvalidConstraintCoefficient {
+                        target: constraint.target.0,
+                    });
+                }
             }
-            map.insert(constraint.target, constraint);
+            if !constraint.offset.is_finite() {
+                return Err(FinitumError::InvalidConstraintCoefficient {
+                    target: constraint.target.0,
+                });
+            }
+            let target = constraint.target;
+            if map.insert(target, constraint).is_some() {
+                return Err(FinitumError::DuplicateConstraintTarget(target.0));
+            }
         }
-        let set = Self { constraints: map };
+        let set = Self {
+            dof_count,
+            constraints: map,
+        };
         set.validate_acyclic()?;
         Ok(set)
     }
@@ -47,6 +71,15 @@ impl ConstraintSet {
     }
 
     pub fn expand(&self, unconstrained: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        if unconstrained.len() != self.dof_count {
+            return Err(FinitumError::ConstraintInputLength {
+                actual: unconstrained.len(),
+                expected: self.dof_count,
+            });
+        }
+        if let Some(dof) = unconstrained.iter().position(|value| !value.is_finite()) {
+            return Err(FinitumError::NonFiniteConstraintInput(dof));
+        }
         let mut values = unconstrained.to_vec();
         let mut resolved = BTreeSet::new();
         for target in self.constraints.keys().copied() {
@@ -71,6 +104,9 @@ impl ConstraintSet {
         for dependency in &constraint.dependencies {
             self.resolve(dependency.dof, values, resolved)?;
             value += dependency.weight * values[dependency.dof.0];
+        }
+        if !value.is_finite() {
+            return Err(FinitumError::NonFiniteConstraintResult(target.0));
         }
         values[target.0] = value;
         resolved.insert(target);

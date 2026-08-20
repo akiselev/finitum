@@ -1,5 +1,6 @@
 use crate::FinitumError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VertexId(pub usize);
@@ -12,7 +13,7 @@ pub struct Cell {
     pub vertices: Vec<VertexId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Mesh {
     dimension: usize,
     vertices: Vec<Vec<f64>>,
@@ -36,6 +37,9 @@ impl Mesh {
                     expected: dimension,
                 });
             }
+            if let Some(axis) = coordinates.iter().position(|value| !value.is_finite()) {
+                return Err(FinitumError::NonFiniteCoordinate { vertex, axis });
+            }
         }
         let expected = dimension + 1;
         for (cell_id, cell) in cells.iter().enumerate() {
@@ -46,9 +50,16 @@ impl Mesh {
                     expected,
                 });
             }
+            let mut distinct = BTreeSet::new();
             for vertex in &cell.vertices {
                 if vertex.0 >= vertices.len() {
                     return Err(FinitumError::MissingVertex {
+                        cell: cell_id,
+                        vertex: vertex.0,
+                    });
+                }
+                if !distinct.insert(*vertex) {
+                    return Err(FinitumError::DuplicateCellVertex {
                         cell: cell_id,
                         vertex: vertex.0,
                     });
