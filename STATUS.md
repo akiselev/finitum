@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: FC6 discrete realization complete
+Milestone: FC7 stateful realization complete
 
 ## Implemented
 
@@ -21,6 +21,14 @@ Milestone: FC6 discrete realization complete
 - fixed essential-value lifting and homogeneous identity-row operator action;
 - one `RealizationPlan` producing matrix-free and canonical CSR assembled operators through the
   same generated JVP execution; both implement Solverang `LinearOperator` directly.
+- independent runtime state and state-rate basis bindings for generated primal residuals;
+- generated JVP evaluation at the actual linearization point, with independent state/rate
+  directions;
+- dynamic quadrature-point external inputs and chain-rule composition through generated
+  parameter-JVP kernels;
+- fixed essential residual rows and their consistent state-direction JVP rows.
+- deterministic concrete-plan identity covering the artifact chain, mesh, element, DOF map,
+  constraints, stored external values, and caller-declared dynamic-input identities.
 
 ## Boundary
 
@@ -33,9 +41,10 @@ plan consumes their concrete artifacts and trait. FC6 supports scalar H1(order=1
 and fixed essential constraints. Other spaces, facet traversal, affine dependency elimination,
 partial assembly, and optimized backends remain deferred.
 
-The linear operator evaluates generated JVPs at zero active input; nonlinear forms require a
-future state-bearing linearization contract. Concrete constrained DOFs and their values are
-caller-supplied: FC6 verifies that semantic and concrete constraints are both present and that
+The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
+the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
+constrained DOFs and their values are caller-supplied: Finitum verifies that semantic and concrete
+constraints are both present and that
 their extents are valid, but the mesh has no boundary-region tags with which to prove partition
 membership. Point-kernel buffers are allocated per invocation, external sampling prepares its
 own cell geometry, and reference CSR assembly performs one operator action per column; these are
@@ -49,7 +58,7 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 8 passed, 0 failed
+cargo test --all-targets           # 10 passed, 0 failed
 git diff --check
 ```
 
@@ -57,7 +66,10 @@ The realization gate includes an independent affine patch test on a nonuniform s
 with `k = 1`, `f = 0`, and nonzero linear Dirichlet data, both realized operators reproduce every
 exact P1 nodal value within `1e-12`.
 
+The FC7 gate compiles a transient nonlinear form and verifies the combined generated state/rate
+and dynamic-property JVP against centered differences.
+
 ## Next
 
-Extend realization only when FC7 or later acceptance cases require another concrete evaluation,
+Extend realization only when FC8 or later acceptance cases require another concrete evaluation,
 constraint, traversal, or assembly contract.

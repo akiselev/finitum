@@ -66,6 +66,7 @@ dependencies = [
  "quantitas",
  "resolvent",
  "serde",
+ "serde_json",
  "solverang",
  "thiserror",
 ]

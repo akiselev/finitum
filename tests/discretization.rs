@@ -1,11 +1,13 @@
 use finitum::{
-    AffineConstraint, Cell, ConstraintSet, DofId, DofMap, ElementRestriction, ExternalInput,
-    FinitumError, Mesh, PreparedElement, QuadraturePoint, RealizationPlan, VertexId, WeightedDof,
+    AffineConstraint, Cell, ConstraintSet, DofId, DofMap, DynamicExternalInput, ElementRestriction,
+    ExternalInput, FinitumError, Mesh, PreparedElement, QuadraturePoint, RealizationPlan, VertexId,
+    WeightedDof,
 };
 use quantitas::UnitRegistry;
 use resolvent::{
-    InputSourceRequirement, TensorInputRole, compile_semantics, derive_variational_form,
-    factor_operator, infer_form_requirements, lower_operator_kernels,
+    DerivativeEvaluation, InputSourceRequirement, TensorInputId, TensorInputRole,
+    compile_semantics, derive_variational_form, factor_operator, infer_form_requirements,
+    lower_operator_kernels,
 };
 use solverang::{
     ConjugateGradientConfig, EvaluationContext, LinearOperator, solve_conjugate_gradient,
@@ -20,6 +22,19 @@ model Poisson {
   source f: VolumetricSource;
   equation balance on Omega { -div(k * grad(u)) = f; }
   boundary walls on boundary("walls") { dirichlet u = exact_u(); }
+}
+"#;
+
+const TRANSIENT_NONLINEAR: &str = r#"
+module fc7.transient_nonlinear;
+model TransientNonlinear {
+  domain Omega { dimension = 2; coordinates = cartesian; }
+  field u: state scalar H1(order=1) on Omega { time_role = differential; };
+  property capacity = storage_capacity(u);
+  property k = diffusivity(u);
+  source f: VolumetricSource;
+  equation evolution on Omega { capacity * dt(u) - div(k * grad(u)) = f; }
+  boundary walls on boundary("walls") { dirichlet u = exact_u(t); }
 }
 "#;
 
@@ -231,6 +246,14 @@ fn prepared_element_rejects_shape_and_nonfinite_tables() {
             location: "basis value 0".into(),
         }
     );
+}
+
+#[test]
+fn dynamic_external_input_requires_an_explicit_identity() {
+    assert!(matches!(
+        DynamicExternalInput::new(0, TensorInputId(0), 1, " ", |_| vec![1.0], |_, _| vec![0.0],),
+        Err(FinitumError::InvalidRealization(_))
+    ));
 }
 
 #[test]
@@ -469,6 +492,133 @@ fn fc6_refuses_a_kernel_bundle_from_another_factorization() {
     )
     .unwrap_err();
     assert!(matches!(error, FinitumError::ArtifactMismatch(_)));
+}
+
+#[test]
+fn fc7_runtime_state_rate_and_property_chain_rule_match_finite_differences() {
+    let compilation =
+        compile_semantics(TRANSIENT_NONLINEAR, &UnitRegistry::si_bootstrap()).unwrap();
+    let form =
+        derive_variational_form(&compilation.semantic, "TransientNonlinear", "evolution").unwrap();
+    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let kernels = lower_operator_kernels(&factorization).unwrap();
+    let (mesh, dofs, constraints) = square_discretization(2);
+    let element = PreparedElement::linear_simplex(2).unwrap();
+    let model = &compilation.semantic.models[0];
+    let mut stored = Vec::new();
+    let mut dynamic = Vec::new();
+    for integral in &factorization.integrals {
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let name = &model.symbols[input.binding.symbol.index()].name;
+            match name.as_str() {
+                "capacity" => dynamic.push(
+                    DynamicExternalInput::new(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        "capacity=1;direction=0/v1",
+                        |_| vec![1.0],
+                        |_, _| vec![0.0],
+                    )
+                    .unwrap(),
+                ),
+                "k" => dynamic.push(
+                    DynamicExternalInput::new(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        "k=1+0.2u;direction=0.2du/v1",
+                        |evaluation| {
+                            vec![
+                                1.0 + 0.2
+                                    * evaluation.values(DerivativeEvaluation::Value).unwrap()[0],
+                            ]
+                        },
+                        |_, direction| {
+                            vec![0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0]]
+                        },
+                    )
+                    .unwrap(),
+                ),
+                "f" => stored.push(
+                    ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        &mesh,
+                        &element,
+                        |_, _| vec![0.0],
+                    )
+                    .unwrap(),
+                ),
+                other => panic!("unexpected external input {other}"),
+            }
+        }
+    }
+    let plan = RealizationPlan::new_stateful(
+        requirements,
+        factorization,
+        kernels,
+        mesh,
+        element,
+        dofs,
+        constraints,
+        stored,
+        dynamic,
+    )
+    .unwrap();
+    assert_eq!(plan.digest().algorithm, "blake3");
+    let state = vec![0.0, 0.0, 0.0, 0.0, 0.35, 0.0, 0.0, 0.0, 0.0];
+    let rate = vec![0.0, 0.0, 0.0, 0.0, -0.17, 0.0, 0.0, 0.0, 0.0];
+    let state_direction = vec![0.0, 0.0, 0.0, 0.0, 0.73, 0.0, 0.0, 0.0, 0.0];
+    let rate_direction = vec![0.0, 0.0, 0.0, 0.0, -0.41, 0.0, 0.0, 0.0, 0.0];
+    let mut analytic = vec![0.0; plan.dimension()];
+    plan.jacobian_vector_product(
+        0.3,
+        &state,
+        &rate,
+        &state_direction,
+        &rate_direction,
+        &mut analytic,
+    )
+    .unwrap();
+    let epsilon = 1.0e-6;
+    let plus_state = state
+        .iter()
+        .zip(&state_direction)
+        .map(|(value, direction)| value + epsilon * direction)
+        .collect::<Vec<_>>();
+    let minus_state = state
+        .iter()
+        .zip(&state_direction)
+        .map(|(value, direction)| value - epsilon * direction)
+        .collect::<Vec<_>>();
+    let plus_rate = rate
+        .iter()
+        .zip(&rate_direction)
+        .map(|(value, direction)| value + epsilon * direction)
+        .collect::<Vec<_>>();
+    let minus_rate = rate
+        .iter()
+        .zip(&rate_direction)
+        .map(|(value, direction)| value - epsilon * direction)
+        .collect::<Vec<_>>();
+    let mut plus = vec![0.0; plan.dimension()];
+    let mut minus = vec![0.0; plan.dimension()];
+    plan.residual(0.3, &plus_state, &plus_rate, &mut plus)
+        .unwrap();
+    plan.residual(0.3, &minus_state, &minus_rate, &mut minus)
+        .unwrap();
+    let finite_difference = plus
+        .iter()
+        .zip(&minus)
+        .map(|(plus, minus)| (plus - minus) / (2.0 * epsilon))
+        .collect::<Vec<_>>();
+    assert_close(&analytic, &finite_difference, 2.0e-9);
 }
 
 fn square_discretization(subdivisions: usize) -> (Mesh, DofMap, ConstraintSet) {

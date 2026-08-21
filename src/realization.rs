@@ -12,6 +12,7 @@ use resolvent::{
     SemanticMeasure, StructuredOperatorKernels, StructuredPointKernelBundle, TensorInputId,
     TensorInputRole,
 };
+use serde::Serialize;
 use solverang::{CsrMatrix, EvaluationContext, LinearOperator, NumericError};
 
 use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};
@@ -23,6 +24,102 @@ pub struct ExternalInput {
     pub input: TensorInputId,
     component_count: usize,
     values: Vec<f64>,
+}
+
+/// One basis-backed active input evaluated at a quadrature point.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointActiveInput {
+    pub input: TensorInputId,
+    pub derivative: DerivativeEvaluation,
+    pub values: Vec<f64>,
+}
+
+/// Runtime point data supplied to a state-dependent external input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointEvaluation {
+    pub time: f64,
+    pub cell: CellId,
+    pub coordinates: Vec<f64>,
+    pub active: Vec<PointActiveInput>,
+}
+
+impl PointEvaluation {
+    /// Return the first active binding with the requested evaluation kind.
+    pub fn values(&self, derivative: DerivativeEvaluation) -> Option<&[f64]> {
+        self.active
+            .iter()
+            .find(|input| input.derivative == derivative)
+            .map(|input| input.values.as_slice())
+    }
+}
+
+type PointValueEvaluator = dyn Fn(&PointEvaluation) -> Vec<f64> + Send + Sync;
+type PointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync;
+
+/// A non-basis QFunction input evaluated from the current point state.
+///
+/// The callbacks are supplied by the consuming product or material implementation. Finitum
+/// only binds their values and directional derivatives into generated parameter-JVP kernels.
+/// `identity` must change whenever either callback's semantics change. The direction callback is
+/// trusted to return the exact directional derivative of the value callback; products should
+/// retain centered-difference acceptance checks for every authored dynamic binding.
+#[derive(Clone)]
+pub struct DynamicExternalInput {
+    pub integral_index: usize,
+    pub input: TensorInputId,
+    component_count: usize,
+    identity: String,
+    value: Arc<PointValueEvaluator>,
+    direction: Arc<PointDirectionEvaluator>,
+}
+
+impl std::fmt::Debug for DynamicExternalInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicExternalInput")
+            .field("integral_index", &self.integral_index)
+            .field("input", &self.input)
+            .field("component_count", &self.component_count)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DynamicExternalInput {
+    pub fn new(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: impl Into<String>,
+        value: impl Fn(&PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
+        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
+    ) -> Result<Self, FinitumError> {
+        if component_count == 0 {
+            return Err(FinitumError::InvalidRealization(
+                "dynamic external input component count must be non-zero".into(),
+            ));
+        }
+        let identity = identity.into();
+        if identity.trim().is_empty() {
+            return Err(FinitumError::InvalidRealization(
+                "dynamic external input identity must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            integral_index,
+            input,
+            component_count,
+            identity,
+            value: Arc::new(value),
+            direction: Arc::new(direction),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ExternalBinding {
+    Stored(ExternalInput),
+    Dynamic(DynamicExternalInput),
 }
 
 impl ExternalInput {
@@ -98,6 +195,7 @@ struct BoundBundle {
 
 #[derive(Clone, Debug)]
 struct RealizationData {
+    digest: Digest,
     requirements: FormRequirements,
     factorization: OperatorFactorization,
     mesh: Mesh,
@@ -105,17 +203,17 @@ struct RealizationData {
     geometries: Vec<CellGeometry>,
     dofs: DofMap,
     constraints: ConstraintSet,
-    external: BTreeMap<(usize, TensorInputId), ExternalInput>,
+    external: BTreeMap<(usize, TensorInputId), ExternalBinding>,
     bundles: BTreeMap<(usize, usize), BoundBundle>,
 }
 
 /// Digest-linked binding of FC3 requirements, an FC4 factorization, FC5 executables, and
 /// concrete mesh/element/DOF/constraint/input data.
 ///
-/// FC6 realizes a globally linear operator by evaluating generated JVPs at zero active input.
-/// A nonlinear residual must not reuse this plan: its linearization point belongs in the future
-/// stateful realization contract. Semantic boundary requirements are linked to the artifact
-/// chain, but the caller currently supplies the concrete boundary-DOF membership.
+/// The FC6 linear view evaluates generated JVPs at zero active input. FC7 residual and JVP methods
+/// instead bind independent runtime state and state-rate vectors at the actual linearization
+/// point. Semantic boundary requirements are linked to the artifact chain, but the caller
+/// currently supplies the concrete boundary-DOF membership.
 #[derive(Clone, Debug)]
 pub struct RealizationPlan {
     data: Arc<RealizationData>,
@@ -133,6 +231,32 @@ impl RealizationPlan {
         constraints: ConstraintSet,
         external_inputs: Vec<ExternalInput>,
     ) -> Result<Self, FinitumError> {
+        Self::new_stateful(
+            requirements,
+            factorization,
+            kernels,
+            mesh,
+            element,
+            dofs,
+            constraints,
+            external_inputs,
+            Vec::new(),
+        )
+    }
+
+    /// Bind a realization whose non-basis inputs may depend on the runtime point state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_stateful(
+        requirements: FormRequirements,
+        factorization: OperatorFactorization,
+        kernels: StructuredOperatorKernels,
+        mesh: Mesh,
+        element: PreparedElement,
+        dofs: DofMap,
+        constraints: ConstraintSet,
+        external_inputs: Vec<ExternalInput>,
+        dynamic_external_inputs: Vec<DynamicExternalInput>,
+    ) -> Result<Self, FinitumError> {
         validate_artifacts(&requirements, &factorization, &kernels)?;
         validate_discretization(
             &requirements,
@@ -142,13 +266,30 @@ impl RealizationPlan {
             &dofs,
             &constraints,
         )?;
-        let external = validate_external_inputs(&factorization, &mesh, &element, external_inputs)?;
+        let external = validate_external_inputs(
+            &factorization,
+            &mesh,
+            &element,
+            external_inputs,
+            dynamic_external_inputs,
+        )?;
+        let digest = realization_digest(
+            &requirements,
+            &factorization,
+            &kernels,
+            &mesh,
+            &element,
+            &dofs,
+            &constraints,
+            &external,
+        );
         let bundles = bind_kernels(&factorization, kernels)?;
         let geometries = (0..mesh.cells().len())
             .map(|cell| CellGeometry::new(&mesh, CellId(cell)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             data: Arc::new(RealizationData {
+                digest,
                 requirements,
                 factorization,
                 mesh,
@@ -170,12 +311,65 @@ impl RealizationPlan {
         &self.data.mesh
     }
 
+    /// Digest of the concrete realization, including discretization, constraints, and external
+    /// input descriptors. Dynamic callbacks are represented by their required caller identity.
+    pub fn digest(&self) -> &Digest {
+        &self.data.digest
+    }
+
     pub fn source_factorization_digest(&self) -> &Digest {
         &self.data.factorization.artifact_digest
     }
 
     pub fn source_requirements_digest(&self) -> &Digest {
         &self.data.requirements.artifact_digest
+    }
+
+    /// Evaluate the generated global residual at independent state and state-rate vectors.
+    pub fn residual(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.validate_time_action(time, state, state_rate, output)?;
+        output.fill(0.0);
+        self.apply_cells(time, state, state_rate, None, None, output, Action::Primal)?;
+        for constraint in self.data.constraints.constraints() {
+            output[constraint.target.0] = state[constraint.target.0] - constraint.offset;
+        }
+        validate_finite("stateful residual", output)
+    }
+
+    /// Evaluate the generated state/rate JVP plus the chain rule through dynamic external inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn jacobian_vector_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        state_direction: &[f64],
+        rate_direction: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.validate_time_action(time, state, state_rate, output)?;
+        self.validate_action(state_direction, output)?;
+        self.validate_action(rate_direction, output)?;
+        output.fill(0.0);
+        self.apply_cells(
+            time,
+            state,
+            state_rate,
+            Some(state_direction),
+            Some(rate_direction),
+            output,
+            Action::Jvp,
+        )?;
+        for constraint in self.data.constraints.constraints() {
+            output[constraint.target.0] = state_direction[constraint.target.0];
+        }
+        validate_finite("stateful JVP", output)
     }
 
     /// Return the zero-active-state JVP realization for this globally linear FC6 plan.
@@ -233,7 +427,16 @@ impl RealizationPlan {
             homogeneous[constraint.target.0] = 0.0;
         }
         output.fill(0.0);
-        self.apply_cells(&homogeneous, output, Action::Jvp)?;
+        let zero = vec![0.0; self.dimension()];
+        self.apply_cells(
+            0.0,
+            &zero,
+            &zero,
+            Some(&homogeneous),
+            Some(&zero),
+            output,
+            Action::Jvp,
+        )?;
         for constraint in self.data.constraints.constraints() {
             output[constraint.target.0] = input[constraint.target.0];
         }
@@ -243,8 +446,25 @@ impl RealizationPlan {
     fn apply_primal(&self, state: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
         self.validate_action(state, output)?;
         output.fill(0.0);
-        self.apply_cells(state, output, Action::Primal)?;
+        let zero = vec![0.0; self.dimension()];
+        self.apply_cells(0.0, state, &zero, None, None, output, Action::Primal)?;
         validate_finite("primal residual", output)
+    }
+
+    fn validate_time_action(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        output: &[f64],
+    ) -> Result<(), FinitumError> {
+        if !time.is_finite() {
+            return Err(FinitumError::InvalidRealization(
+                "operator evaluation time must be finite".into(),
+            ));
+        }
+        self.validate_action(state, output)?;
+        self.validate_action(state_rate, output)
     }
 
     fn validate_action(&self, input: &[f64], output: &[f64]) -> Result<(), FinitumError> {
@@ -259,9 +479,14 @@ impl RealizationPlan {
         validate_finite("operator input", input)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_cells(
         &self,
+        time: f64,
         state: &[f64],
+        state_rate: &[f64],
+        state_direction: Option<&[f64]>,
+        rate_direction: Option<&[f64]>,
         output: &mut [f64],
         action: Action,
     ) -> Result<(), FinitumError> {
@@ -272,6 +497,25 @@ impl RealizationPlan {
                 .iter()
                 .map(|dof| state[dof.0])
                 .collect::<Vec<_>>();
+            let local_rate = restriction
+                .dofs
+                .iter()
+                .map(|dof| state_rate[dof.0])
+                .collect::<Vec<_>>();
+            let local_state_direction = state_direction.map(|direction| {
+                restriction
+                    .dofs
+                    .iter()
+                    .map(|dof| direction[dof.0])
+                    .collect::<Vec<_>>()
+            });
+            let local_rate_direction = rate_direction.map(|direction| {
+                restriction
+                    .dofs
+                    .iter()
+                    .map(|dof| direction[dof.0])
+                    .collect::<Vec<_>>()
+            });
             let mut local_output = vec![0.0; restriction.dofs.len()];
             for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
                 let scale = point.weight * geometry.determinant;
@@ -285,7 +529,9 @@ impl RealizationPlan {
                                 cell_index,
                                 point_index,
                                 geometry,
+                                time,
                                 &local_state,
+                                &local_rate,
                             )?,
                             Action::Jvp => self.execute_jvp(
                                 bound,
@@ -293,7 +539,19 @@ impl RealizationPlan {
                                 cell_index,
                                 point_index,
                                 geometry,
+                                time,
                                 &local_state,
+                                &local_rate,
+                                local_state_direction.as_deref().ok_or_else(|| {
+                                    FinitumError::InvalidRealization(
+                                        "JVP action is missing a state direction".into(),
+                                    )
+                                })?,
+                                local_rate_direction.as_deref().ok_or_else(|| {
+                                    FinitumError::InvalidRealization(
+                                        "JVP action is missing a rate direction".into(),
+                                    )
+                                })?,
                             )?,
                         };
                         apply_basis_adjoint(
@@ -315,6 +573,7 @@ impl RealizationPlan {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_primal(
         &self,
         bound: &BoundBundle,
@@ -322,9 +581,19 @@ impl RealizationPlan {
         cell: usize,
         point: usize,
         geometry: &CellGeometry,
+        time: f64,
         local_state: &[f64],
+        local_rate: &[f64],
     ) -> Result<Vec<f64>, FinitumError> {
-        let inputs = self.point_inputs(integral, cell, point, geometry, local_state)?;
+        let (inputs, _) = self.point_inputs(
+            integral,
+            cell,
+            point,
+            geometry,
+            time,
+            local_state,
+            local_rate,
+        )?;
         let values = bound
             .bundle
             .primal_inputs
@@ -353,6 +622,7 @@ impl RealizationPlan {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_jvp(
         &self,
         bound: &BoundBundle,
@@ -360,9 +630,31 @@ impl RealizationPlan {
         cell: usize,
         point: usize,
         geometry: &CellGeometry,
-        local_direction: &[f64],
+        time: f64,
+        local_state: &[f64],
+        local_rate: &[f64],
+        local_state_direction: &[f64],
+        local_rate_direction: &[f64],
     ) -> Result<Vec<f64>, FinitumError> {
-        let directions = self.point_inputs(integral, cell, point, geometry, local_direction)?;
+        let (inputs, evaluation) = self.point_inputs(
+            integral,
+            cell,
+            point,
+            geometry,
+            time,
+            local_state,
+            local_rate,
+        )?;
+        let directions = self.point_directions(
+            integral,
+            cell,
+            point,
+            geometry,
+            time,
+            local_state_direction,
+            local_rate_direction,
+            &evaluation,
+        )?;
         let input_by_operand = bound
             .bundle
             .primal_inputs
@@ -371,23 +663,7 @@ impl RealizationPlan {
             .collect::<BTreeMap<_, _>>();
         let mut values = BTreeMap::new();
         for binding in &bound.bundle.primal_inputs {
-            let input = integral
-                .primal
-                .inputs
-                .iter()
-                .find(|input| input.id == binding.input)
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(format!(
-                        "bundle input {:?} is absent from integral {}",
-                        binding.input, integral.integral_index
-                    ))
-                })?;
-            let primal = if input.role == TensorInputRole::Active {
-                vec![0.0; component_count(&input.shape)?]
-            } else {
-                directions[&binding.input].clone()
-            };
-            values.insert(binding.operand, primal);
+            values.insert(binding.operand, inputs[&binding.input].clone());
         }
         for pair in &bound.bundle.jvp.independent_operands {
             let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
@@ -400,36 +676,152 @@ impl RealizationPlan {
         }
         let executable = &bound.executable.kernels()[bound.bundle.jvp.kernel_index];
         let buffers = execute(executable, &values)?;
-        operand_values(
+        let mut output = operand_values(
             executable,
             &buffers,
             bound.bundle.jvp.dependent_operands[0].derivative,
-        )
+        )?;
+
+        let mut parameter_values = bound
+            .bundle
+            .primal_inputs
+            .iter()
+            .map(|binding| (binding.operand, inputs[&binding.input].clone()))
+            .collect::<BTreeMap<_, _>>();
+        for pair in &bound.bundle.parameter.independent_operands {
+            let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "parameter-JVP operand {:?} has no QFunction input binding",
+                    pair.primal
+                ))
+            })?;
+            parameter_values.insert(pair.derivative, directions[input].clone());
+        }
+        let parameter_executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+        let parameter_buffers = execute(parameter_executable, &parameter_values)?;
+        let parameter_output = operand_values(
+            parameter_executable,
+            &parameter_buffers,
+            bound.bundle.parameter.dependent_operands[0].derivative,
+        )?;
+        for (value, parameter) in output.iter_mut().zip(parameter_output) {
+            *value += parameter;
+        }
+        Ok(output)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn point_inputs(
         &self,
         integral: &IntegralOperatorFactorization,
         cell: usize,
         point: usize,
         geometry: &CellGeometry,
+        time: f64,
         local_state: &[f64],
-    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
-        integral
-            .primal
-            .inputs
-            .iter()
-            .map(|input| {
-                let values = if input.source == InputSourceRequirement::Basis {
-                    evaluate_basis_input(&self.data.element, geometry, point, input, local_state)?
+        local_rate: &[f64],
+    ) -> Result<(BTreeMap<TensorInputId, Vec<f64>>, PointEvaluation), FinitumError> {
+        let mut inputs = BTreeMap::new();
+        let mut active = Vec::new();
+        for input in &integral.primal.inputs {
+            if input.source != InputSourceRequirement::Basis {
+                continue;
+            }
+            let dofs =
+                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                    local_rate
                 } else {
-                    self.data.external[&(integral.integral_index, input.id)]
-                        .point_values(cell, point, self.data.element.quadrature().len())
-                        .to_vec()
+                    local_state
                 };
-                Ok((input.id, values))
-            })
-            .collect()
+            let values = evaluate_basis_input(&self.data.element, geometry, point, input, dofs)?;
+            if input.role == TensorInputRole::Active {
+                active.push(PointActiveInput {
+                    input: input.id,
+                    derivative: input.binding.evaluation.derivative,
+                    values: values.clone(),
+                });
+            }
+            inputs.insert(input.id, values);
+        }
+        let evaluation = PointEvaluation {
+            time,
+            cell: CellId(cell),
+            coordinates: geometry
+                .physical_point(&self.data.element.quadrature()[point].coordinates),
+            active,
+        };
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let binding = &self.data.external[&(integral.integral_index, input.id)];
+            let values = match binding {
+                ExternalBinding::Stored(stored) => stored
+                    .point_values(cell, point, self.data.element.quadrature().len())
+                    .to_vec(),
+                ExternalBinding::Dynamic(dynamic) => (dynamic.value)(&evaluation),
+            };
+            validate_components(input, &values, "external input")?;
+            inputs.insert(input.id, values);
+        }
+        Ok((inputs, evaluation))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn point_directions(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        cell: usize,
+        point: usize,
+        geometry: &CellGeometry,
+        time: f64,
+        local_state_direction: &[f64],
+        local_rate_direction: &[f64],
+        evaluation: &PointEvaluation,
+    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
+        let mut directions = BTreeMap::new();
+        let mut active = Vec::new();
+        for input in &integral.primal.inputs {
+            if input.source != InputSourceRequirement::Basis {
+                continue;
+            }
+            let dofs =
+                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                    local_rate_direction
+                } else {
+                    local_state_direction
+                };
+            let values = evaluate_basis_input(&self.data.element, geometry, point, input, dofs)?;
+            if input.role == TensorInputRole::Active {
+                active.push(PointActiveInput {
+                    input: input.id,
+                    derivative: input.binding.evaluation.derivative,
+                    values: values.clone(),
+                });
+            }
+            directions.insert(input.id, values);
+        }
+        let direction_evaluation = PointEvaluation {
+            time,
+            cell: CellId(cell),
+            coordinates: evaluation.coordinates.clone(),
+            active,
+        };
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let binding = &self.data.external[&(integral.integral_index, input.id)];
+            let values = match binding {
+                ExternalBinding::Stored(stored) => vec![0.0; stored.component_count],
+                ExternalBinding::Dynamic(dynamic) => {
+                    (dynamic.direction)(evaluation, &direction_evaluation)
+                }
+            };
+            validate_components(input, &values, "external input direction")?;
+            directions.insert(input.id, values);
+        }
+        Ok(directions)
     }
 }
 
@@ -509,6 +901,80 @@ impl LinearOperator for AssembledOperator {
     ) -> Result<(), NumericError> {
         self.matrix.apply(context, input, output)
     }
+}
+
+#[derive(Serialize)]
+struct RealizationDigestPayload<'a> {
+    schema: &'static str,
+    requirements: &'a Digest,
+    factorization: &'a Digest,
+    kernels: &'a Digest,
+    mesh: &'a Mesh,
+    element: &'a PreparedElement,
+    dofs: &'a DofMap,
+    constraints: &'a ConstraintSet,
+    external: Vec<ExternalBindingDescriptor<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExternalBindingDescriptor<'a> {
+    Stored {
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        values: &'a [f64],
+    },
+    Dynamic {
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: &'a str,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn realization_digest(
+    requirements: &FormRequirements,
+    factorization: &OperatorFactorization,
+    kernels: &StructuredOperatorKernels,
+    mesh: &Mesh,
+    element: &PreparedElement,
+    dofs: &DofMap,
+    constraints: &ConstraintSet,
+    external: &BTreeMap<(usize, TensorInputId), ExternalBinding>,
+) -> Digest {
+    let external = external
+        .values()
+        .map(|binding| match binding {
+            ExternalBinding::Stored(input) => ExternalBindingDescriptor::Stored {
+                integral_index: input.integral_index,
+                input: input.input,
+                component_count: input.component_count,
+                values: &input.values,
+            },
+            ExternalBinding::Dynamic(input) => ExternalBindingDescriptor::Dynamic {
+                integral_index: input.integral_index,
+                input: input.input,
+                component_count: input.component_count,
+                identity: &input.identity,
+            },
+        })
+        .collect();
+    let payload = RealizationDigestPayload {
+        schema: "finitum-realization-plan/1",
+        requirements: &requirements.artifact_digest,
+        factorization: &factorization.artifact_digest,
+        kernels: &kernels.artifact_digest,
+        mesh,
+        element,
+        dofs,
+        constraints,
+        external,
+    };
+    Digest::blake3(
+        &serde_json::to_vec(&payload).expect("validated realization data must serialize"),
+    )
 }
 
 fn validate_artifacts(
@@ -654,12 +1120,14 @@ fn validate_evaluation(
 ) -> Result<(), FinitumError> {
     if matches!(
         derivative,
-        DerivativeEvaluation::Value | DerivativeEvaluation::Gradient
+        DerivativeEvaluation::Value
+            | DerivativeEvaluation::Gradient
+            | DerivativeEvaluation::TimeDerivative
     ) {
         Ok(())
     } else {
         Err(FinitumError::UnsupportedRealization(format!(
-            "FC6 supports value and gradient basis actions, got {derivative:?}"
+            "the scalar P1 realization supports value, gradient, and time-derivative basis actions, got {derivative:?}"
         )))
     }
 }
@@ -669,11 +1137,26 @@ fn validate_external_inputs(
     mesh: &Mesh,
     element: &PreparedElement,
     external_inputs: Vec<ExternalInput>,
-) -> Result<BTreeMap<(usize, TensorInputId), ExternalInput>, FinitumError> {
+    dynamic_external_inputs: Vec<DynamicExternalInput>,
+) -> Result<BTreeMap<(usize, TensorInputId), ExternalBinding>, FinitumError> {
     let mut external = BTreeMap::new();
     for input in external_inputs {
         let key = (input.integral_index, input.input);
-        if external.insert(key, input).is_some() {
+        if external
+            .insert(key, ExternalBinding::Stored(input))
+            .is_some()
+        {
+            return Err(FinitumError::InvalidRealization(format!(
+                "external input {key:?} was supplied more than once"
+            )));
+        }
+    }
+    for input in dynamic_external_inputs {
+        let key = (input.integral_index, input.input);
+        if external
+            .insert(key, ExternalBinding::Dynamic(input))
+            .is_some()
+        {
             return Err(FinitumError::InvalidRealization(format!(
                 "external input {key:?} was supplied more than once"
             )));
@@ -694,22 +1177,34 @@ fn validate_external_inputs(
                     input: input.id,
                 })?;
             let components = component_count(&input.shape)?;
-            let expected = mesh
-                .cells()
-                .len()
-                .checked_mul(element.quadrature().len())
-                .and_then(|count| count.checked_mul(components))
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(
-                        "external input storage extent overflows usize".into(),
-                    )
-                })?;
-            if supplied.component_count != components || supplied.values.len() != expected {
-                return Err(FinitumError::InvalidRealization(format!(
-                    "external input {key:?} has {} components and {} values, expected {components} and {expected}",
-                    supplied.component_count,
-                    supplied.values.len()
-                )));
+            match supplied {
+                ExternalBinding::Stored(supplied) => {
+                    let expected = mesh
+                        .cells()
+                        .len()
+                        .checked_mul(element.quadrature().len())
+                        .and_then(|count| count.checked_mul(components))
+                        .ok_or_else(|| {
+                            FinitumError::InvalidRealization(
+                                "external input storage extent overflows usize".into(),
+                            )
+                        })?;
+                    if supplied.component_count != components || supplied.values.len() != expected {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "external input {key:?} has {} components and {} values, expected {components} and {expected}",
+                            supplied.component_count,
+                            supplied.values.len()
+                        )));
+                    }
+                }
+                ExternalBinding::Dynamic(supplied) => {
+                    if supplied.component_count != components {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "dynamic external input {key:?} has {} components, expected {components}",
+                            supplied.component_count
+                        )));
+                    }
+                }
             }
         }
     }
@@ -719,6 +1214,22 @@ fn validate_external_inputs(
         ));
     }
     Ok(external)
+}
+
+fn validate_components(
+    input: &QFunctionInput,
+    values: &[f64],
+    label: &str,
+) -> Result<(), FinitumError> {
+    let expected = component_count(&input.shape)?;
+    if values.len() != expected {
+        return Err(FinitumError::InvalidRealization(format!(
+            "{label} {:?} returned {} components, expected {expected}",
+            input.id,
+            values.len()
+        )));
+    }
+    validate_finite(label, values)
 }
 
 fn bind_kernels(
@@ -797,7 +1308,7 @@ fn evaluate_basis_input(
     local_state: &[f64],
 ) -> Result<Vec<f64>, FinitumError> {
     match input.binding.evaluation.derivative {
-        DerivativeEvaluation::Value => {
+        DerivativeEvaluation::Value | DerivativeEvaluation::TimeDerivative => {
             let value = local_state
                 .iter()
                 .enumerate()

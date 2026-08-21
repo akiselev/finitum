@@ -11,5 +11,8 @@ pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint};
 pub use error::FinitumError;
 pub use mesh::{Cell, CellId, Mesh, VertexId};
-pub use realization::{AssembledOperator, ExternalInput, MatrixFreeOperator, RealizationPlan};
+pub use realization::{
+    AssembledOperator, DynamicExternalInput, ExternalInput, MatrixFreeOperator, PointActiveInput,
+    PointEvaluation, RealizationPlan,
+};
 pub use space::{DofId, DofMap, ElementRestriction};
