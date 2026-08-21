@@ -5,8 +5,8 @@ use malleus::{
     AccessMode, BufferBinding, Executable, ExecutableModule, Interpreter, OperandId,
     validate_module,
 };
-use resolvent::scientific::ValueShape;
-use resolvent::{
+use scientia::scientific::ValueShape;
+use scientia::{
     DerivativeEvaluation, Digest, ElementFamilyRequirement, EvaluationSite, FormRequirements,
     InputSourceRequirement, IntegralOperatorFactorization, OperatorFactorization, QFunctionInput,
     SemanticMeasure, StructuredOperatorKernels, StructuredPointKernelBundle, TensorInputId,

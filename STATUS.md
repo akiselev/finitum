@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: FC11 realization artifact inspection complete
+Milestone: R1 Scientia consumer migration
 
 ## Implemented
 
@@ -13,7 +13,7 @@ Milestone: FC11 realization artifact inspection complete
   cycle validation, exact input extents, and finite expansion results;
 - prepared quadrature/basis tables with checked extents, shape validation, and finite data;
 - P1 simplex reference basis and barycenter quadrature preparation;
-- digest validation across Resolvent `FormRequirements`/`OperatorFactorization` and complete
+- digest validation across Scientia `FormRequirements`/`OperatorFactorization` and complete
   Malleus primal/JVP/VJP/parameter bundles;
 - concrete affine geometry preprocessing and quadrature-point external-input packing;
 - deterministic gather, value/gradient basis forward action, generated primal/JVP execution,
@@ -42,7 +42,7 @@ Milestone: FC11 realization artifact inspection complete
   restrictions, and triangle/tetrahedron incidence complexes that verify curl-grad and div-curl
   are exactly zero;
 - element-local Schur condensation with a retained trace system and full interior recovery map;
-- `SystemRealizationPlan`, which validates Resolvent block coordinates and the complete
+- `SystemRealizationPlan`, which validates Scientia block coordinates and the complete
   form/factorization/Malleus receipt chain before digest-binding it to a mesh, block layout,
   facets, compatible maps, and exact-sequence evidence.
 - one-dimensional nonmatching Lagrange transfer and mortar-like common-trace interpolation with
@@ -54,18 +54,18 @@ Milestone: FC11 realization artifact inspection complete
   sum-factorized value/gradient evaluation; and
 - an explicit level-set identity and quadrature policy for linearly clipped segment cells.
 - digest-bound finite-volume, finite-difference, network DAE, particle, and boundary-integral
-  realizations consuming Resolvent `MethodProgram` directly, with typed state-extent checks;
+  realizations consuming Scientia `MethodProgram` directly, with typed state-extent checks;
 - deterministic DAE residual/JVP actions for every method family, compiled Malleus flux/stencil
   execution where present, and a `DiscreteOperator` enum that preserves variational-versus-sibling
   family identity for Krasis coupling.
 
 ## Boundary
 
-Resolvent owns the abstract space and form meaning. Malleus owns executable local kernels.
+Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
 Finitum owns their concrete mesh/space binding and global realization. Krasis owns coupled
 state and Solverang owns numerical algorithms.
 
-The manifest now depends directly on Resolvent, Malleus, and Solverang because realization plans
+The manifest now depends directly on Scientia, Malleus, and Solverang because realization plans
 consume their concrete artifacts and trait. The FC6/FC7 executable action remains scalar
 H1(order=1) cell integration. FC8 adds deterministic mixed, facet, Piola, exact-sequence, and
 condensation reference contracts. FC9 adds reference transfer, affine-constraint, partial,
@@ -74,8 +74,8 @@ tables are not integrated into `RealizationPlan`; there is no local refinement, 
 geometrically derived hanging-node map, multidimensional hp realization, production SIMD/GPU
 backend, or embedded-domain source semantics.
 
-The FC10 `MethodProgram` and FC11 serialized-kernel contracts were validated against Resolvent
-`57c9b431e77a91d27fe20c4ca206e8b55c3e4cd7` and Malleus
+The FC10 `MethodProgram` and FC11 serialized-kernel contracts were validated against Scientia
+`215433962c874dfd86b59ffc6d69f017bba2b95a` and Malleus
 `09e27a6a23a6a5eab6f881ac0bec9db23046d58e`.
 
 The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
@@ -103,10 +103,12 @@ caller-supplied tables. No named physical law is selected in Finitum.
 Passed on 2026-08-21 with Rust 1.97.0:
 
 ```text
-cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 26 passed, 0 failed
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets           # 26 passed, 0 failed
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
+cargo test --locked --workspace --doc
 git diff --check
 ```
 
@@ -131,7 +133,7 @@ differences.
 
 The FC10 gate independently checks periodic FV conservation, a centered FD stencil, a dense
 network DAE, equal/opposite particle forces plus an energy gradient, and weighted boundary-integral
-semantics. FV/FD actions execute the digest-linked Malleus kernels emitted by Resolvent.
+semantics. FV/FD actions execute the digest-linked Malleus kernels emitted by Scientia.
 
 ## Next
 

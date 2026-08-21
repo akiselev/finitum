@@ -59,7 +59,7 @@ pub enum FinitumError {
     #[error("realization is missing external input {input:?} for integral {integral}")]
     MissingExternalInput {
         integral: usize,
-        input: resolvent::TensorInputId,
+        input: scientia::TensorInputId,
     },
     #[error("Malleus kernel validation failed: {0}")]
     KernelValidation(String),

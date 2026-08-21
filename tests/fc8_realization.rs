@@ -2,7 +2,7 @@ use finitum::{
     AffineMap, BlockLayout, Cell, CellId, CompatibleDofMaps, ExactSequence, FacetTopology, Mesh,
     VertexId, static_condense,
 };
-use resolvent::SymbolId;
+use scientia::SymbolId;
 
 fn tetra_pair() -> Mesh {
     Mesh::new(

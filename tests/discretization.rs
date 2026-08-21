@@ -4,7 +4,7 @@ use finitum::{
     WeightedDof,
 };
 use quantitas::UnitRegistry;
-use resolvent::{
+use scientia::{
     DerivativeEvaluation, InputSourceRequirement, TensorInputId, TensorInputRole,
     compile_semantics, derive_variational_form, factor_operator, infer_form_requirements,
     lower_operator_kernels,

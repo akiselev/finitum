@@ -1,6 +1,6 @@
 use crate::{BlockLayout, CompatibleDofMaps, ExactSequence, FacetTopology, FinitumError, Mesh};
-use resolvent::scientific::ValueShape;
-use resolvent::{Digest, ElementFamilyRequirement, OperatorSystem, SemanticMeasure};
+use scientia::scientific::ValueShape;
+use scientia::{Digest, ElementFamilyRequirement, OperatorSystem, SemanticMeasure};
 use serde::Serialize;
 use std::sync::Arc;
 

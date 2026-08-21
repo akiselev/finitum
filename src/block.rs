@@ -1,5 +1,5 @@
 use crate::FinitumError;
-use resolvent::SymbolId;
+use scientia::SymbolId;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

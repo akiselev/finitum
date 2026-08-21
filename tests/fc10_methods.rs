@@ -4,7 +4,7 @@ use finitum::{
     ParticleRealization, RadialPairPolynomial,
 };
 use quantitas::UnitRegistry;
-use resolvent::{
+use scientia::{
     AffineMethodKernelSpec, MethodProgram, compile_boundary_integral_method,
     compile_conservation_law_method, compile_finite_difference_method, compile_network_dae_method,
     compile_particle_method, compile_semantics,
@@ -49,7 +49,7 @@ model Boundary {
 }
 "#;
 
-fn module() -> resolvent::SemanticModule {
+fn module() -> scientia::SemanticModule {
     compile_semantics(SOURCE, &UnitRegistry::si_bootstrap())
         .unwrap()
         .semantic

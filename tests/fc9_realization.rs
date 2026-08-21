@@ -5,7 +5,7 @@ use finitum::{
     RealizationPlan, TensorProductBasis, VariableOrderSegmentElements, VertexId,
 };
 use quantitas::UnitRegistry;
-use resolvent::{
+use scientia::{
     InputSourceRequirement, TensorInputRole, compile_semantics, derive_variational_form,
     factor_operator, infer_form_requirements, lower_operator_kernels,
 };

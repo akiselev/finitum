@@ -4,7 +4,7 @@ use crate::{FinitumError, RealizationPlan};
 use malleus::{
     BufferBinding, Executable, ExecutableModule, Interpreter, OperandId, validate_module,
 };
-use resolvent::{MethodFamily, MethodProgram, MethodProgramKind};
+use scientia::{MethodFamily, MethodProgram, MethodProgramKind};
 use serde::Serialize;
 use solverang::{DaeOperator, EvaluationContext, NumericError};
 use std::sync::Arc;
@@ -954,7 +954,7 @@ fn concrete_identity(
     #[derive(Serialize)]
     struct Payload<'a, T> {
         schema: &'a str,
-        program: &'a resolvent::Digest,
+        program: &'a scientia::Digest,
         config: &'a T,
     }
     let bytes = serde_json::to_vec(&Payload {

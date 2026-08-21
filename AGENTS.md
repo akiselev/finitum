@@ -1,7 +1,7 @@
 # Agent instructions
 
 Finitum owns concrete discretization and global operator realization. It may depend on
-Resolvent mathematical artifacts and Malleus executable kernels. Add Solverang only when
+Scientia scientific compiler artifacts and Malleus executable kernels. Add Solverang only when
 a real realized operator can implement its traits directly. Stateful nonlinear, block,
 and DAE composition belongs to Krasis.
 

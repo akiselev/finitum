@@ -7,7 +7,7 @@ implementation contains:
 - deterministic element restrictions over a bounded global degree-of-freedom space;
 - acyclic affine constraints with finite coefficients and checked expansion;
 - prepared quadrature, basis-value, and basis-gradient tables with checked extents and finite data;
-- digest-linked `RealizationPlan` bindings from Resolvent FC3/FC4 artifacts and complete Malleus
+- digest-linked `RealizationPlan` bindings from Scientia FC3/FC4 artifacts and complete Malleus
   FC5 modules to concrete mesh, geometry, DOF, constraint, and coefficient data;
 - deterministic P1 simplex gather, value/gradient basis actions, generated primal/JVP execution,
   quadrature weighting, basis transpose, and scatter;
@@ -24,7 +24,7 @@ implementation contains:
 - component-explicit product layouts, oriented exterior/interior/interface facet traversal,
   covariant and contravariant Piola maps, and oriented edge/facet restrictions;
 - exact triangle/tetrahedron incidence sequences and element-local Schur condensation; and
-- a digest-linked `SystemRealizationPlan` consuming Resolvent block systems and complete Malleus
+- a digest-linked `SystemRealizationPlan` consuming Scientia block systems and complete Malleus
   bundles;
 - nonmatching trace transfer and conservative mortar scatter, standalone per-cell variable-order
   segment tables, and algebraic midpoint interpolation;
