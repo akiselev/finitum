@@ -37,7 +37,8 @@ pub use optimized::{
 };
 pub use realization::{
     AssembledOperator, DynamicExternalInput, ExternalInput, MatrixFreeOperator, PointActiveInput,
-    PointEvaluation, RealizationPlan,
+    PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, RealizationArtifact, RealizationExternalInput,
+    RealizationPlan,
 };
 pub use space::{DofId, DofMap, ElementRestriction};
 pub use system::SystemRealizationPlan;

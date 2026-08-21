@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: FC10 sibling method realizations complete
+Milestone: FC11 realization artifact inspection complete
 
 ## Implemented
 
@@ -30,6 +30,9 @@ Milestone: FC10 sibling method realizations complete
 - fixed essential residual rows and their consistent state-direction JVP rows.
 - deterministic concrete-plan identity covering the artifact chain, mesh, element, DOF map,
   constraints, stored external values, and caller-declared dynamic-input identities.
+- a complete serializable `RealizationArtifact` projection for product inspection and cache
+  records, including source artifact digests, mesh, element tables, DOF map, constraints, stored
+  values, and dynamic-input identities; generated executables remain rebuildable data.
 - product-space block layouts with explicit field/entity/component ownership and deterministic
   gather/scatter;
 - deterministic simplex exterior/interior facet topology, explicit reversible minus/plus
@@ -70,7 +73,9 @@ tables are not integrated into `RealizationPlan`; there is no local refinement, 
 geometrically derived hanging-node map, multidimensional hp realization, production SIMD/GPU
 backend, or embedded-domain source semantics.
 
-The FC10 `MethodProgram` contract was validated against Resolvent `201540e`.
+The FC10 `MethodProgram` and FC11 serialized-kernel contracts were validated against Resolvent
+`57c9b431e77a91d27fe20c4ca206e8b55c3e4cd7` and Malleus
+`09e27a6a23a6a5eab6f881ac0bec9db23046d58e`.
 
 The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
 the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
@@ -129,5 +134,5 @@ semantics. FV/FD actions execute the digest-linked Malleus kernels emitted by Re
 
 ## Next
 
-Support FC11 artifact serialization and inspection, or extend any method topology only from a
-concrete acceptance case; keep local-kernel meaning and backend numerical policy explicit.
+Extend any method topology only from a concrete acceptance case; keep local-kernel meaning,
+backend numerical policy, and realization-artifact identity explicit.

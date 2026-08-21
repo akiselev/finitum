@@ -18,6 +18,8 @@ use solverang::{CsrMatrix, EvaluationContext, LinearOperator, NumericError, Oper
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
 use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};
 
+pub const REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-realization-plan/2";
+
 /// Concrete quadrature-point values for one non-basis QFunction input.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExternalInput {
@@ -197,6 +199,7 @@ struct BoundBundle {
 #[derive(Clone, Debug)]
 struct RealizationData {
     digest: Digest,
+    kernels_digest: Digest,
     requirements: FormRequirements,
     factorization: OperatorFactorization,
     mesh: Mesh,
@@ -218,6 +221,43 @@ struct RealizationData {
 #[derive(Clone, Debug)]
 pub struct RealizationPlan {
     data: Arc<RealizationData>,
+}
+
+/// Stable, fully inspectable projection of a concrete realization.
+///
+/// Executable modules are deterministically rebuilt from the archived Resolvent/Malleus kernel
+/// bundle. Dynamic callbacks cannot be serialized and are therefore represented by the identity
+/// that already participates in the realization digest.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RealizationArtifact {
+    pub schema: String,
+    pub artifact_digest: Digest,
+    pub source_requirements_digest: Digest,
+    pub source_factorization_digest: Digest,
+    pub source_kernels_digest: Digest,
+    pub mesh: Mesh,
+    pub element: PreparedElement,
+    pub dofs: DofMap,
+    pub constraints: ConstraintSet,
+    pub external_inputs: Vec<RealizationExternalInput>,
+}
+
+/// Serializable product data for one stored or dynamic realization input.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RealizationExternalInput {
+    Stored {
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        values: Vec<f64>,
+    },
+    Dynamic {
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: String,
+    },
 }
 
 impl RealizationPlan {
@@ -284,6 +324,7 @@ impl RealizationPlan {
             &constraints,
             &external,
         );
+        let kernels_digest = kernels.artifact_digest.clone();
         let bundles = bind_kernels(&factorization, kernels)?;
         let geometries = (0..mesh.cells().len())
             .map(|cell| CellGeometry::new(&mesh, CellId(cell)))
@@ -291,6 +332,7 @@ impl RealizationPlan {
         Ok(Self {
             data: Arc::new(RealizationData {
                 digest,
+                kernels_digest,
                 requirements,
                 factorization,
                 mesh,
@@ -324,6 +366,41 @@ impl RealizationPlan {
 
     pub fn source_requirements_digest(&self) -> &Digest {
         &self.data.requirements.artifact_digest
+    }
+
+    /// Capture every identity-sensitive input needed to inspect or rebuild this realization.
+    pub fn artifact(&self) -> RealizationArtifact {
+        let external_inputs = self
+            .data
+            .external
+            .values()
+            .map(|binding| match binding {
+                ExternalBinding::Stored(input) => RealizationExternalInput::Stored {
+                    integral_index: input.integral_index,
+                    input: input.input,
+                    component_count: input.component_count,
+                    values: input.values.clone(),
+                },
+                ExternalBinding::Dynamic(input) => RealizationExternalInput::Dynamic {
+                    integral_index: input.integral_index,
+                    input: input.input,
+                    component_count: input.component_count,
+                    identity: input.identity.clone(),
+                },
+            })
+            .collect();
+        RealizationArtifact {
+            schema: REALIZATION_ARTIFACT_SCHEMA.into(),
+            artifact_digest: self.data.digest.clone(),
+            source_requirements_digest: self.data.requirements.artifact_digest.clone(),
+            source_factorization_digest: self.data.factorization.artifact_digest.clone(),
+            source_kernels_digest: self.data.kernels_digest.clone(),
+            mesh: self.data.mesh.clone(),
+            element: self.data.element.clone(),
+            dofs: self.data.dofs.clone(),
+            constraints: self.data.constraints.clone(),
+            external_inputs,
+        }
     }
 
     /// Evaluate the generated global residual at independent state and state-rate vectors.
@@ -1202,7 +1279,7 @@ fn realization_digest(
         })
         .collect();
     let payload = RealizationDigestPayload {
-        schema: "finitum-realization-plan/2",
+        schema: REALIZATION_ARTIFACT_SCHEMA,
         requirements: &requirements.artifact_digest,
         factorization: &factorization.artifact_digest,
         kernels: &kernels.artifact_digest,
