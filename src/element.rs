@@ -20,6 +20,38 @@ pub struct PreparedElement {
 }
 
 impl PreparedElement {
+    /// P1 simplex basis with barycenter quadrature. This rule is exact for the affine stiffness
+    /// integrand and first-degree loads in dimensions one through three.
+    pub fn linear_simplex(dimension: usize) -> Result<Self, FinitumError> {
+        if !(1..=3).contains(&dimension) {
+            return Err(FinitumError::InvalidDimension(dimension));
+        }
+        let basis_count = dimension + 1;
+        let weight = match dimension {
+            1 => 1.0,
+            2 => 0.5,
+            3 => 1.0 / 6.0,
+            _ => unreachable!("dimension was checked"),
+        };
+        let quadrature = vec![QuadraturePoint {
+            coordinates: vec![1.0 / basis_count as f64; dimension],
+            weight,
+        }];
+        let basis_values = vec![1.0 / basis_count as f64; basis_count];
+        let mut basis_gradients = vec![0.0; basis_count * dimension];
+        for axis in 0..dimension {
+            basis_gradients[axis] = -1.0;
+            basis_gradients[(axis + 1) * dimension + axis] = 1.0;
+        }
+        Self::new(
+            dimension,
+            basis_count,
+            quadrature,
+            basis_values,
+            basis_gradients,
+        )
+    }
+
     pub fn new(
         dimension: usize,
         basis_count: usize,

@@ -50,4 +50,21 @@ pub enum FinitumError {
     InvalidElementShape(String),
     #[error("prepared element contains non-finite data at {location}")]
     NonFiniteElementData { location: String },
+    #[error("realization artifact mismatch: {0}")]
+    ArtifactMismatch(String),
+    #[error("unsupported realization contract: {0}")]
+    UnsupportedRealization(String),
+    #[error("invalid realization data: {0}")]
+    InvalidRealization(String),
+    #[error("realization is missing external input {input:?} for integral {integral}")]
+    MissingExternalInput {
+        integral: usize,
+        input: resolvent::TensorInputId,
+    },
+    #[error("Malleus kernel validation failed: {0}")]
+    KernelValidation(String),
+    #[error("Malleus kernel execution failed: {0}")]
+    KernelExecution(String),
+    #[error("assembled realization failed: {0}")]
+    Assembly(String),
 }

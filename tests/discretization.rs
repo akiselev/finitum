@@ -1,7 +1,27 @@
 use finitum::{
-    AffineConstraint, Cell, ConstraintSet, DofId, DofMap, ElementRestriction, FinitumError, Mesh,
-    PreparedElement, QuadraturePoint, VertexId, WeightedDof,
+    AffineConstraint, Cell, ConstraintSet, DofId, DofMap, ElementRestriction, ExternalInput,
+    FinitumError, Mesh, PreparedElement, QuadraturePoint, RealizationPlan, VertexId, WeightedDof,
 };
+use quantitas::UnitRegistry;
+use resolvent::{
+    InputSourceRequirement, TensorInputRole, compile_semantics, derive_variational_form,
+    factor_operator, infer_form_requirements, lower_operator_kernels,
+};
+use solverang::{
+    ConjugateGradientConfig, EvaluationContext, LinearOperator, solve_conjugate_gradient,
+};
+
+const POISSON: &str = r#"
+module fc6.poisson;
+model Poisson {
+  domain Omega { dimension = 2; coordinates = cartesian; }
+  field u: unknown scalar H1(order=1) on Omega;
+  property k = diffusivity(0);
+  source f: VolumetricSource;
+  equation balance on Omega { -div(k * grad(u)) = f; }
+  boundary walls on boundary("walls") { dirichlet u = exact_u(); }
+}
+"#;
 
 #[test]
 fn fixture_triangle_and_constraints_validate() {
@@ -211,4 +231,316 @@ fn prepared_element_rejects_shape_and_nonfinite_tables() {
             location: "basis value 0".into(),
         }
     );
+}
+
+#[test]
+fn fc6_binds_generated_kernels_and_assembled_matrix_free_actions_agree() {
+    let compilation = compile_semantics(POISSON, &UnitRegistry::si_bootstrap()).unwrap();
+    let form = derive_variational_form(&compilation.semantic, "Poisson", "balance").unwrap();
+    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let kernels = lower_operator_kernels(&factorization).unwrap();
+    let (mesh, dofs, constraints) = square_discretization(2);
+    let element = PreparedElement::linear_simplex(2).unwrap();
+    let model = &compilation.semantic.models[0];
+    let external = factorization
+        .integrals
+        .iter()
+        .flat_map(|integral| {
+            integral
+                .primal
+                .inputs
+                .iter()
+                .filter(|input| input.source != InputSourceRequirement::Basis)
+                .map(|input| {
+                    assert_ne!(input.role, TensorInputRole::Active);
+                    let name = &model.symbols[input.binding.symbol.index()].name;
+                    let value = match name.as_str() {
+                        "k" => 1.0,
+                        "f" => 1.0,
+                        other => panic!("unexpected external input {other}"),
+                    };
+                    ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        &mesh,
+                        &element,
+                        move |_, _| vec![value],
+                    )
+                    .unwrap()
+                })
+        })
+        .collect();
+    let plan = RealizationPlan::new(
+        requirements,
+        factorization,
+        kernels,
+        mesh,
+        element,
+        dofs,
+        constraints,
+        external,
+    )
+    .unwrap();
+    let matrix_free = plan.matrix_free();
+    let assembled = plan.assemble().unwrap();
+    assert_eq!(
+        matrix_free.source_factorization_digest(),
+        assembled.source_factorization_digest()
+    );
+
+    let context = EvaluationContext::reproducible();
+    let direction = (0..plan.dimension())
+        .map(|index| index as f64 - 2.5)
+        .collect::<Vec<_>>();
+    let mut matrix_free_output = vec![0.0; plan.dimension()];
+    let mut assembled_output = vec![0.0; plan.dimension()];
+    matrix_free
+        .apply(&context, &direction, &mut matrix_free_output)
+        .unwrap();
+    assembled
+        .apply(&context, &direction, &mut assembled_output)
+        .unwrap();
+    assert_close(&matrix_free_output, &assembled_output, 1.0e-14);
+    for boundary in [0, 1, 2, 3, 5, 6, 7, 8] {
+        assert_eq!(matrix_free_output[boundary], direction[boundary]);
+    }
+
+    let right_hand_side = plan.load_vector().unwrap();
+    let report = solve_conjugate_gradient(
+        &matrix_free,
+        None,
+        &context,
+        &right_hand_side,
+        &vec![0.0; plan.dimension()],
+        &ConjugateGradientConfig::default(),
+    )
+    .unwrap();
+    assert!(report.converged);
+    assert!(report.solution[4] > 0.0);
+}
+
+#[test]
+fn fc6_linear_patch_is_exact_on_a_nonuniform_sheared_mesh() {
+    let compilation = compile_semantics(POISSON, &UnitRegistry::si_bootstrap()).unwrap();
+    let form = derive_variational_form(&compilation.semantic, "Poisson", "balance").unwrap();
+    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let kernels = lower_operator_kernels(&factorization).unwrap();
+
+    // A sheared unit square with an off-center interior vertex. The four determinants differ,
+    // and every cell Jacobian has an off-diagonal entry, so neither a transposed pullback nor an
+    // omitted/permuted determinant can hide behind an orthogonal uniform mesh.
+    let vertices = vec![
+        vec![0.0, 0.0],
+        vec![1.0, 0.0],
+        vec![0.35, 1.0],
+        vec![1.35, 1.0],
+        vec![0.573, 0.58],
+    ];
+    let cells = vec![
+        Cell {
+            vertices: vec![VertexId(0), VertexId(1), VertexId(4)],
+        },
+        Cell {
+            vertices: vec![VertexId(1), VertexId(3), VertexId(4)],
+        },
+        Cell {
+            vertices: vec![VertexId(3), VertexId(2), VertexId(4)],
+        },
+        Cell {
+            vertices: vec![VertexId(2), VertexId(0), VertexId(4)],
+        },
+    ];
+    let determinants = cells
+        .iter()
+        .map(|cell| {
+            let origin = &vertices[cell.vertices[0].0];
+            let first = &vertices[cell.vertices[1].0];
+            let second = &vertices[cell.vertices[2].0];
+            (first[0] - origin[0]) * (second[1] - origin[1])
+                - (second[0] - origin[0]) * (first[1] - origin[1])
+        })
+        .collect::<Vec<_>>();
+    assert!(determinants.windows(2).all(|pair| pair[0] != pair[1]));
+    assert_ne!(vertices[4][0] - vertices[0][0], 0.0);
+
+    let restrictions = cells
+        .iter()
+        .map(|cell| ElementRestriction {
+            dofs: cell.vertices.iter().map(|vertex| DofId(vertex.0)).collect(),
+        })
+        .collect();
+    let mesh = Mesh::new(2, vertices.clone(), cells).unwrap();
+    let dofs = DofMap::new(vertices.len(), restrictions).unwrap();
+    let exact = |point: &[f64]| 0.7 - 1.25 * point[0] + 0.8 * point[1];
+    let constraints = ConstraintSet::new(
+        vertices.len(),
+        (0..4).map(|target| AffineConstraint {
+            target: DofId(target),
+            dependencies: Vec::new(),
+            offset: exact(&vertices[target]),
+        }),
+    )
+    .unwrap();
+    let element = PreparedElement::linear_simplex(2).unwrap();
+    let model = &compilation.semantic.models[0];
+    let external = factorization
+        .integrals
+        .iter()
+        .flat_map(|integral| {
+            integral
+                .primal
+                .inputs
+                .iter()
+                .filter(|input| input.source != InputSourceRequirement::Basis)
+                .map(|input| {
+                    let name = &model.symbols[input.binding.symbol.index()].name;
+                    let value = match name.as_str() {
+                        "k" => 1.0,
+                        "f" => 0.0,
+                        other => panic!("unexpected external input {other}"),
+                    };
+                    ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        &mesh,
+                        &element,
+                        move |_, _| vec![value],
+                    )
+                    .unwrap()
+                })
+        })
+        .collect();
+    let plan = RealizationPlan::new(
+        requirements,
+        factorization,
+        kernels,
+        mesh,
+        element,
+        dofs,
+        constraints,
+        external,
+    )
+    .unwrap();
+    let right_hand_side = plan.load_vector().unwrap();
+    let context = EvaluationContext::reproducible();
+    let matrix_free = plan.matrix_free();
+    let assembled = plan.assemble().unwrap();
+    for operator in [&matrix_free as &dyn LinearOperator, &assembled] {
+        let report = solve_conjugate_gradient(
+            operator,
+            None,
+            &context,
+            &right_hand_side,
+            &vec![0.0; plan.dimension()],
+            &ConjugateGradientConfig::default(),
+        )
+        .unwrap();
+        assert!(report.converged);
+        let expected = vertices
+            .iter()
+            .map(|point| exact(point))
+            .collect::<Vec<_>>();
+        assert_close(&report.solution, &expected, 1.0e-12);
+    }
+}
+
+#[test]
+fn fc6_refuses_a_kernel_bundle_from_another_factorization() {
+    let compilation = compile_semantics(POISSON, &UnitRegistry::si_bootstrap()).unwrap();
+    let form = derive_variational_form(&compilation.semantic, "Poisson", "balance").unwrap();
+    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let mut kernels = lower_operator_kernels(&factorization).unwrap();
+    kernels.source_factorization_digest.hex = "not-the-parent".into();
+    let (mesh, dofs, constraints) = square_discretization(2);
+    let error = RealizationPlan::new(
+        requirements,
+        factorization,
+        kernels,
+        mesh,
+        PreparedElement::linear_simplex(2).unwrap(),
+        dofs,
+        constraints,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, FinitumError::ArtifactMismatch(_)));
+}
+
+fn square_discretization(subdivisions: usize) -> (Mesh, DofMap, ConstraintSet) {
+    let width = subdivisions + 1;
+    let vertices = (0..=subdivisions)
+        .flat_map(|row| {
+            (0..=subdivisions).map(move |column| {
+                vec![
+                    column as f64 / subdivisions as f64,
+                    row as f64 / subdivisions as f64,
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let cells = (0..subdivisions)
+        .flat_map(|row| {
+            (0..subdivisions).flat_map(move |column| {
+                let lower_left = row * width + column;
+                let lower_right = lower_left + 1;
+                let upper_left = lower_left + width;
+                let upper_right = upper_left + 1;
+                [
+                    Cell {
+                        vertices: vec![
+                            VertexId(lower_left),
+                            VertexId(lower_right),
+                            VertexId(upper_right),
+                        ],
+                    },
+                    Cell {
+                        vertices: vec![
+                            VertexId(lower_left),
+                            VertexId(upper_right),
+                            VertexId(upper_left),
+                        ],
+                    },
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let restrictions = cells
+        .iter()
+        .map(|cell| ElementRestriction {
+            dofs: cell.vertices.iter().map(|vertex| DofId(vertex.0)).collect(),
+        })
+        .collect();
+    let mesh = Mesh::new(2, vertices, cells).unwrap();
+    let dofs = DofMap::new(width * width, restrictions).unwrap();
+    let constraints = ConstraintSet::new(
+        width * width,
+        (0..width * width)
+            .filter(|index| {
+                let row = index / width;
+                let column = index % width;
+                row == 0 || column == 0 || row == subdivisions || column == subdivisions
+            })
+            .map(|target| AffineConstraint {
+                target: DofId(target),
+                dependencies: Vec::new(),
+                offset: 0.0,
+            }),
+    )
+    .unwrap();
+    (mesh, dofs, constraints)
+}
+
+fn assert_close(actual: &[f64], expected: &[f64], tolerance: f64) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{actual} != {expected} within {tolerance}"
+        );
+    }
 }

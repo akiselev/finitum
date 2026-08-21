@@ -70,6 +70,20 @@ impl ConstraintSet {
         self.constraints.values()
     }
 
+    pub fn dof_count(&self) -> usize {
+        self.dof_count
+    }
+
+    pub fn is_constrained(&self, dof: DofId) -> bool {
+        self.constraints.contains_key(&dof)
+    }
+
+    pub(crate) fn has_affine_dependencies(&self) -> bool {
+        self.constraints
+            .values()
+            .any(|constraint| !constraint.dependencies.is_empty())
+    }
+
     pub fn expand(&self, unconstrained: &[f64]) -> Result<Vec<f64>, FinitumError> {
         if unconstrained.len() != self.dof_count {
             return Err(FinitumError::ConstraintInputLength {

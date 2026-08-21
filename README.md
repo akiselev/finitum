@@ -1,20 +1,27 @@
 # Finitum
 
-Finitum is Sinbad's concrete discretization and global-realization layer. Its current checked
-foundation contains:
+Finitum is Sinbad's concrete discretization and global-realization layer. Its checked FC6
+implementation contains:
 
 - simplex meshes with finite coordinates, valid connectivity, and distinct vertices per cell;
 - deterministic element restrictions over a bounded global degree-of-freedom space;
-- acyclic affine constraints with finite coefficients and checked expansion; and
-- prepared quadrature, basis-value, and basis-gradient tables with checked extents and finite data.
+- acyclic affine constraints with finite coefficients and checked expansion;
+- prepared quadrature, basis-value, and basis-gradient tables with checked extents and finite data;
+- digest-linked `RealizationPlan` bindings from Resolvent FC3/FC4 artifacts and complete Malleus
+  FC5 modules to concrete mesh, geometry, DOF, constraint, and coefficient data;
+- deterministic P1 simplex gather, value/gradient basis actions, generated primal/JVP execution,
+  quadrature weighting, basis transpose, and scatter;
+- fixed essential-value lifting and identity rows; and
+- matrix-free and canonical CSR operators implementing Solverang's `LinearOperator` directly.
 
-The crate does not yet expose a global operator. A sparse matrix wrapper without the real
-form/kernel/discretization binding would only be a forwarding seam, so it was removed.
+The current realization deliberately supports scalar H1(order=1) cell integrals and fixed
+essential values. Mixed/compatible spaces, facet traversal, affine dependency elimination,
+partial assembly, and optimized backends remain later phases. Generated JVPs are evaluated at
+zero active input, which is valid only for this globally linear scope. The caller supplies the
+mapping from semantic boundary requirements to concrete constrained DOFs; FC6 checks extents and
+presence, not boundary-partition membership.
 
-Resolvent will supply abstract form and local-factorization artifacts. Malleus will supply
-validated executable local kernels. Finitum will bind them to its mesh, element, DOF, and
-constraint data before adding assembled, partial, element, or matrix-free realizations. Krasis
-owns coupled state; Solverang owns numerical algorithms.
-
-There are currently no dependencies on those sibling repositories because no implemented API
-consumes them yet. They should be added only with the first end-to-end realized operator.
+This is a deterministic reference realization, not a production hot path: point execution
+allocates interpreter buffers, external sampling prepares geometry independently, and CSR
+assembly takes one matrix-free action per column. Krasis owns coupled state; Solverang owns
+numerical algorithms.

@@ -7,8 +7,14 @@ license = "MIT OR Apache-2.0"
 description = "Concrete discretization and global operator realization for the Sinbad stack."
 
 [dependencies]
+malleus = { path = "../malleus" }
+resolvent = { path = "../resolvent" }
 serde = { version = "1", features = ["derive"] }
+solverang = { path = "../solverang" }
 thiserror = "2"
+
+[dev-dependencies]
+quantitas = { path = "../quantitas" }
 
 [lints.rust]
 unsafe_code = "forbid"
