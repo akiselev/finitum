@@ -11,7 +11,8 @@ implementation contains:
   FC5 modules to concrete mesh, geometry, DOF, constraint, and coefficient data;
 - deterministic P1 simplex gather, value/gradient basis actions, generated primal/JVP execution,
   quadrature weighting, basis transpose, and scatter;
-- affine constraint prolongation/restriction, lifting, and constraint rows;
+- affine constraint prolongation/restriction, lifting, and constraint rows, with dependent-row
+  actions explicitly classified as nonsymmetric;
 - matrix-free and canonical CSR operators implementing Solverang's `LinearOperator` directly;
 - independent runtime state/rate residual and JVP actions; and
 - dynamic point inputs chained through generated parameter-JVP kernels; and
@@ -22,17 +23,19 @@ implementation contains:
 - exact triangle/tetrahedron incidence sequences and element-local Schur condensation; and
 - a digest-linked `SystemRealizationPlan` consuming Resolvent block systems and complete Malleus
   bundles;
-- nonmatching trace transfer and conservative mortar scatter, per-cell hp segment tables and
-  hanging-node interpolation;
+- nonmatching trace transfer and conservative mortar scatter, standalone per-cell variable-order
+  segment tables, and algebraic midpoint interpolation;
 - distinct element-assembled and quadrature-partial operators, fixed-width cell batching,
   accelerator-friendly component/lane packing, and tensor-product sum factorization; and
 - a concrete level-set policy and exact reference quadrature for clipped segments.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
-with affine essential and hanging-node constraints. FC8's mixed/facet/compatible path is a deterministic reference
+with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference
 planning, mapping, topology, and evidence contract; production compatible basis tables and global
-mixed solves are not claimed. FC9's advanced paths are likewise bounded reference contracts: they
-do not claim production multidimensional hp/embedded meshes or a SIMD/GPU backend. The FC6 linear
+mixed solves are not claimed. FC9's advanced paths are likewise bounded reference contracts: the
+variable-order segment tables are not integrated into `RealizationPlan`, and the uniform-grid
+acceptance constraint is algebraic rather than derived from local refinement. There is no hp/AMR
+realization, production multidimensional embedded mesh, or SIMD/GPU backend. The FC6 linear
 view evaluates JVPs at zero active input; FC7 callers
 use runtime state/rate methods. The caller supplies the mapping from semantic boundary
 requirements to concrete constrained DOFs; Finitum checks extents and presence, not

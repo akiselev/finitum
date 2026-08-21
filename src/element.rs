@@ -53,6 +53,10 @@ impl PreparedElement {
     }
 
     /// Nodal Lagrange segment of the requested order with Gauss-Legendre quadrature.
+    ///
+    /// The interpolation nodes are equispaced. This is a deterministic reference table, not a
+    /// well-conditioned high-order production basis; later high-order realizations should use a
+    /// stable nodal family rather than extending this constructor's order limit.
     pub fn lagrange_segment(order: usize) -> Result<Self, FinitumError> {
         if !(1..=16).contains(&order) {
             return Err(FinitumError::InvalidElementShape(format!(

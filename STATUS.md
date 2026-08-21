@@ -43,8 +43,8 @@ Milestone: FC9 advanced realization reference contracts complete
   facets, compatible maps, and exact-sequence evidence.
 - one-dimensional nonmatching Lagrange transfer and mortar-like common-trace interpolation with
   weighted conservative transpose scatter;
-- per-cell hp segment elements with Gauss-Legendre quadrature and explicit linear hanging-node
-  constraints;
+- standalone per-cell variable-order segment basis tables with Gauss-Legendre quadrature, plus an
+  explicit algebraic midpoint-constraint constructor;
 - quadrature-point partial assembly preserving `E^T B^T D B E`, separate dense element assembly,
   fixed-width cell batches, component/lane accelerator packing, and tensor-product
   sum-factorized value/gradient evaluation; and
@@ -59,9 +59,11 @@ state and Solverang owns numerical algorithms.
 The manifest now depends directly on Resolvent, Malleus, and Solverang because realization plans
 consume their concrete artifacts and trait. The FC6/FC7 executable action remains scalar
 H1(order=1) cell integration. FC8 adds deterministic mixed, facet, Piola, exact-sequence, and
-condensation reference contracts. FC9 adds reference transfer, hp, affine-constraint, partial,
-batched, packed, sum-factorized, and clipped-segment paths without claiming a production SIMD/GPU
-backend, general multidimensional hp meshes, or embedded-domain source semantics.
+condensation reference contracts. FC9 adds reference transfer, affine-constraint, partial,
+batched, packed, sum-factorized, variable-order-segment, and clipped-segment paths. The segment
+tables are not integrated into `RealizationPlan`; there is no local refinement, AMR topology,
+geometrically derived hanging-node map, multidimensional hp realization, production SIMD/GPU
+backend, or embedded-domain source semantics.
 
 The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
 the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
@@ -71,6 +73,12 @@ their extents are valid, but the mesh has no boundary-region tags with which to 
 membership. Point-kernel buffers are allocated per invocation, external sampling prepares its
 own cell geometry, and reference CSR assembly performs one operator action per column; these are
 deliberate fixture-grade costs, not production performance claims.
+
+The matrix-free, element-assembled, and partial constructors all freeze the generated JVP at zero
+state/rate. Affine dependency constraints replace target rows with algebraic constraint residuals,
+so the full-coordinate action is nonsymmetric even when the reduced `P^T A P` block is symmetric;
+the operators declare this to Solverang and conjugate gradient refuses it. Equispaced segment
+nodes through order 16 are reference data and are not a well-conditioned high-order basis claim.
 
 ## Validation
 
@@ -96,10 +104,12 @@ against the uncondensed local residual, H(div) flux preservation and shared-face
 conservative two-sided DG facet scatter, H(curl) circulation preservation, and exact simplex
 incidence identities.
 
-The FC9 gate checks nonmatching mortar work conservation, hp partition/gradient identities,
-hanging-node prolongation and constraint rows, dense-reference sum factorization, accelerator
-pack/unpack identity, exact clipped polynomial integration, and quadrature-partial JVP agreement
-with generated Malleus interpreter execution and centered differences.
+The FC9 gate checks nonmatching mortar work conservation, variable-order segment
+partition/gradient identities, algebraic midpoint prolongation and constraint rows, CG refusal of
+the declared nonsymmetric action, dense-reference sum factorization, an explicit
+batch/component/lane packed index plus pack/unpack identity, exact clipped polynomial integration,
+and quadrature-partial JVP agreement with generated Malleus interpreter execution and centered
+differences.
 
 ## Next
 

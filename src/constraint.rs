@@ -78,6 +78,12 @@ impl ConstraintSet {
         self.constraints.contains_key(&dof)
     }
 
+    pub(crate) fn has_affine_dependencies(&self) -> bool {
+        self.constraints
+            .values()
+            .any(|constraint| !constraint.dependencies.is_empty())
+    }
+
     /// Expand free coordinates through the affine constraint graph.
     pub fn expand_homogeneous(&self, values: &[f64]) -> Result<Vec<f64>, FinitumError> {
         self.expand_with_offsets(values, false)

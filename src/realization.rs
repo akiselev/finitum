@@ -13,7 +13,7 @@ use resolvent::{
     TensorInputRole,
 };
 use serde::Serialize;
-use solverang::{CsrMatrix, EvaluationContext, LinearOperator, NumericError};
+use solverang::{CsrMatrix, EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
 
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
 use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};
@@ -419,13 +419,23 @@ impl RealizationPlan {
         }
         let matrix = CsrMatrix::from_triplets(dimension, dimension, entries)
             .map_err(|error| FinitumError::Assembly(error.to_string()))?;
+        let symmetry = if self.data.constraints.has_affine_dependencies() {
+            OperatorSymmetry::Nonsymmetric
+        } else {
+            matrix.symmetry()
+        };
         Ok(AssembledOperator {
             matrix,
             source_factorization_digest: self.source_factorization_digest().clone(),
+            symmetry,
         })
     }
 
     /// Precompute dense cell actions while retaining element restrictions and global scatter.
+    ///
+    /// Like [`Self::matrix_free`], this extracts the generated JVP at zero state and state rate.
+    /// It is exact for the globally linear scope and is a frozen zero-state linearization if
+    /// reused with a nonlinear form.
     pub fn element_assembly(
         &self,
         lane_width: usize,
@@ -467,6 +477,10 @@ impl RealizationPlan {
     }
 
     /// Precompute quadrature-point Jacobians while retaining basis actions and restrictions.
+    ///
+    /// Like [`Self::matrix_free`], this extracts the generated JVP at zero state and state rate.
+    /// It is exact for the globally linear scope and is a frozen zero-state linearization if
+    /// reused with a nonlinear form.
     pub fn partial_assembly(
         &self,
         lane_width: usize,
@@ -1043,6 +1057,8 @@ enum Action {
 ///
 /// This action is the generated JVP evaluated at zero active input. It is therefore a complete
 /// operator only for the globally linear FC6 scope, not a reusable nonlinear linearization.
+/// Affine dependency constraints replace target rows with constraint residuals, which destroys
+/// symmetry; [`LinearOperator::symmetry`] reports that case as nonsymmetric.
 #[derive(Clone, Debug)]
 pub struct MatrixFreeOperator {
     plan: RealizationPlan,
@@ -1063,6 +1079,14 @@ impl LinearOperator for MatrixFreeOperator {
         self.plan.dimension()
     }
 
+    fn symmetry(&self) -> OperatorSymmetry {
+        if self.plan.data.constraints.has_affine_dependencies() {
+            OperatorSymmetry::Nonsymmetric
+        } else {
+            OperatorSymmetry::Unknown
+        }
+    }
+
     fn apply(
         &self,
         _context: &EvaluationContext,
@@ -1076,10 +1100,14 @@ impl LinearOperator for MatrixFreeOperator {
 }
 
 /// Canonical CSR realization assembled from the matrix-free action.
+///
+/// Its symmetry classification is retained explicitly because affine dependency constraint rows
+/// make the full-coordinate action nonsymmetric.
 #[derive(Clone, Debug)]
 pub struct AssembledOperator {
     matrix: CsrMatrix,
     source_factorization_digest: Digest,
+    symmetry: OperatorSymmetry,
 }
 
 impl AssembledOperator {
@@ -1099,6 +1127,10 @@ impl LinearOperator for AssembledOperator {
 
     fn columns(&self) -> usize {
         self.matrix.columns()
+    }
+
+    fn symmetry(&self) -> OperatorSymmetry {
+        self.symmetry
     }
 
     fn apply(

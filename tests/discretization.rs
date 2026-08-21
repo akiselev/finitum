@@ -10,7 +10,8 @@ use resolvent::{
     lower_operator_kernels,
 };
 use solverang::{
-    ConjugateGradientConfig, EvaluationContext, LinearOperator, solve_conjugate_gradient,
+    ConjugateGradientConfig, ConjugateGradientSymmetryPolicy, EvaluationContext, LinearOperator,
+    solve_conjugate_gradient,
 };
 
 const POISSON: &str = r#"
@@ -337,7 +338,7 @@ fn fc6_binds_generated_kernels_and_assembled_matrix_free_actions_agree() {
         &context,
         &right_hand_side,
         &vec![0.0; plan.dimension()],
-        &ConjugateGradientConfig::default(),
+        &cg_config_assuming_symmetry(),
     )
     .unwrap();
     assert!(report.converged);
@@ -459,7 +460,7 @@ fn fc6_linear_patch_is_exact_on_a_nonuniform_sheared_mesh() {
             &context,
             &right_hand_side,
             &vec![0.0; plan.dimension()],
-            &ConjugateGradientConfig::default(),
+            &cg_config_assuming_symmetry(),
         )
         .unwrap();
         assert!(report.converged);
@@ -692,5 +693,12 @@ fn assert_close(actual: &[f64], expected: &[f64], tolerance: f64) {
             (actual - expected).abs() <= tolerance,
             "{actual} != {expected} within {tolerance}"
         );
+    }
+}
+
+fn cg_config_assuming_symmetry() -> ConjugateGradientConfig {
+    ConjugateGradientConfig {
+        symmetry_policy: ConjugateGradientSymmetryPolicy::AssumeSymmetric,
+        ..ConjugateGradientConfig::default()
     }
 }

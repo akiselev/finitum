@@ -2,14 +2,17 @@ use crate::{
     AffineConstraint, CellId, DofId, DofMap, FinitumError, Mesh, PreparedElement, WeightedDof,
 };
 
-/// Per-cell polynomial-order realization with one prepared element per restriction.
+/// Per-cell variable-order basis tables for one-dimensional segments.
+///
+/// This validates local tables and restrictions only. It does not provide mesh refinement,
+/// AMR topology, or integration with [`crate::RealizationPlan`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct HpElementMap {
+pub struct VariableOrderSegmentElements {
     orders: Vec<usize>,
     elements: Vec<PreparedElement>,
 }
 
-impl HpElementMap {
+impl VariableOrderSegmentElements {
     /// Prepare nodal segment elements for independently selected cell orders.
     pub fn lagrange_segments(
         mesh: &Mesh,
@@ -18,13 +21,13 @@ impl HpElementMap {
     ) -> Result<Self, FinitumError> {
         if mesh.dimension() != 1 {
             return Err(FinitumError::UnsupportedRealization(
-                "the landed hp basis constructor is for one-dimensional segments".into(),
+                "variable-order segment tables require a one-dimensional mesh".into(),
             ));
         }
         let orders = orders.into();
         if orders.len() != mesh.cells().len() || orders.len() != dofs.restrictions().len() {
             return Err(FinitumError::InvalidRealization(format!(
-                "hp order count {}, mesh cell count {}, and restriction count {} must agree",
+                "segment order count {}, mesh cell count {}, and restriction count {} must agree",
                 orders.len(),
                 mesh.cells().len(),
                 dofs.restrictions().len()
@@ -36,7 +39,7 @@ impl HpElementMap {
             let actual = dofs.restrictions()[cell].dofs.len();
             if actual != element.basis_count() {
                 return Err(FinitumError::InvalidRealization(format!(
-                    "hp cell {cell} at order {order} needs {} DOFs, got {actual}",
+                    "segment cell {cell} at order {order} needs {} DOFs, got {actual}",
                     element.basis_count()
                 )));
             }

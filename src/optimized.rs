@@ -1,7 +1,7 @@
 use crate::realization::{CellGeometry, apply_basis_adjoint, evaluate_basis_input};
 use crate::{ConstraintSet, ElementRestriction, FinitumError, PreparedElement};
 use resolvent::{DerivativeEvaluation, Digest, QFunctionInput};
-use solverang::{EvaluationContext, LinearOperator, NumericError};
+use solverang::{EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
 
 /// Fixed-width cell batches with explicit inactive padding lanes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,7 +19,10 @@ impl CellBatchLayout {
             ));
         }
         let batch_count = cell_count.div_ceil(lane_width);
-        let lanes = (0..batch_count * lane_width)
+        let lane_count = batch_count.checked_mul(lane_width).ok_or_else(|| {
+            FinitumError::InvalidRealization("cell-batch extent overflows usize".into())
+        })?;
+        let lanes = (0..lane_count)
             .map(|lane| (lane < cell_count).then_some(lane))
             .collect();
         Ok(Self {
@@ -55,6 +58,8 @@ pub struct AcceleratorLayout {
     entity_count: usize,
     component_count: usize,
     lane_width: usize,
+    value_count: usize,
+    packed_len: usize,
 }
 
 impl AcceleratorLayout {
@@ -68,21 +73,38 @@ impl AcceleratorLayout {
                 "accelerator layout extents and lane width must be nonzero".into(),
             ));
         }
+        let value_count = entity_count.checked_mul(component_count).ok_or_else(|| {
+            FinitumError::InvalidRealization("accelerator value extent overflows usize".into())
+        })?;
+        let padded_entities = entity_count
+            .div_ceil(lane_width)
+            .checked_mul(lane_width)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(
+                    "accelerator padded entity extent overflows usize".into(),
+                )
+            })?;
+        let packed_len = padded_entities
+            .checked_mul(component_count)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization("accelerator packed extent overflows usize".into())
+            })?;
         Ok(Self {
             entity_count,
             component_count,
             lane_width,
+            value_count,
+            packed_len,
         })
     }
 
     pub fn packed_len(&self) -> usize {
-        self.entity_count.div_ceil(self.lane_width) * self.lane_width * self.component_count
+        self.packed_len
     }
 
     /// Pack entity-major values as batch/component/lane, zeroing inactive lanes.
     pub fn pack(&self, entity_major: &[f64]) -> Result<Vec<f64>, FinitumError> {
-        let expected = self.entity_count * self.component_count;
-        validate_finite_length("accelerator input", entity_major, expected)?;
+        validate_finite_length("accelerator input", entity_major, self.value_count)?;
         let mut packed = vec![0.0; self.packed_len()];
         for entity in 0..self.entity_count {
             let batch = entity / self.lane_width;
@@ -98,7 +120,7 @@ impl AcceleratorLayout {
 
     pub fn unpack(&self, packed: &[f64]) -> Result<Vec<f64>, FinitumError> {
         validate_finite_length("accelerator packed input", packed, self.packed_len())?;
-        let mut entity_major = vec![0.0; self.entity_count * self.component_count];
+        let mut entity_major = vec![0.0; self.value_count];
         for entity in 0..self.entity_count {
             let batch = entity / self.lane_width;
             let lane = entity % self.lane_width;
@@ -162,7 +184,10 @@ impl TensorProductBasis {
         validate_finite_length("tensor nodal values", nodal_values, nodal_count)?;
         let values = self.apply_tables(nodal_values, None)?;
         let point_count = checked_power(self.point_count, self.dimension)?;
-        let mut gradients = vec![0.0; point_count * self.dimension];
+        let gradient_count = point_count.checked_mul(self.dimension).ok_or_else(|| {
+            FinitumError::InvalidRealization("tensor gradient extent overflows usize".into())
+        })?;
+        let mut gradients = vec![0.0; gradient_count];
         for axis in 0..self.dimension {
             let derivative = self.apply_tables(nodal_values, Some(axis))?;
             for (point, value) in derivative.into_iter().enumerate() {
@@ -193,6 +218,7 @@ impl TensorProductBasis {
 }
 
 /// Element-assembled realization: dense cell matrices are stored, but no global matrix is formed.
+/// Affine dependency constraint rows make the resulting full-coordinate action nonsymmetric.
 #[derive(Clone, Debug)]
 pub struct ElementAssemblyOperator {
     dimension: usize,
@@ -286,6 +312,14 @@ impl LinearOperator for ElementAssemblyOperator {
         self.dimension
     }
 
+    fn symmetry(&self) -> OperatorSymmetry {
+        if self.constraints.has_affine_dependencies() {
+            OperatorSymmetry::Nonsymmetric
+        } else {
+            OperatorSymmetry::Unknown
+        }
+    }
+
     fn apply(
         &self,
         _context: &EvaluationContext,
@@ -311,6 +345,7 @@ pub(crate) struct PartialPointAction {
 }
 
 /// Quadrature-data realization applying `E^T B^T D B E` without cell or global matrices.
+/// Affine dependency constraint rows make the resulting full-coordinate action nonsymmetric.
 #[derive(Clone, Debug)]
 pub struct PartialAssemblyOperator {
     dimension: usize,
@@ -386,7 +421,7 @@ impl PartialAssemblyOperator {
                         let values = if qinput.binding.evaluation.derivative
                             == DerivativeEvaluation::TimeDerivative
                         {
-                            vec![0.0; qinput.shape.iter().product()]
+                            vec![0.0; checked_product(&qinput.shape, "QFunction input")?]
                         } else {
                             evaluate_basis_input(
                                 &self.element,
@@ -446,6 +481,14 @@ impl LinearOperator for PartialAssemblyOperator {
         self.dimension
     }
 
+    fn symmetry(&self) -> OperatorSymmetry {
+        if self.constraints.has_affine_dependencies() {
+            OperatorSymmetry::Nonsymmetric
+        } else {
+            OperatorSymmetry::Unknown
+        }
+    }
+
     fn apply(
         &self,
         _context: &EvaluationContext,
@@ -468,7 +511,7 @@ fn contract_axis(
 ) -> Result<Vec<f64>, FinitumError> {
     let mut output_extents = input_extents.to_vec();
     output_extents[axis] = output_extent;
-    let output_len = output_extents.iter().product();
+    let output_len = checked_product(&output_extents, "tensor contraction")?;
     let mut output = vec![0.0; output_len];
     for (linear, value) in output.iter_mut().enumerate() {
         let mut coordinates = decode_index(linear, &output_extents);
@@ -507,6 +550,14 @@ fn checked_power(base: usize, exponent: usize) -> Result<usize, FinitumError> {
     (0..exponent).try_fold(1usize, |value, _| {
         value.checked_mul(base).ok_or_else(|| {
             FinitumError::InvalidRealization("tensor-product extent overflows usize".into())
+        })
+    })
+}
+
+fn checked_product(extents: &[usize], name: &str) -> Result<usize, FinitumError> {
+    extents.iter().try_fold(1usize, |value, extent| {
+        value.checked_mul(*extent).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("{name} extent overflows usize"))
         })
     })
 }

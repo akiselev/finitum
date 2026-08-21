@@ -1,15 +1,18 @@
 use finitum::{
     AcceleratorLayout, AffineConstraint, Cell, CellBatchLayout, ConstraintSet, DofId, DofMap,
     ElementRestriction, EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature, ExternalInput,
-    HangingNodeConstraint, HpElementMap, Mesh, MortarInterface, NonmatchingTransfer,
-    PreparedElement, RealizationPlan, TensorProductBasis, VertexId,
+    HangingNodeConstraint, Mesh, MortarInterface, NonmatchingTransfer, PreparedElement,
+    RealizationPlan, TensorProductBasis, VariableOrderSegmentElements, VertexId,
 };
 use quantitas::UnitRegistry;
 use resolvent::{
     InputSourceRequirement, TensorInputRole, compile_semantics, derive_variational_form,
     factor_operator, infer_form_requirements, lower_operator_kernels,
 };
-use solverang::{EvaluationContext, LinearOperator};
+use solverang::{
+    ConjugateGradientConfig, EvaluationContext, LinearOperator, OperatorSymmetry, SolveError,
+    solve_conjugate_gradient,
+};
 
 const POISSON: &str = r#"
 module fc9.poisson;
@@ -68,7 +71,7 @@ fn nonmatching_mortar_reproduces_traces_and_preserves_interface_work() {
 }
 
 #[test]
-fn hp_elements_and_hanging_nodes_preserve_polynomials() {
+fn variable_order_segments_and_affine_dependencies_preserve_polynomials() {
     let mesh = Mesh::new(
         1,
         vec![vec![0.0], vec![0.5], vec![1.0]],
@@ -94,11 +97,15 @@ fn hp_elements_and_hanging_nodes_preserve_polynomials() {
         ],
     )
     .unwrap();
-    let hp = HpElementMap::lagrange_segments(&mesh, &dofs, vec![1, 3]).unwrap();
-    assert_eq!(hp.order(finitum::CellId(0)), Some(1));
-    assert_eq!(hp.element(finitum::CellId(1)).unwrap().basis_count(), 4);
-    for cell in 0..hp.cell_count() {
-        let element = hp.element(finitum::CellId(cell)).unwrap();
+    let elements =
+        VariableOrderSegmentElements::lagrange_segments(&mesh, &dofs, vec![1, 3]).unwrap();
+    assert_eq!(elements.order(finitum::CellId(0)), Some(1));
+    assert_eq!(
+        elements.element(finitum::CellId(1)).unwrap().basis_count(),
+        4
+    );
+    for cell in 0..elements.cell_count() {
+        let element = elements.element(finitum::CellId(cell)).unwrap();
         for point in 0..element.quadrature().len() {
             let value_sum = (0..element.basis_count())
                 .map(|basis| element.basis_value(point, basis).unwrap())
@@ -151,6 +158,8 @@ fn sum_factorization_and_accelerator_packing_match_dense_meaning() {
     let entity_major = (0..15).map(|value| value as f64 - 3.0).collect::<Vec<_>>();
     let packed = layout.pack(&entity_major).unwrap();
     assert_eq!(packed.len(), 24);
+    // entity 4 -> batch 1/lane 0; component 2 -> (1 * 3 + 2) * 4 + 0 = 20.
+    assert_eq!(packed[20], entity_major[14]);
     assert_eq!(layout.unpack(&packed).unwrap(), entity_major);
     assert!(packed[15..].contains(&0.0));
 }
@@ -183,6 +192,38 @@ fn partial_assembly_preserves_interpreter_jvp_and_affine_constraints() {
     let plan = poisson_plan_with_hanging_constraint();
     let partial = plan.partial_assembly(4).unwrap();
     let element_assembled = plan.element_assembly(4).unwrap();
+    let assembled = plan.assemble().unwrap();
+    assert_eq!(
+        plan.matrix_free().symmetry(),
+        OperatorSymmetry::Nonsymmetric
+    );
+    assert_eq!(partial.symmetry(), OperatorSymmetry::Nonsymmetric);
+    assert_eq!(element_assembled.symmetry(), OperatorSymmetry::Nonsymmetric);
+    assert_eq!(assembled.symmetry(), OperatorSymmetry::Nonsymmetric);
+    let context = EvaluationContext::reproducible();
+    let mut target_column = vec![0.0; plan.dimension()];
+    target_column[5] = 1.0;
+    let target_column = optimized_action(&assembled, &context, &target_column);
+    let mut master_column = vec![0.0; plan.dimension()];
+    master_column[1] = 1.0;
+    let master_column = optimized_action(&assembled, &context, &master_column);
+    assert_eq!(master_column[5], -0.5);
+    assert_eq!(target_column[1], 0.0);
+    let right_hand_side = vec![1.0; plan.dimension()];
+    let initial = vec![0.0; plan.dimension()];
+    let cg_error = solve_conjugate_gradient(
+        &partial,
+        None,
+        &context,
+        &right_hand_side,
+        &initial,
+        &ConjugateGradientConfig::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cg_error,
+        SolveError::InvalidConfiguration { ref reason } if reason.contains("nonsymmetric")
+    ));
     assert_eq!(partial.batches().cell_count(), 18);
     assert_eq!(partial.batches().batch_count(), 5);
     assert_eq!(partial.stored_point_action_count(), 18);
@@ -193,7 +234,6 @@ fn partial_assembly_preserves_interpreter_jvp_and_affine_constraints() {
     let input = (0..plan.dimension())
         .map(|index| 0.3 * index as f64 - 1.1)
         .collect::<Vec<_>>();
-    let context = EvaluationContext::reproducible();
     let mut reference = vec![0.0; plan.dimension()];
     let mut optimized = vec![0.0; plan.dimension()];
     let mut element_output = vec![0.0; plan.dimension()];

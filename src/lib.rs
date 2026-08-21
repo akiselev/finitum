@@ -16,7 +16,7 @@ mod system;
 mod topology;
 mod transfer;
 
-pub use adaptivity::{HangingNodeConstraint, HpElementMap};
+pub use adaptivity::{HangingNodeConstraint, VariableOrderSegmentElements};
 pub use block::{BlockLayout, FieldBlock};
 pub use condensation::{CondensedLocalSystem, static_condense};
 pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
