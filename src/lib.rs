@@ -9,6 +9,7 @@ mod embedded;
 mod error;
 mod mapping;
 mod mesh;
+mod method;
 mod optimized;
 mod realization;
 mod space;
@@ -25,6 +26,11 @@ pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::FinitumError;
 pub use mapping::AffineMap;
 pub use mesh::{Cell, CellId, Mesh, VertexId};
+pub use method::{
+    BoundaryIntegralRealization, DiscreteOperator, FiniteDifferenceRealization, FiniteVolumeFace,
+    FiniteVolumeRealization, MethodRealization, NetworkDaeRealization, ParticlePair,
+    ParticleRealization, RadialPairPolynomial,
+};
 pub use optimized::{
     AcceleratorLayout, CellBatchLayout, ElementAssemblyOperator, PartialAssemblyOperator,
     TensorProductBasis, TensorProductEvaluation,

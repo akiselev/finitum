@@ -1,6 +1,6 @@
 # Finitum
 
-Finitum is Sinbad's concrete discretization and global-realization layer. Its checked FC6--FC9
+Finitum is Sinbad's concrete discretization and global-realization layer. Its checked FC6--FC10
 implementation contains:
 
 - simplex meshes with finite coordinates, valid connectivity, and distinct vertices per cell;
@@ -28,6 +28,9 @@ implementation contains:
 - distinct element-assembled and quadrature-partial operators, fixed-width cell batching,
   accelerator-friendly component/lane packing, and tensor-product sum factorization; and
 - a concrete level-set policy and exact reference quadrature for clipped segments.
+- digest-bound FC10 finite-volume, finite-difference, network DAE, particle-pair, and
+  boundary-integral reference realizations, plus one `DiscreteOperator` boundary shared with
+  variational FEM for Krasis composition.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference
@@ -39,7 +42,11 @@ realization, production multidimensional embedded mesh, or SIMD/GPU backend. The
 view evaluates JVPs at zero active input; FC7 callers
 use runtime state/rate methods. The caller supplies the mapping from semantic boundary
 requirements to concrete constrained DOFs; Finitum checks extents and presence, not
-boundary-partition membership.
+boundary-partition membership. FC10's method realizations are bounded deterministic contracts:
+FV uses oriented two-cell faces and compiled affine flux kernels, FD uses caller-supplied neighbor
+rows and compiled affine stencils, network DAEs use typed-extent dense matrices, particles use
+generic radial polynomials and explicit pairs, and boundary integrals use caller-supplied kernel
+tables and quadrature weights.
 
 This is a deterministic reference realization, not a production hot path: point execution
 allocates interpreter buffers, external sampling prepares geometry independently, and CSR

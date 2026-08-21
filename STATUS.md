@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: FC9 advanced realization reference contracts complete
+Milestone: FC10 sibling method realizations complete
 
 ## Implemented
 
@@ -49,6 +49,11 @@ Milestone: FC9 advanced realization reference contracts complete
   fixed-width cell batches, component/lane accelerator packing, and tensor-product
   sum-factorized value/gradient evaluation; and
 - an explicit level-set identity and quadrature policy for linearly clipped segment cells.
+- digest-bound finite-volume, finite-difference, network DAE, particle, and boundary-integral
+  realizations consuming Resolvent `MethodProgram` directly, with typed state-extent checks;
+- deterministic DAE residual/JVP actions for every method family, compiled Malleus flux/stencil
+  execution where present, and a `DiscreteOperator` enum that preserves variational-versus-sibling
+  family identity for Krasis coupling.
 
 ## Boundary
 
@@ -65,6 +70,8 @@ tables are not integrated into `RealizationPlan`; there is no local refinement, 
 geometrically derived hanging-node map, multidimensional hp realization, production SIMD/GPU
 backend, or embedded-domain source semantics.
 
+The FC10 `MethodProgram` contract was validated against Resolvent `201540e`.
+
 The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
 the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
 constrained DOFs and their values are caller-supplied: Finitum verifies that semantic and concrete
@@ -80,6 +87,11 @@ so the full-coordinate action is nonsymmetric even when the reduced `P^T A P` bl
 the operators declare this to Solverang and conjugate gradient refuses it. Equispaced segment
 nodes through order 16 are reference data and are not a well-conditioned high-order basis claim.
 
+FC10 remains a reference contract rather than a production meshless or particle engine. FV uses
+explicit oriented faces, FD uses supplied neighbor rows, network realization uses dense matrices,
+particle laws are generic radial polynomials over explicit pairs, and boundary kernels are
+caller-supplied tables. No named physical law is selected in Finitum.
+
 ## Validation
 
 Passed on 2026-08-21 with Rust 1.97.0:
@@ -88,7 +100,7 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 21 passed, 0 failed
+cargo test --all-targets           # 26 passed, 0 failed
 git diff --check
 ```
 
@@ -111,7 +123,11 @@ batch/component/lane packed index plus pack/unpack identity, exact clipped polyn
 and quadrature-partial JVP agreement with generated Malleus interpreter execution and centered
 differences.
 
+The FC10 gate independently checks periodic FV conservation, a centered FD stencil, a dense
+network DAE, equal/opposite particle forces plus an energy gradient, and weighted boundary-integral
+semantics. FV/FD actions execute the digest-linked Malleus kernels emitted by Resolvent.
+
 ## Next
 
-Extend these contracts to production multidimensional hp/embedded meshes or target code only from
-a concrete acceptance case; keep point-QFunction meaning and backend numerical policy explicit.
+Support FC11 artifact serialization and inspection, or extend any method topology only from a
+concrete acceptance case; keep local-kernel meaning and backend numerical policy explicit.
