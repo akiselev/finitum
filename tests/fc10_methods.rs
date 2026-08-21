@@ -276,4 +276,35 @@ fn boundary_integral_fixture_preserves_caller_supplied_quadrature_semantics() {
         .unwrap(),
     );
     assert_eq!(residual(&operator, &[2.0, 2.0], &[0.0; 2]), vec![0.0, 0.0]);
+    assert_eq!(
+        residual(&operator, &[2.0, 2.0], &[17.0, -23.0]),
+        vec![0.0, 0.0]
+    );
+
+    let context = EvaluationContext::reproducible();
+    let mut first = vec![0.0; 2];
+    operator
+        .jacobian_vector_product(
+            &context,
+            0.0,
+            &[2.0, 2.0],
+            &[1.0, 2.0],
+            &[0.25, -0.75],
+            &[3.0, 4.0],
+            &mut first,
+        )
+        .unwrap();
+    let mut second = vec![0.0; 2];
+    operator
+        .jacobian_vector_product(
+            &context,
+            0.0,
+            &[2.0, 2.0],
+            &[-5.0, 7.0],
+            &[0.25, -0.75],
+            &[-11.0, 13.0],
+            &mut second,
+        )
+        .unwrap();
+    assert_eq!(first, second);
 }

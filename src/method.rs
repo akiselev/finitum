@@ -609,6 +609,11 @@ impl ParticleRealization {
     }
 }
 
+/// Algebraic boundary-integral row in the common DAE interface.
+///
+/// Its residual is `A * state - right_hand_side`, its JVP is `A * state_direction`, and its DAE
+/// mass contribution is zero. Consequently, state rates and rate directions are intentionally
+/// ignored.
 #[derive(Clone, Debug)]
 pub struct BoundaryIntegralRealization {
     program: Arc<MethodProgram>,
