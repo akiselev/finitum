@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: FC8 mixed, facet, and compatible realization contracts complete
+Milestone: FC9 advanced realization reference contracts complete
 
 ## Implemented
 
@@ -18,7 +18,8 @@ Milestone: FC8 mixed, facet, and compatible realization contracts complete
 - concrete affine geometry preprocessing and quadrature-point external-input packing;
 - deterministic gather, value/gradient basis forward action, generated primal/JVP execution,
   quadrature weighting, basis transpose, and scatter;
-- fixed essential-value lifting and homogeneous identity-row operator action;
+- affine constraint prolongation, transpose restriction, lifting, and explicit constraint rows for
+  both residual and directional actions, including nested hanging-node dependencies;
 - one `RealizationPlan` producing matrix-free and canonical CSR assembled operators through the
   same generated JVP execution; both implement Solverang `LinearOperator` directly.
 - independent runtime state and state-rate basis bindings for generated primal residuals;
@@ -40,6 +41,14 @@ Milestone: FC8 mixed, facet, and compatible realization contracts complete
 - `SystemRealizationPlan`, which validates Resolvent block coordinates and the complete
   form/factorization/Malleus receipt chain before digest-binding it to a mesh, block layout,
   facets, compatible maps, and exact-sequence evidence.
+- one-dimensional nonmatching Lagrange transfer and mortar-like common-trace interpolation with
+  weighted conservative transpose scatter;
+- per-cell hp segment elements with Gauss-Legendre quadrature and explicit linear hanging-node
+  constraints;
+- quadrature-point partial assembly preserving `E^T B^T D B E`, separate dense element assembly,
+  fixed-width cell batches, component/lane accelerator packing, and tensor-product
+  sum-factorized value/gradient evaluation; and
+- an explicit level-set identity and quadrature policy for linearly clipped segment cells.
 
 ## Boundary
 
@@ -49,9 +58,10 @@ state and Solverang owns numerical algorithms.
 
 The manifest now depends directly on Resolvent, Malleus, and Solverang because realization plans
 consume their concrete artifacts and trait. The FC6/FC7 executable action remains scalar
-H1(order=1) cell integration with fixed essential constraints. FC8 adds deterministic mixed,
-facet, Piola, exact-sequence, and condensation reference contracts; production compatible basis
-tables, global mixed solves, partial assembly, and optimized backends remain deferred.
+H1(order=1) cell integration. FC8 adds deterministic mixed, facet, Piola, exact-sequence, and
+condensation reference contracts. FC9 adds reference transfer, hp, affine-constraint, partial,
+batched, packed, sum-factorized, and clipped-segment paths without claiming a production SIMD/GPU
+backend, general multidimensional hp meshes, or embedded-domain source semantics.
 
 The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
 the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
@@ -70,7 +80,7 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 15 passed, 0 failed
+cargo test --all-targets           # 21 passed, 0 failed
 git diff --check
 ```
 
@@ -86,7 +96,12 @@ against the uncondensed local residual, H(div) flux preservation and shared-face
 conservative two-sided DG facet scatter, H(curl) circulation preservation, and exact simplex
 incidence identities.
 
+The FC9 gate checks nonmatching mortar work conservation, hp partition/gradient identities,
+hanging-node prolongation and constraint rows, dense-reference sum factorization, accelerator
+pack/unpack identity, exact clipped polynomial integration, and quadrature-partial JVP agreement
+with generated Malleus interpreter execution and centered differences.
+
 ## Next
 
-Start FC9 transfer, hp, hanging-node, or optimized realization only from a concrete acceptance
-case; do not describe the FC8 reference contracts as production compatible-space solves.
+Extend these contracts to production multidimensional hp/embedded meshes or target code only from
+a concrete acceptance case; keep point-QFunction meaning and backend numerical policy explicit.

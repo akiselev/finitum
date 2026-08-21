@@ -1,6 +1,6 @@
 # Finitum
 
-Finitum is Sinbad's concrete discretization and global-realization layer. Its checked FC6--FC8
+Finitum is Sinbad's concrete discretization and global-realization layer. Its checked FC6--FC9
 implementation contains:
 
 - simplex meshes with finite coordinates, valid connectivity, and distinct vertices per cell;
@@ -11,7 +11,7 @@ implementation contains:
   FC5 modules to concrete mesh, geometry, DOF, constraint, and coefficient data;
 - deterministic P1 simplex gather, value/gradient basis actions, generated primal/JVP execution,
   quadrature weighting, basis transpose, and scatter;
-- fixed essential-value lifting and identity rows; and
+- affine constraint prolongation/restriction, lifting, and constraint rows;
 - matrix-free and canonical CSR operators implementing Solverang's `LinearOperator` directly;
 - independent runtime state/rate residual and JVP actions; and
 - dynamic point inputs chained through generated parameter-JVP kernels; and
@@ -21,13 +21,19 @@ implementation contains:
   covariant and contravariant Piola maps, and oriented edge/facet restrictions;
 - exact triangle/tetrahedron incidence sequences and element-local Schur condensation; and
 - a digest-linked `SystemRealizationPlan` consuming Resolvent block systems and complete Malleus
-  bundles.
+  bundles;
+- nonmatching trace transfer and conservative mortar scatter, per-cell hp segment tables and
+  hanging-node interpolation;
+- distinct element-assembled and quadrature-partial operators, fixed-width cell batching,
+  accelerator-friendly component/lane packing, and tensor-product sum factorization; and
+- a concrete level-set policy and exact reference quadrature for clipped segments.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
-with fixed essential values. FC8's mixed/facet/compatible path is a deterministic reference
+with affine essential and hanging-node constraints. FC8's mixed/facet/compatible path is a deterministic reference
 planning, mapping, topology, and evidence contract; production compatible basis tables and global
-mixed solves are not claimed. Affine dependency elimination, partial assembly, and optimized
-backends remain later phases. The FC6 linear view evaluates JVPs at zero active input; FC7 callers
+mixed solves are not claimed. FC9's advanced paths are likewise bounded reference contracts: they
+do not claim production multidimensional hp/embedded meshes or a SIMD/GPU backend. The FC6 linear
+view evaluates JVPs at zero active input; FC7 callers
 use runtime state/rate methods. The caller supplies the mapping from semantic boundary
 requirements to concrete constrained DOFs; Finitum checks extents and presence, not
 boundary-partition membership.

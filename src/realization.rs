@@ -15,6 +15,7 @@ use resolvent::{
 use serde::Serialize;
 use solverang::{CsrMatrix, EvaluationContext, LinearOperator, NumericError};
 
+use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
 use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};
 
 /// Concrete quadrature-point values for one non-basis QFunction input.
@@ -334,10 +335,24 @@ impl RealizationPlan {
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         self.validate_time_action(time, state, state_rate, output)?;
-        output.fill(0.0);
-        self.apply_cells(time, state, state_rate, None, None, output, Action::Primal)?;
+        let physical_state = self.data.constraints.expand(state)?;
+        let physical_rate = self.data.constraints.expand_homogeneous(state_rate)?;
+        let mut physical_output = vec![0.0; self.dimension()];
+        self.apply_cells(
+            time,
+            &physical_state,
+            &physical_rate,
+            None,
+            None,
+            &mut physical_output,
+            Action::Primal,
+        )?;
+        output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
         for constraint in self.data.constraints.constraints() {
-            output[constraint.target.0] = state[constraint.target.0] - constraint.offset;
+            output[constraint.target.0] = self
+                .data
+                .constraints
+                .equation_residual(state, constraint.target)?;
         }
         validate_finite("stateful residual", output)
     }
@@ -356,18 +371,26 @@ impl RealizationPlan {
         self.validate_time_action(time, state, state_rate, output)?;
         self.validate_action(state_direction, output)?;
         self.validate_action(rate_direction, output)?;
-        output.fill(0.0);
+        let physical_state = self.data.constraints.expand(state)?;
+        let physical_rate = self.data.constraints.expand_homogeneous(state_rate)?;
+        let physical_state_direction = self.data.constraints.expand_homogeneous(state_direction)?;
+        let physical_rate_direction = self.data.constraints.expand_homogeneous(rate_direction)?;
+        let mut physical_output = vec![0.0; self.dimension()];
         self.apply_cells(
             time,
-            state,
-            state_rate,
-            Some(state_direction),
-            Some(rate_direction),
-            output,
+            &physical_state,
+            &physical_rate,
+            Some(&physical_state_direction),
+            Some(&physical_rate_direction),
+            &mut physical_output,
             Action::Jvp,
         )?;
+        output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
         for constraint in self.data.constraints.constraints() {
-            output[constraint.target.0] = state_direction[constraint.target.0];
+            output[constraint.target.0] = self
+                .data
+                .constraints
+                .direction_residual(state_direction, constraint.target)?;
         }
         validate_finite("stateful JVP", output)
     }
@@ -402,15 +425,164 @@ impl RealizationPlan {
         })
     }
 
+    /// Precompute dense cell actions while retaining element restrictions and global scatter.
+    pub fn element_assembly(
+        &self,
+        lane_width: usize,
+    ) -> Result<ElementAssemblyOperator, FinitumError> {
+        let dimension = self.dimension();
+        let zero = vec![0.0; dimension];
+        let mut local_matrices = Vec::with_capacity(self.data.dofs.restrictions().len());
+        for (cell, restriction) in self.data.dofs.restrictions().iter().enumerate() {
+            let local_dimension = restriction.dofs.len();
+            let mut matrix = vec![0.0; local_dimension * local_dimension];
+            for (column, dof) in restriction.dofs.iter().enumerate() {
+                let mut direction = vec![0.0; dimension];
+                direction[dof.0] = 1.0;
+                let mut output = vec![0.0; dimension];
+                self.apply_cell(
+                    cell,
+                    0.0,
+                    &zero,
+                    &zero,
+                    Some(&direction),
+                    Some(&zero),
+                    &mut output,
+                    Action::Jvp,
+                )?;
+                for (row, row_dof) in restriction.dofs.iter().enumerate() {
+                    matrix[row * local_dimension + column] = output[row_dof.0];
+                }
+            }
+            local_matrices.push(matrix);
+        }
+        ElementAssemblyOperator::new(
+            dimension,
+            self.source_factorization_digest().clone(),
+            self.data.dofs.restrictions().to_vec(),
+            self.data.constraints.clone(),
+            local_matrices,
+            lane_width,
+        )
+    }
+
+    /// Precompute quadrature-point Jacobians while retaining basis actions and restrictions.
+    pub fn partial_assembly(
+        &self,
+        lane_width: usize,
+    ) -> Result<PartialAssemblyOperator, FinitumError> {
+        if self
+            .data
+            .external
+            .values()
+            .any(|binding| matches!(binding, ExternalBinding::Dynamic(_)))
+        {
+            return Err(FinitumError::UnsupportedRealization(
+                "partial assembly currently requires state-independent external inputs".into(),
+            ));
+        }
+        let mut point_actions = Vec::with_capacity(self.data.dofs.restrictions().len());
+        for (cell, restriction) in self.data.dofs.restrictions().iter().enumerate() {
+            let geometry = &self.data.geometries[cell];
+            let zero = vec![0.0; restriction.dofs.len()];
+            let mut cell_actions = Vec::new();
+            for (point, quadrature) in self.data.element.quadrature().iter().enumerate() {
+                let scale = quadrature.weight * geometry.determinant;
+                for integral in &self.data.factorization.integrals {
+                    let (inputs, _) =
+                        self.point_inputs(integral, cell, point, geometry, 0.0, &zero, &zero)?;
+                    let active_inputs = integral
+                        .primal
+                        .inputs
+                        .iter()
+                        .filter(|input| {
+                            input.source == InputSourceRequirement::Basis
+                                && input.role == TensorInputRole::Active
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let input_components = active_inputs
+                        .iter()
+                        .map(|input| component_count(&input.shape))
+                        .sum::<Result<usize, _>>()?;
+                    if input_components == 0 {
+                        continue;
+                    }
+                    for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                        let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+                        let mut columns = Vec::with_capacity(input_components);
+                        for selected in 0..input_components {
+                            let mut directions = integral
+                                .primal
+                                .inputs
+                                .iter()
+                                .map(|input| {
+                                    component_count(&input.shape)
+                                        .map(|count| (input.id, vec![0.0; count]))
+                                })
+                                .collect::<Result<BTreeMap<_, _>, _>>()?;
+                            let mut offset = 0;
+                            for input in &active_inputs {
+                                let count = component_count(&input.shape)?;
+                                if (offset..offset + count).contains(&selected) {
+                                    directions.get_mut(&input.id).expect("input was inserted")
+                                        [selected - offset] = 1.0;
+                                    break;
+                                }
+                                offset += count;
+                            }
+                            columns.push(self.execute_jvp_values(bound, &inputs, &directions)?);
+                        }
+                        let output_components = columns[0].len();
+                        if columns
+                            .iter()
+                            .any(|column| column.len() != output_components)
+                        {
+                            return Err(FinitumError::InvalidRealization(
+                                "partial point Jacobian has inconsistent output extents".into(),
+                            ));
+                        }
+                        let mut matrix = vec![0.0; output_components * input_components];
+                        for (column, values) in columns.iter().enumerate() {
+                            for (row, value) in values.iter().copied().enumerate() {
+                                matrix[row * input_components + column] = value;
+                            }
+                        }
+                        cell_actions.push(PartialPointAction {
+                            point,
+                            scale,
+                            active_inputs: active_inputs.clone(),
+                            output_derivative: qoutput.binding.evaluation.derivative,
+                            output_components,
+                            matrix,
+                        });
+                    }
+                }
+            }
+            point_actions.push(cell_actions);
+        }
+        PartialAssemblyOperator::new(
+            self.dimension(),
+            self.source_factorization_digest().clone(),
+            self.data.dofs.restrictions().to_vec(),
+            self.data.constraints.clone(),
+            self.data.element.clone(),
+            self.data.geometries.clone(),
+            point_actions,
+            lane_width,
+        )
+    }
+
     /// Build the affine right-hand side from the generated primal kernels and fixed essential
     /// values. No source term is duplicated in Finitum.
     pub fn load_vector(&self) -> Result<Vec<f64>, FinitumError> {
-        let mut lifting = vec![0.0; self.dimension()];
-        for constraint in self.data.constraints.constraints() {
-            lifting[constraint.target.0] = constraint.offset;
-        }
-        let mut residual = vec![0.0; self.dimension()];
-        self.apply_primal(&lifting, &mut residual)?;
+        let lifting = self.data.constraints.expand(&vec![0.0; self.dimension()])?;
+        let mut physical_residual = vec![0.0; self.dimension()];
+        self.apply_primal(&lifting, &mut physical_residual)?;
+        let mut residual = self
+            .data
+            .constraints
+            .restrict_transpose(&physical_residual)?;
         for value in &mut residual {
             *value = -*value;
         }
@@ -422,11 +594,8 @@ impl RealizationPlan {
 
     fn apply_direction(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
         self.validate_action(input, output)?;
-        let mut homogeneous = input.to_vec();
-        for constraint in self.data.constraints.constraints() {
-            homogeneous[constraint.target.0] = 0.0;
-        }
-        output.fill(0.0);
+        let homogeneous = self.data.constraints.expand_homogeneous(input)?;
+        let mut physical_output = vec![0.0; self.dimension()];
         let zero = vec![0.0; self.dimension()];
         self.apply_cells(
             0.0,
@@ -434,11 +603,15 @@ impl RealizationPlan {
             &zero,
             Some(&homogeneous),
             Some(&zero),
-            output,
+            &mut physical_output,
             Action::Jvp,
         )?;
+        output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
         for constraint in self.data.constraints.constraints() {
-            output[constraint.target.0] = input[constraint.target.0];
+            output[constraint.target.0] = self
+                .data
+                .constraints
+                .direction_residual(input, constraint.target)?;
         }
         validate_finite("matrix-free output", output)
     }
@@ -490,85 +663,111 @@ impl RealizationPlan {
         output: &mut [f64],
         action: Action,
     ) -> Result<(), FinitumError> {
-        for (cell_index, restriction) in self.data.dofs.restrictions().iter().enumerate() {
-            let geometry = &self.data.geometries[cell_index];
-            let local_state = restriction
+        for cell_index in 0..self.data.dofs.restrictions().len() {
+            self.apply_cell(
+                cell_index,
+                time,
+                state,
+                state_rate,
+                state_direction,
+                rate_direction,
+                output,
+                action,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_cell(
+        &self,
+        cell_index: usize,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        state_direction: Option<&[f64]>,
+        rate_direction: Option<&[f64]>,
+        output: &mut [f64],
+        action: Action,
+    ) -> Result<(), FinitumError> {
+        let restriction = &self.data.dofs.restrictions()[cell_index];
+        let geometry = &self.data.geometries[cell_index];
+        let local_state = restriction
+            .dofs
+            .iter()
+            .map(|dof| state[dof.0])
+            .collect::<Vec<_>>();
+        let local_rate = restriction
+            .dofs
+            .iter()
+            .map(|dof| state_rate[dof.0])
+            .collect::<Vec<_>>();
+        let local_state_direction = state_direction.map(|direction| {
+            restriction
                 .dofs
                 .iter()
-                .map(|dof| state[dof.0])
-                .collect::<Vec<_>>();
-            let local_rate = restriction
+                .map(|dof| direction[dof.0])
+                .collect::<Vec<_>>()
+        });
+        let local_rate_direction = rate_direction.map(|direction| {
+            restriction
                 .dofs
                 .iter()
-                .map(|dof| state_rate[dof.0])
-                .collect::<Vec<_>>();
-            let local_state_direction = state_direction.map(|direction| {
-                restriction
-                    .dofs
-                    .iter()
-                    .map(|dof| direction[dof.0])
-                    .collect::<Vec<_>>()
-            });
-            let local_rate_direction = rate_direction.map(|direction| {
-                restriction
-                    .dofs
-                    .iter()
-                    .map(|dof| direction[dof.0])
-                    .collect::<Vec<_>>()
-            });
-            let mut local_output = vec![0.0; restriction.dofs.len()];
-            for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
-                let scale = point.weight * geometry.determinant;
-                for integral in &self.data.factorization.integrals {
-                    for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
-                        let bound = &self.data.bundles[&(integral.integral_index, output_index)];
-                        let point_output = match action {
-                            Action::Primal => self.execute_primal(
-                                bound,
-                                integral,
-                                cell_index,
-                                point_index,
-                                geometry,
-                                time,
-                                &local_state,
-                                &local_rate,
-                            )?,
-                            Action::Jvp => self.execute_jvp(
-                                bound,
-                                integral,
-                                cell_index,
-                                point_index,
-                                geometry,
-                                time,
-                                &local_state,
-                                &local_rate,
-                                local_state_direction.as_deref().ok_or_else(|| {
-                                    FinitumError::InvalidRealization(
-                                        "JVP action is missing a state direction".into(),
-                                    )
-                                })?,
-                                local_rate_direction.as_deref().ok_or_else(|| {
-                                    FinitumError::InvalidRealization(
-                                        "JVP action is missing a rate direction".into(),
-                                    )
-                                })?,
-                            )?,
-                        };
-                        apply_basis_adjoint(
-                            &self.data.element,
-                            geometry,
+                .map(|dof| direction[dof.0])
+                .collect::<Vec<_>>()
+        });
+        let mut local_output = vec![0.0; restriction.dofs.len()];
+        for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
+            let scale = point.weight * geometry.determinant;
+            for integral in &self.data.factorization.integrals {
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+                    let point_output = match action {
+                        Action::Primal => self.execute_primal(
+                            bound,
+                            integral,
+                            cell_index,
                             point_index,
-                            &qoutput.binding.evaluation.derivative,
-                            &point_output,
-                            scale,
-                            &mut local_output,
-                        )?;
-                    }
+                            geometry,
+                            time,
+                            &local_state,
+                            &local_rate,
+                        )?,
+                        Action::Jvp => self.execute_jvp(
+                            bound,
+                            integral,
+                            cell_index,
+                            point_index,
+                            geometry,
+                            time,
+                            &local_state,
+                            &local_rate,
+                            local_state_direction.as_deref().ok_or_else(|| {
+                                FinitumError::InvalidRealization(
+                                    "JVP action is missing a state direction".into(),
+                                )
+                            })?,
+                            local_rate_direction.as_deref().ok_or_else(|| {
+                                FinitumError::InvalidRealization(
+                                    "JVP action is missing a rate direction".into(),
+                                )
+                            })?,
+                        )?,
+                    };
+                    apply_basis_adjoint(
+                        &self.data.element,
+                        geometry,
+                        point_index,
+                        &qoutput.binding.evaluation.derivative,
+                        &point_output,
+                        scale,
+                        &mut local_output,
+                    )?;
                 }
             }
-            for (local, dof) in restriction.dofs.iter().enumerate() {
-                output[dof.0] += local_output[local];
-            }
+        }
+        for (local, dof) in restriction.dofs.iter().enumerate() {
+            output[dof.0] += local_output[local];
         }
         Ok(())
     }
@@ -655,6 +854,15 @@ impl RealizationPlan {
             local_rate_direction,
             &evaluation,
         )?;
+        self.execute_jvp_values(bound, &inputs, &directions)
+    }
+
+    fn execute_jvp_values(
+        &self,
+        bound: &BoundBundle,
+        inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+        directions: &BTreeMap<TensorInputId, Vec<f64>>,
+    ) -> Result<Vec<f64>, FinitumError> {
         let input_by_operand = bound
             .bundle
             .primal_inputs
@@ -962,7 +1170,7 @@ fn realization_digest(
         })
         .collect();
     let payload = RealizationDigestPayload {
-        schema: "finitum-realization-plan/1",
+        schema: "finitum-realization-plan/2",
         requirements: &requirements.artifact_digest,
         factorization: &factorization.artifact_digest,
         kernels: &kernels.artifact_digest,
@@ -1027,12 +1235,6 @@ fn validate_discretization(
             constraints.dof_count(),
             dofs.dof_count()
         )));
-    }
-    if constraints.has_affine_dependencies() {
-        return Err(FinitumError::UnsupportedRealization(
-            "FC6 essential realization supports fixed values; affine dependency elimination is deferred"
-                .into(),
-        ));
     }
     if !factorization.essential_constraints.is_empty() && constraints.constraints().next().is_none()
     {
@@ -1300,7 +1502,7 @@ fn bind_kernels(
     Ok(bound)
 }
 
-fn evaluate_basis_input(
+pub(crate) fn evaluate_basis_input(
     element: &PreparedElement,
     geometry: &CellGeometry,
     point: usize,
@@ -1342,7 +1544,7 @@ fn evaluate_basis_input(
     }
 }
 
-fn apply_basis_adjoint(
+pub(crate) fn apply_basis_adjoint(
     element: &PreparedElement,
     geometry: &CellGeometry,
     point: usize,
@@ -1476,7 +1678,7 @@ fn numeric_error(error: FinitumError) -> NumericError {
 }
 
 #[derive(Clone, Debug)]
-struct CellGeometry {
+pub(crate) struct CellGeometry {
     dimension: usize,
     origin: Vec<f64>,
     jacobian: Vec<f64>,

@@ -78,13 +78,20 @@ impl ConstraintSet {
         self.constraints.contains_key(&dof)
     }
 
-    pub(crate) fn has_affine_dependencies(&self) -> bool {
-        self.constraints
-            .values()
-            .any(|constraint| !constraint.dependencies.is_empty())
+    /// Expand free coordinates through the affine constraint graph.
+    pub fn expand_homogeneous(&self, values: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        self.expand_with_offsets(values, false)
     }
 
     pub fn expand(&self, unconstrained: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        self.expand_with_offsets(unconstrained, true)
+    }
+
+    fn expand_with_offsets(
+        &self,
+        unconstrained: &[f64],
+        include_offsets: bool,
+    ) -> Result<Vec<f64>, FinitumError> {
         if unconstrained.len() != self.dof_count {
             return Err(FinitumError::ConstraintInputLength {
                 actual: unconstrained.len(),
@@ -97,9 +104,87 @@ impl ConstraintSet {
         let mut values = unconstrained.to_vec();
         let mut resolved = BTreeSet::new();
         for target in self.constraints.keys().copied() {
-            self.resolve(target, &mut values, &mut resolved)?;
+            self.resolve(target, &mut values, &mut resolved, include_offsets)?;
         }
         Ok(values)
+    }
+
+    /// Apply the transpose of the homogeneous constraint prolongation.
+    ///
+    /// Constrained entries are recursively accumulated into unconstrained masters and cleared.
+    pub fn restrict_transpose(&self, values: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        self.validate_values(values)?;
+        let mut restricted = vec![0.0; self.dof_count];
+        for (dof, value) in values.iter().copied().enumerate() {
+            self.accumulate_master(DofId(dof), value, &mut restricted)?;
+        }
+        if let Some(dof) = restricted.iter().position(|value| !value.is_finite()) {
+            return Err(FinitumError::NonFiniteConstraintResult(dof));
+        }
+        Ok(restricted)
+    }
+
+    /// Residual of each explicit affine constraint equation in full coordinates.
+    pub fn equation_residual(&self, values: &[f64], target: DofId) -> Result<f64, FinitumError> {
+        self.validate_values(values)?;
+        let constraint = self
+            .constraints
+            .get(&target)
+            .ok_or(FinitumError::InvalidConstraintTarget(target.0))?;
+        let mut residual = values[target.0] - constraint.offset;
+        for dependency in &constraint.dependencies {
+            residual -= dependency.weight * values[dependency.dof.0];
+        }
+        if !residual.is_finite() {
+            return Err(FinitumError::NonFiniteConstraintResult(target.0));
+        }
+        Ok(residual)
+    }
+
+    /// Residual of the homogeneous linearized constraint equation.
+    pub fn direction_residual(&self, values: &[f64], target: DofId) -> Result<f64, FinitumError> {
+        self.validate_values(values)?;
+        let constraint = self
+            .constraints
+            .get(&target)
+            .ok_or(FinitumError::InvalidConstraintTarget(target.0))?;
+        let mut residual = values[target.0];
+        for dependency in &constraint.dependencies {
+            residual -= dependency.weight * values[dependency.dof.0];
+        }
+        if !residual.is_finite() {
+            return Err(FinitumError::NonFiniteConstraintResult(target.0));
+        }
+        Ok(residual)
+    }
+
+    fn validate_values(&self, values: &[f64]) -> Result<(), FinitumError> {
+        if values.len() != self.dof_count {
+            return Err(FinitumError::ConstraintInputLength {
+                actual: values.len(),
+                expected: self.dof_count,
+            });
+        }
+        if let Some(dof) = values.iter().position(|value| !value.is_finite()) {
+            return Err(FinitumError::NonFiniteConstraintInput(dof));
+        }
+        Ok(())
+    }
+
+    fn accumulate_master(
+        &self,
+        dof: DofId,
+        value: f64,
+        restricted: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let Some(constraint) = self.constraints.get(&dof) else {
+            restricted[dof.0] += value;
+            return Ok(());
+        };
+        for dependency in &constraint.dependencies {
+            self.accumulate_master(dependency.dof, dependency.weight * value, restricted)?;
+        }
+        Ok(())
     }
 
     fn resolve(
@@ -107,6 +192,7 @@ impl ConstraintSet {
         target: DofId,
         values: &mut [f64],
         resolved: &mut BTreeSet<DofId>,
+        include_offsets: bool,
     ) -> Result<(), FinitumError> {
         if resolved.contains(&target) {
             return Ok(());
@@ -114,9 +200,13 @@ impl ConstraintSet {
         let Some(constraint) = self.constraints.get(&target) else {
             return Ok(());
         };
-        let mut value = constraint.offset;
+        let mut value = if include_offsets {
+            constraint.offset
+        } else {
+            0.0
+        };
         for dependency in &constraint.dependencies {
-            self.resolve(dependency.dof, values, resolved)?;
+            self.resolve(dependency.dof, values, resolved, include_offsets)?;
             value += dependency.weight * values[dependency.dof.0];
         }
         if !value.is_finite() {
