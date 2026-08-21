@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: FC7 stateful realization complete
+Milestone: FC8 mixed, facet, and compatible realization contracts complete
 
 ## Implemented
 
@@ -29,6 +29,17 @@ Milestone: FC7 stateful realization complete
 - fixed essential residual rows and their consistent state-direction JVP rows.
 - deterministic concrete-plan identity covering the artifact chain, mesh, element, DOF map,
   constraints, stored external values, and caller-declared dynamic-input identities.
+- product-space block layouts with explicit field/entity/component ownership and deterministic
+  gather/scatter;
+- deterministic simplex exterior/interior facet topology, explicit reversible minus/plus
+  interface ordering, and cell-to-facet orientation signs;
+- affine H(curl) covariant and H(div) contravariant Piola maps, oriented edge/facet DOF
+  restrictions, and triangle/tetrahedron incidence complexes that verify curl-grad and div-curl
+  are exactly zero;
+- element-local Schur condensation with a retained trace system and full interior recovery map;
+- `SystemRealizationPlan`, which validates Resolvent block coordinates and the complete
+  form/factorization/Malleus receipt chain before digest-binding it to a mesh, block layout,
+  facets, compatible maps, and exact-sequence evidence.
 
 ## Boundary
 
@@ -36,10 +47,11 @@ Resolvent owns the abstract space and form meaning. Malleus owns executable loca
 Finitum owns their concrete mesh/space binding and global realization. Krasis owns coupled
 state and Solverang owns numerical algorithms.
 
-The manifest now depends directly on Resolvent, Malleus, and Solverang because the realization
-plan consumes their concrete artifacts and trait. FC6 supports scalar H1(order=1) cell integrals
-and fixed essential constraints. Other spaces, facet traversal, affine dependency elimination,
-partial assembly, and optimized backends remain deferred.
+The manifest now depends directly on Resolvent, Malleus, and Solverang because realization plans
+consume their concrete artifacts and trait. The FC6/FC7 executable action remains scalar
+H1(order=1) cell integration with fixed essential constraints. FC8 adds deterministic mixed,
+facet, Piola, exact-sequence, and condensation reference contracts; production compatible basis
+tables, global mixed solves, partial assembly, and optimized backends remain deferred.
 
 The FC6 linear operator continues to evaluate generated JVPs at zero active input. FC7 callers use
 the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
@@ -58,7 +70,7 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets           # 10 passed, 0 failed
+cargo test --all-targets           # 15 passed, 0 failed
 git diff --check
 ```
 
@@ -69,7 +81,12 @@ exact P1 nodal value within `1e-12`.
 The FC7 gate compiles a transient nonlinear form and verifies the combined generated state/rate
 and dynamic-property JVP against centered differences.
 
+The FC8 gate independently checks vector/tensor block ownership, a Stokes-like Schur complement
+against the uncondensed local residual, H(div) flux preservation and shared-facet signs, a
+conservative two-sided DG facet scatter, H(curl) circulation preservation, and exact simplex
+incidence identities.
+
 ## Next
 
-Extend realization only when FC8 or later acceptance cases require another concrete evaluation,
-constraint, traversal, or assembly contract.
+Start FC9 transfer, hp, hanging-node, or optimized realization only from a concrete acceptance
+case; do not describe the FC8 reference contracts as production compatible-space solves.
