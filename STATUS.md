@@ -32,7 +32,8 @@ Milestone: FC11 realization artifact inspection complete
   constraints, stored external values, and caller-declared dynamic-input identities.
 - a complete serializable `RealizationArtifact` projection for product inspection and cache
   records, including source artifact digests, mesh, element tables, DOF map, constraints, stored
-  values, and dynamic-input identities; generated executables remain rebuildable data.
+  values, and dynamic-input identities; it does not deserialize or reconstruct a realization,
+  and generated executables remain absent.
 - product-space block layouts with explicit field/entity/component ownership and deterministic
   gather/scatter;
 - deterministic simplex exterior/interior facet topology, explicit reversible minus/plus

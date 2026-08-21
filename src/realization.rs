@@ -225,9 +225,10 @@ pub struct RealizationPlan {
 
 /// Stable, fully inspectable projection of a concrete realization.
 ///
-/// Executable modules are deterministically rebuilt from the archived Resolvent/Malleus kernel
-/// bundle. Dynamic callbacks cannot be serialized and are therefore represented by the identity
-/// that already participates in the realization digest.
+/// This projection records identities and serializable data for artifact inspection. It is not a
+/// deserialization or `RealizationPlan` reconstruction API: generated executables are absent, and
+/// dynamic callbacks are represented only by the identity that participates in the realization
+/// digest.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RealizationArtifact {
     pub schema: String,
@@ -368,7 +369,7 @@ impl RealizationPlan {
         &self.data.requirements.artifact_digest
     }
 
-    /// Capture every identity-sensitive input needed to inspect or rebuild this realization.
+    /// Capture every identity-sensitive input exposed by this realization for inspection.
     pub fn artifact(&self) -> RealizationArtifact {
         let external_inputs = self
             .data

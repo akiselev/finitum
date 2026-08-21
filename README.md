@@ -19,8 +19,8 @@ implementation contains:
 - a concrete realization digest covering artifacts, mesh, element tables, DOF map, constraints,
   stored values, and explicit dynamic-input identities;
 - an FC11 `RealizationArtifact` projection containing that digest and every identity-sensitive
-  rebuild input; dynamic callbacks are represented by the identities already covered by the
-  digest, while executables are deterministically rebuilt from archived kernels;
+  serializable input for inspection; it is not a reconstruction API, generated executables are
+  absent, and dynamic callbacks are represented only by their digest-covered identities;
 - component-explicit product layouts, oriented exterior/interior/interface facet traversal,
   covariant and contravariant Piola maps, and oriented edge/facet restrictions;
 - exact triangle/tetrahedron incidence sequences and element-local Schur condensation; and
