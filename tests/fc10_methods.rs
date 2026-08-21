@@ -3,13 +3,13 @@ use finitum::{
     FiniteVolumeRealization, MethodRealization, NetworkDaeRealization, ParticlePair,
     ParticleRealization, RadialPairPolynomial,
 };
+use methodus::{DaeOperator, EvaluationContext, verify_dae_jvp};
 use quantitas::UnitRegistry;
 use scientia::{
     AffineMethodKernelSpec, MethodProgram, compile_boundary_integral_method,
     compile_conservation_law_method, compile_finite_difference_method, compile_network_dae_method,
     compile_particle_method, compile_semantics,
 };
-use solverang::{DaeOperator, EvaluationContext, verify_dae_jvp};
 
 const SOURCE: &str = r#"
 module fixtures.fc10;

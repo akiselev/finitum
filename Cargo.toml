@@ -12,7 +12,7 @@ malleus = { path = "../malleus" }
 scientia = { path = "../scientia" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-solverang = { path = "../solverang" }
+methodus = { path = "../methodus" }
 thiserror = "2"
 
 [dev-dependencies]

@@ -5,6 +5,7 @@ use malleus::{
     AccessMode, BufferBinding, Executable, ExecutableModule, Interpreter, OperandId,
     validate_module,
 };
+use methodus::{CsrMatrix, EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
 use scientia::scientific::ValueShape;
 use scientia::{
     DerivativeEvaluation, Digest, ElementFamilyRequirement, EvaluationSite, FormRequirements,
@@ -13,7 +14,6 @@ use scientia::{
     TensorInputRole,
 };
 use serde::Serialize;
-use solverang::{CsrMatrix, EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
 
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
 use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};

@@ -4,14 +4,14 @@ use finitum::{
     HangingNodeConstraint, Mesh, MortarInterface, NonmatchingTransfer, PreparedElement,
     RealizationPlan, TensorProductBasis, VariableOrderSegmentElements, VertexId,
 };
+use methodus::{
+    ConjugateGradientConfig, EvaluationContext, LinearOperator, OperatorSymmetry, SolveError,
+    solve_conjugate_gradient,
+};
 use quantitas::UnitRegistry;
 use scientia::{
     InputSourceRequirement, TensorInputRole, compile_semantics, derive_variational_form,
     factor_operator, infer_form_requirements, lower_operator_kernels,
-};
-use solverang::{
-    ConjugateGradientConfig, EvaluationContext, LinearOperator, OperatorSymmetry, SolveError,
-    solve_conjugate_gradient,
 };
 
 const POISSON: &str = r#"

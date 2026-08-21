@@ -1,7 +1,7 @@
 use crate::realization::{CellGeometry, apply_basis_adjoint, evaluate_basis_input};
 use crate::{ConstraintSet, ElementRestriction, FinitumError, PreparedElement};
+use methodus::{EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
 use scientia::{DerivativeEvaluation, Digest, QFunctionInput};
-use solverang::{EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
 
 /// Fixed-width cell batches with explicit inactive padding lanes.
 #[derive(Clone, Debug, PartialEq, Eq)]

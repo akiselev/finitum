@@ -21,7 +21,7 @@ Milestone: R1 Scientia consumer migration
 - affine constraint prolongation, transpose restriction, lifting, and explicit constraint rows for
   both residual and directional actions, including nested hanging-node dependencies;
 - one `RealizationPlan` producing matrix-free and canonical CSR assembled operators through the
-  same generated JVP execution; both implement Solverang `LinearOperator` directly.
+  same generated JVP execution; both implement Methodus `LinearOperator` directly.
 - independent runtime state and state-rate basis bindings for generated primal residuals;
 - generated JVP evaluation at the actual linearization point, with independent state/rate
   directions;
@@ -63,9 +63,9 @@ Milestone: R1 Scientia consumer migration
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
 Finitum owns their concrete mesh/space binding and global realization. Krasis owns coupled
-state and Solverang owns numerical algorithms.
+state and Methodus owns numerical algorithms.
 
-The manifest now depends directly on Scientia, Malleus, and Solverang because realization plans
+The manifest now depends directly on Scientia, Malleus, and Methodus because realization plans
 consume their concrete artifacts and trait. The FC6/FC7 executable action remains scalar
 H1(order=1) cell integration. FC8 adds deterministic mixed, facet, Piola, exact-sequence, and
 condensation reference contracts. FC9 adds reference transfer, affine-constraint, partial,
@@ -73,6 +73,10 @@ batched, packed, sum-factorized, variable-order-segment, and clipped-segment pat
 tables are not integrated into `RealizationPlan`; there is no local refinement, AMR topology,
 geometrically derived hanging-node map, multidimensional hp realization, production SIMD/GPU
 backend, or embedded-domain source semantics.
+
+The numerical dependency moved directly from Solverang to Methodus at Methodus
+`d5354abb4dfd197ba5fd66f3742f9820701e4c43`; Finitum has no dependency on the
+generalized Solverang constraint engine.
 
 The FC10 `MethodProgram` and FC11 serialized-kernel contracts were validated against Scientia
 `215433962c874dfd86b59ffc6d69f017bba2b95a` and Malleus
@@ -90,7 +94,7 @@ deliberate fixture-grade costs, not production performance claims.
 The matrix-free, element-assembled, and partial constructors all freeze the generated JVP at zero
 state/rate. Affine dependency constraints replace target rows with algebraic constraint residuals,
 so the full-coordinate action is nonsymmetric even when the reduced `P^T A P` block is symmetric;
-the operators declare this to Solverang and conjugate gradient refuses it. Equispaced segment
+the operators declare this to Methodus and conjugate gradient refuses it. Equispaced segment
 nodes through order 16 are reference data and are not a well-conditioned high-order basis claim.
 
 FC10 remains a reference contract rather than a production meshless or particle engine. FV uses

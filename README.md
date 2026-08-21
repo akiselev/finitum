@@ -13,7 +13,7 @@ implementation contains:
   quadrature weighting, basis transpose, and scatter;
 - affine constraint prolongation/restriction, lifting, and constraint rows, with dependent-row
   actions explicitly classified as nonsymmetric;
-- matrix-free and canonical CSR operators implementing Solverang's `LinearOperator` directly;
+- matrix-free and canonical CSR operators implementing Methodus's `LinearOperator` directly;
 - independent runtime state/rate residual and JVP actions; and
 - dynamic point inputs chained through generated parameter-JVP kernels; and
 - a concrete realization digest covering artifacts, mesh, element tables, DOF map, constraints,
@@ -53,5 +53,5 @@ tables and quadrature weights.
 
 This is a deterministic reference realization, not a production hot path: point execution
 allocates interpreter buffers, external sampling prepares geometry independently, and CSR
-assembly takes one matrix-free action per column. Krasis owns coupled state; Solverang owns
+assembly takes one matrix-free action per column. Krasis owns coupled state; Methodus owns
 numerical algorithms.

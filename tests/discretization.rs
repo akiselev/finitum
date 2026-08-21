@@ -3,15 +3,15 @@ use finitum::{
     ExternalInput, FinitumError, Mesh, PreparedElement, QuadraturePoint, RealizationPlan, VertexId,
     WeightedDof,
 };
+use methodus::{
+    ConjugateGradientConfig, ConjugateGradientSymmetryPolicy, EvaluationContext, LinearOperator,
+    solve_conjugate_gradient,
+};
 use quantitas::UnitRegistry;
 use scientia::{
     DerivativeEvaluation, InputSourceRequirement, TensorInputId, TensorInputRole,
     compile_semantics, derive_variational_form, factor_operator, infer_form_requirements,
     lower_operator_kernels,
-};
-use solverang::{
-    ConjugateGradientConfig, ConjugateGradientSymmetryPolicy, EvaluationContext, LinearOperator,
-    solve_conjugate_gradient,
 };
 
 const POISSON: &str = r#"

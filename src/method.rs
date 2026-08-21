@@ -4,9 +4,9 @@ use crate::{FinitumError, RealizationPlan};
 use malleus::{
     BufferBinding, Executable, ExecutableModule, Interpreter, OperandId, validate_module,
 };
+use methodus::{DaeOperator, EvaluationContext, NumericError};
 use scientia::{MethodFamily, MethodProgram, MethodProgramKind};
 use serde::Serialize;
-use solverang::{DaeOperator, EvaluationContext, NumericError};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
