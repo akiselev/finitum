@@ -33,7 +33,12 @@ implementation contains:
 - a concrete level-set policy and exact reference quadrature for clipped segments.
 - digest-bound FC10 finite-volume, finite-difference, network DAE, particle-pair, and
   boundary-integral reference realizations, plus one `DiscreteOperator` boundary shared with
-  variational FEM for Krasis composition.
+  variational FEM for Krasis composition; and
+- an R3P affine-rectangle realization that freezes CADabra provider revision, semantic digest,
+  stable design-parameter coordinates, node/chart coordinates, cell/region ownership, and
+  boundary identities before producing the P1 simplex mesh and CAD-ID-selected constraints;
+  `CadPrimalPlan` retains that association digest and canonical boundary-condition projection
+  alongside the executable operator identity, rejecting forged DOF or constraint data.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference
@@ -43,9 +48,12 @@ variable-order segment tables are not integrated into `RealizationPlan`, and the
 acceptance constraint is algebraic rather than derived from local refinement. There is no hp/AMR
 realization, production multidimensional embedded mesh, or SIMD/GPU backend. The FC6 linear
 view evaluates JVPs at zero active input; FC7 callers
-use runtime state/rate methods. The caller supplies the mapping from semantic boundary
-requirements to concrete constrained DOFs; Finitum checks extents and presence, not
-boundary-partition membership. FC10's method realizations are bounded deterministic contracts:
+use runtime state/rate methods. Generic callers may still supply concrete constrained DOFs, while
+the R3P rectangle path derives their boundary membership from stable CADabra identities and
+refuses stale or source-mismatched providers, missing identities, duplicate selections, or conflicting values at
+shared corners. R3P currently supports affine rectangles contained in an XY carrier; embedded
+surface elements and geometry derivatives belong to later capabilities. FC10's method
+realizations are bounded deterministic contracts:
 FV uses oriented two-cell faces and compiled affine flux kernels, FD uses caller-supplied neighbor
 rows and compiled affine stencils, network DAEs use typed-extent dense matrices, particles use
 generic radial polynomials and explicit pairs, and boundary integrals use caller-supplied kernel

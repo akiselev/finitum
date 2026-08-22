@@ -67,4 +67,14 @@ pub enum FinitumError {
     KernelExecution(String),
     #[error("assembled realization failed: {0}")]
     Assembly(String),
+    #[error("stale CAD geometry revision: expected {expected}, got {actual}")]
+    StaleGeometryRevision { expected: u64, actual: u64 },
+    #[error("CAD provider source identity does not match the realized geometry")]
+    CadGeometrySourceMismatch,
+    #[error("CAD boundary association is missing for {0}")]
+    MissingCadBoundary(String),
+    #[error("CAD boundary association is ambiguous for {0}")]
+    AmbiguousCadBoundary(String),
+    #[error("invalid CAD geometry realization: {0}")]
+    InvalidCadGeometry(String),
 }

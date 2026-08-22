@@ -2,6 +2,7 @@
 
 mod adaptivity;
 mod block;
+mod cad_geometry;
 mod condensation;
 mod constraint;
 mod element;
@@ -19,6 +20,10 @@ mod transfer;
 
 pub use adaptivity::{HangingNodeConstraint, VariableOrderSegmentElements};
 pub use block::{BlockLayout, FieldBlock};
+pub use cad_geometry::{
+    CadBoundaryAssociation, CadBoundaryCondition, CadCellAssociation, CadGeometryRealization,
+    CadGeometrySource, CadNodeAssociation, CadParameterCoordinate, CadPrimalPlan,
+};
 pub use condensation::{CondensedLocalSystem, static_condense};
 pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint};

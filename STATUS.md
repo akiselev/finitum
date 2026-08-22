@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: R1 Scientia consumer migration
+Milestone: R3P primal CAD geometry realization
 
 ## Implemented
 
@@ -34,6 +34,12 @@ Milestone: R1 Scientia consumer migration
   records, including source artifact digests, mesh, element tables, DOF map, constraints, stored
   values, and dynamic-input identities; it does not deserialize or reconstruct a realization,
   and generated executables remain absent.
+- deterministic primal realization of an admitted CADabra affine rectangle, binding provider
+  revision and semantic digest, stable design-parameter coordinates, node/chart identities,
+  simplex/region identities, and boundary-to-vertex associations into one realization digest,
+  retained with the executable operator by `CadPrimalPlan`;
+- stable CAD-boundary-selected essential constraints with typed stale-revision, missing-boundary,
+  source-mismatch, duplicate-selection, conflicting-corner, and forged-plan refusals;
 - product-space block layouts with explicit field/entity/component ownership and deterministic
   gather/scatter;
 - deterministic simplex exterior/interior facet topology, explicit reversible minus/plus
@@ -65,8 +71,9 @@ Scientia owns the abstract space and form meaning. Malleus owns executable local
 Finitum owns their concrete mesh/space binding and global realization. Krasis owns coupled
 state and Methodus owns numerical algorithms.
 
-The manifest now depends directly on Scientia, Malleus, and Methodus because realization plans
-consume their concrete artifacts and trait. The FC6/FC7 executable action remains scalar
+The manifest now depends directly on Scientia, Malleus, Methodus, and CADabra's provider crate
+because realization plans consume their concrete artifacts and the R3P path consumes provider
+identity/maps directly. The FC6/FC7 executable action remains scalar
 H1(order=1) cell integration. FC8 adds deterministic mixed, facet, Piola, exact-sequence, and
 condensation reference contracts. FC9 adds reference transfer, affine-constraint, partial,
 batched, packed, sum-factorized, variable-order-segment, and clipped-segment paths. The segment
@@ -86,8 +93,9 @@ The FC6 linear operator continues to evaluate generated JVPs at zero active inpu
 the explicit residual and state/rate JVP actions at a runtime linearization point. Concrete
 constrained DOFs and their values are caller-supplied: Finitum verifies that semantic and concrete
 constraints are both present and that
-their extents are valid, but the mesh has no boundary-region tags with which to prove partition
-membership. Point-kernel buffers are allocated per invocation, external sampling prepares its
+their extents are valid. The R3P affine-rectangle path supplies independently digest-bound CAD
+region/boundary associations; generic meshes still have no boundary-region tags with which to
+prove partition membership. Point-kernel buffers are allocated per invocation, external sampling prepares its
 own cell geometry, and reference CSR assembly performs one operator action per column; these are
 deliberate fixture-grade costs, not production performance claims.
 
@@ -110,10 +118,11 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 26 passed, 0 failed
+cargo test --locked --workspace --all-targets           # 30 passed, 0 failed
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
-cargo test --locked --workspace --doc
+RUSTDOCFLAGS='-D warnings' cargo test --locked --workspace --doc
 git diff --check
+python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
 ```
 
 The realization gate includes an independent affine patch test on a nonuniform sheared mesh:
@@ -138,6 +147,13 @@ differences.
 The FC10 gate independently checks periodic FV conservation, a centered FD stencil, a dense
 network DAE, equal/opposite particle forces plus an energy gradient, and weighted boundary-integral
 semantics. FV/FD actions execute the digest-linked Malleus kernels emitted by Scientia.
+
+The R3P gate recreates the same mesh and every node/cell/region/boundary association from one
+provider revision, rejects stale/source-mismatched or ambiguous associations, and solves a
+Scientia-generated zero-source Poisson case whose nonzero constant essential data are selected
+only by stable CAD boundary identity. Every nodal value matches the independent manufactured
+constant solution; matrix-free and assembled actions and converged primal solutions agree. This first path is
+explicitly limited to affine rectangles in an XY carrier; R3D geometry actions are not present.
 
 ## Next
 
