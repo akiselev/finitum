@@ -186,6 +186,9 @@ nonuniform sheared affine patch above remains the independent realization oracle
 
 ## Next
 
-Integrate these providers through Krasis SV0-B4 and Sinbad SV0-B5 without moving campaign policy
-into Finitum. Extend any method topology only from a concrete acceptance case; keep local-kernel
-meaning, backend numerical policy, and realization-artifact identity explicit.
+Krasis SV0-B4, Sinbad SV0-B5, and the Sinbad-owned CAD-driven Poisson product
+cut now consume these landed providers. The next geometry capability is R3D's
+global geometry JVP/VJP and parameter pullback; it is not part of the completed
+R3P/E2 primal claim. Extend method topology only from a concrete acceptance
+case, keeping local-kernel meaning, backend policy, and realization identity
+explicit.
