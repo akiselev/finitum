@@ -38,7 +38,15 @@ implementation contains:
   stable design-parameter coordinates, node/chart coordinates, cell/region ownership, and
   boundary identities before producing the P1 simplex mesh and CAD-ID-selected constraints;
   `CadPrimalPlan` retains that association digest and canonical boundary-condition projection
-  alongside the executable operator identity, rejecting forged DOF or constraint data.
+  alongside the executable operator identity, rejecting forged DOF or constraint data; and
+- SV0-B3 reusable concrete-realization checks for nodal patches, matrix-free/global-assembled/
+  element-assembled/partial agreement, assembled global transpose work, affine-constraint work,
+  weighted nonmatching transfer conservation, exact-sequence identities, and geometry-derived
+  mesh-refinement order. Numeric comparisons and convergence fits use Methodus's B1 utilities;
+  local kernel differential campaigns remain in Malleus B2. Every serialized B3 report carries
+  a versioned schema, distinct check kind, source identity/digest, complete acceptance inputs and
+  outputs, and a canonical report digest. Fallible validators re-execute the owning concrete
+  operation and recompute every derived field; digest equality alone is not acceptance.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference
@@ -63,3 +71,11 @@ This is a deterministic reference realization, not a production hot path: point 
 allocates interpreter buffers, external sampling prepares geometry independently, and CSR
 assembly takes one matrix-free action per column. Krasis owns coupled state; Methodus owns
 numerical algorithms.
+
+SV0-B3 reports implementation checks only. Callers supply exact patch values, probes,
+tolerances, errors, and minimum convergence order; Scientia and Sinbad own scientific
+obligations, benchmark meaning, campaign acceptance, and support promotion. The mesh-refinement
+checker uses maximum simplex diameter and does not construct refined meshes or estimate error.
+The small linear patch and prescribed second-order error sequences in the B3 tests exercise the
+checker contracts; they are not discretization certification. The retained FC6 affine patch on a
+nonuniform sheared mesh remains the independent realization oracle.

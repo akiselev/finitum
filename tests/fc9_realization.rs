@@ -2,11 +2,12 @@ use finitum::{
     AcceleratorLayout, AffineConstraint, Cell, CellBatchLayout, ConstraintSet, DofId, DofMap,
     ElementRestriction, EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature, ExternalInput,
     HangingNodeConstraint, Mesh, MortarInterface, NonmatchingTransfer, PreparedElement,
-    RealizationPlan, TensorProductBasis, VariableOrderSegmentElements, VertexId,
+    RealizationPlan, TensorProductBasis, VariableOrderSegmentElements, VerificationSubject,
+    VertexId, check_global_transpose, check_realization_agreement,
 };
 use methodus::{
-    ConjugateGradientConfig, EvaluationContext, LinearOperator, OperatorSymmetry, SolveError,
-    solve_conjugate_gradient,
+    ComparisonTolerance, ConjugateGradientConfig, EvaluationContext, LinearOperator,
+    OperatorSymmetry, SolveError, solve_conjugate_gradient,
 };
 use quantitas::UnitRegistry;
 use scientia::{
@@ -26,6 +27,11 @@ model Poisson {
 }
 "#;
 
+const CHECK_TOLERANCE: ComparisonTolerance = ComparisonTolerance {
+    absolute: 2.0e-13,
+    relative: 2.0e-13,
+};
+
 #[test]
 fn fc9_contracts_refuse_ambiguous_or_malformed_data() {
     assert!(NonmatchingTransfer::lagrange(vec![0.0, 0.0], vec![0.5]).is_err());
@@ -37,6 +43,46 @@ fn fc9_contracts_refuse_ambiguous_or_malformed_data() {
     assert!(CellBatchLayout::new(2, 0).is_err());
     assert!(TensorProductBasis::new(2, 2, 2, vec![1.0; 3], vec![1.0; 4]).is_err());
     assert!(EmbeddedQuadraturePolicy::new(" ", 2, 0.0).is_err());
+}
+
+#[test]
+fn sv0_b3_provider_checks_all_global_realizations_and_transpose() {
+    let plan = poisson_plan_with_hanging_constraint();
+    let right = (0..plan.dimension())
+        .map(|index| 0.17 * index as f64 - 0.8)
+        .collect::<Vec<_>>();
+    let agreement = check_realization_agreement(&plan, &right, 4, CHECK_TOLERANCE).unwrap();
+    assert!(agreement.validate(&plan).unwrap().accepted);
+
+    let assembled = plan.assemble().unwrap();
+    let transpose = assembled.transpose().unwrap();
+    assert_eq!(
+        transpose.source_factorization_digest(),
+        assembled.source_factorization_digest()
+    );
+    let left = (0..plan.dimension())
+        .map(|index| 0.31 - 0.09 * index as f64)
+        .collect::<Vec<_>>();
+    let subject = VerificationSubject::from_serializable(
+        "generated-poisson-global-operator",
+        &(assembled.source_factorization_digest(), assembled.matrix()),
+    )
+    .unwrap();
+    let transpose_report = check_global_transpose(
+        subject.clone(),
+        &assembled,
+        &transpose,
+        &left,
+        &right,
+        CHECK_TOLERANCE,
+    )
+    .unwrap();
+    assert!(
+        transpose_report
+            .validate(subject, &assembled, &transpose)
+            .unwrap()
+            .accepted
+    );
 }
 
 #[test]

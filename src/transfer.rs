@@ -1,7 +1,8 @@
 use crate::FinitumError;
+use serde::Serialize;
 
 /// Deterministic one-dimensional nodal interpolation between nonmatching traces.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NonmatchingTransfer {
     source_nodes: Vec<f64>,
     target_nodes: Vec<f64>,

@@ -1196,6 +1196,24 @@ impl AssembledOperator {
     pub fn source_factorization_digest(&self) -> &Digest {
         &self.source_factorization_digest
     }
+
+    /// Materialize the canonical global transpose of this assembled action.
+    pub fn transpose(&self) -> Result<Self, FinitumError> {
+        let matrix = self.matrix();
+        let mut entries = Vec::with_capacity(matrix.values().len());
+        for row in 0..matrix.rows() {
+            for entry in matrix.row_offsets()[row]..matrix.row_offsets()[row + 1] {
+                entries.push((matrix.column_indices()[entry], row, matrix.values()[entry]));
+            }
+        }
+        let transpose = CsrMatrix::from_triplets(matrix.columns(), matrix.rows(), entries)
+            .map_err(|error| FinitumError::Assembly(error.to_string()))?;
+        Ok(Self {
+            matrix: transpose,
+            source_factorization_digest: self.source_factorization_digest.clone(),
+            symmetry: self.symmetry,
+        })
+    }
 }
 
 impl LinearOperator for AssembledOperator {

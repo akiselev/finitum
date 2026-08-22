@@ -17,6 +17,7 @@ mod space;
 mod system;
 mod topology;
 mod transfer;
+mod verification;
 
 pub use adaptivity::{HangingNodeConstraint, VariableOrderSegmentElements};
 pub use block::{BlockLayout, FieldBlock};
@@ -52,3 +53,13 @@ pub use topology::{
     OrientedFacetPair, OrientedRestriction, SignedIncidence,
 };
 pub use transfer::{MortarInterface, NonmatchingTransfer};
+pub use verification::{
+    ConstraintWorkBody, ConstraintWorkReport, ExactSequenceCheckBody, ExactSequenceCheckReport,
+    GlobalTransposeWorkBody, GlobalTransposeWorkReport, MeshRefinementCheckBody,
+    MeshRefinementCheckReport, MeshRefinementLevel, MeshRefinementSample, PatchCheckBody,
+    PatchCheckReport, RealizationAgreementBody, RealizationAgreementReport,
+    TransferConservationBody, TransferConservationReport, VERIFICATION_REPORT_SCHEMA,
+    ValidatedVerification, VerificationCheckKind, VerificationReportHeader, VerificationSubject,
+    check_constraint_work, check_exact_sequence, check_global_transpose, check_mesh_refinement,
+    check_nodal_patch, check_realization_agreement, check_transfer_conservation,
+};

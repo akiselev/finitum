@@ -1,4 +1,5 @@
 use crate::{CellId, DofId, FinitumError, Mesh, VertexId};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -239,7 +240,7 @@ impl CompatibleDofMaps {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SignedIncidence {
     rows: usize,
     columns: usize,
@@ -247,6 +248,32 @@ pub struct SignedIncidence {
 }
 
 impl SignedIncidence {
+    /// Construct a checked dense signed-incidence action.
+    ///
+    /// This validates the representation only. Topological exactness is a
+    /// separate property checked by [`crate::check_exact_sequence`].
+    pub fn new(rows: usize, columns: usize, values: Vec<i8>) -> Result<Self, FinitumError> {
+        let expected = rows.checked_mul(columns).ok_or_else(|| {
+            FinitumError::InvalidRealization("signed-incidence extent overflows usize".into())
+        })?;
+        if rows == 0 || columns == 0 || values.len() != expected {
+            return Err(FinitumError::InvalidRealization(format!(
+                "signed incidence needs {expected} entries for a nonempty {rows} by {columns} action, got {}",
+                values.len()
+            )));
+        }
+        if values.iter().any(|value| !matches!(value, -1..=1)) {
+            return Err(FinitumError::InvalidRealization(
+                "signed-incidence entries must be -1, 0, or 1".into(),
+            ));
+        }
+        Ok(Self {
+            rows,
+            columns,
+            values,
+        })
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -319,7 +346,7 @@ impl SignedIncidence {
 }
 
 /// Topological de Rham incidence sequence. Construction verifies boundary-of-boundary is zero.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ExactSequence {
     pub gradient: SignedIncidence,
     pub curl: SignedIncidence,

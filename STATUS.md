@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-21
-Milestone: R3P primal CAD geometry realization
+Milestone: SV0-B3 reusable concrete-realization checks
 
 ## Implemented
 
@@ -63,7 +63,15 @@ Milestone: R3P primal CAD geometry realization
   realizations consuming Scientia `MethodProgram` directly, with typed state-extent checks;
 - deterministic DAE residual/JVP actions for every method family, compiled Malleus flux/stencil
   execution where present, and a `DiscreteOperator` enum that preserves variational-versus-sibling
-  family identity for Krasis coupling.
+  family identity for Krasis coupling;
+- reusable nodal patch and four-way matrix-free/global-assembled/element-assembled/partial
+  agreement providers using Methodus componentwise comparisons;
+- canonical CSR global transpose realization and a generic forward/transpose work check;
+- homogeneous affine-constraint work, weighted nonmatching-transfer conservation,
+  dimension-complete exact-sequence boundary/rank, and maximum-cell-diameter mesh-refinement
+  order providers;
+- versioned, kind-distinct serialized reports whose canonical digest binds subject identity,
+  tolerance/policy, probes or refinement samples, measured outputs, and acceptance results.
 
 ## Boundary
 
@@ -110,6 +118,17 @@ explicit oriented faces, FD uses supplied neighbor rows, network realization use
 particle laws are generic radial polynomials over explicit pairs, and boundary kernels are
 caller-supplied tables. No named physical law is selected in Finitum.
 
+SV0-B3 consumes Methodus B1 tolerance, comparison, and convergence-order utilities. Malleus B2
+owns local primal/JVP/VJP/parameter/backend campaigns; Finitum executes those kernels through its
+existing realization plans but does not wrap or duplicate the local campaign API. B3 callers
+provide exact fields, probes, tolerances, measured errors, and required orders. The providers do
+not derive scientific obligations, select benchmarks, refine meshes, estimate discretization
+error, run solvers, or promote support claims. Report consumers recheck the canonical identity;
+they must call the fallible source-aware validator, which re-executes the check and refuses even a
+rehashed inconsistent acceptance field. Constraint-work and transfer-conservation reports are
+distinct, non-interchangeable types. Subject digests use recursively key-sorted canonical JSON or
+an explicitly supplied owner digest.
+
 ## Validation
 
 Passed on 2026-08-21 with Rust 1.97.0:
@@ -118,7 +137,7 @@ Passed on 2026-08-21 with Rust 1.97.0:
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 30 passed, 0 failed
+cargo test --locked --workspace --all-targets           # 35 passed, 0 failed
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 RUSTDOCFLAGS='-D warnings' cargo test --locked --workspace --doc
 git diff --check
@@ -155,7 +174,18 @@ only by stable CAD boundary identity. Every nodal value matches the independent 
 constant solution; matrix-free and assembled actions and converged primal solutions agree. This first path is
 explicitly limited to affine rectangles in an XY carrier; R3D geometry actions are not present.
 
+The SV0-B3 gate exercises the generic checker contracts with a synthetic vector-valued nodal
+field and a prescribed second-order error sequence across three independently constructed segment
+meshes; these are checker tests, not discretization certification. It additionally checks four
+concrete global realization strategies on one generated Poisson plan, a nonsymmetric constrained
+global transpose work identity, affine prolongation/transpose work, weighted nonmatching
+interpolation work, and dimension-complete triangle/tetrahedron exact-sequence identities and
+ranks. Hostile patch, transpose, cross-kind report, serialized-report tamper, missing 3-D
+divergence, and non-refining mesh fixtures are rejected or produce non-accepted reports. The FC6
+nonuniform sheared affine patch above remains the independent realization oracle.
+
 ## Next
 
-Extend any method topology only from a concrete acceptance case; keep local-kernel meaning,
-backend numerical policy, and realization-artifact identity explicit.
+Integrate these providers through Krasis SV0-B4 and Sinbad SV0-B5 without moving campaign policy
+into Finitum. Extend any method topology only from a concrete acceptance case; keep local-kernel
+meaning, backend numerical policy, and realization-artifact identity explicit.
