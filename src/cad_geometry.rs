@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use cadabra_provider::{RectangleProvider, StableId};
+use cadabra_provider::{AnalyticProvider, ProviderFamily, RectangleProvider, StableId};
 use serde::Serialize;
 
 use crate::{
@@ -355,6 +355,228 @@ impl CadGeometryRealization {
     }
 }
 
+impl CadGeometryRealization {
+    /// Samples an admitted analytic annulus into a deterministic triangular P1
+    /// mesh on the provider's polar chart.
+    ///
+    /// The radial chart axis maps to rows and the wrapped angular axis to
+    /// columns, so the seam column is shared and every vertex keeps one stable
+    /// identity. This first R3D slice realizes the planar annulus only; other
+    /// families are refused until their concrete realization paths exist.
+    pub fn from_family(
+        provider: &AnalyticProvider,
+        expected_revision: u64,
+        subdivisions: [usize; 2],
+    ) -> Result<Self, FinitumError> {
+        let snapshot = provider.snapshot();
+        if snapshot.family != ProviderFamily::Annulus {
+            return Err(FinitumError::UnsupportedCadFamily {
+                family: format!("{:?}", snapshot.family),
+                reason: "the first R3D slice realizes admitted planar annuli only",
+            });
+        }
+        if expected_revision != snapshot.revision {
+            return Err(FinitumError::StaleGeometryRevision {
+                expected: snapshot.revision,
+                actual: expected_revision,
+            });
+        }
+        let [radial_cells, angular_cells] = subdivisions;
+        if radial_cells == 0 || angular_cells < 3 {
+            return Err(FinitumError::InvalidCadGeometry(
+                "annulus subdivisions require a positive radial count and at least three angular columns"
+                    .into(),
+            ));
+        }
+        let node_count = radial_cells
+            .checked_add(1)
+            .and_then(|rows| angular_cells.checked_mul(rows))
+            .ok_or_else(|| FinitumError::InvalidCadGeometry("node count overflow".into()))?;
+        let cell_count = radial_cells
+            .checked_mul(angular_cells)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or_else(|| FinitumError::InvalidCadGeometry("cell count overflow".into()))?;
+        if node_count > 1_000_000 || cell_count > 1_000_000 {
+            return Err(FinitumError::InvalidCadGeometry(
+                "annulus realization exceeds the one-million-item work cap".into(),
+            ));
+        }
+        validate_xy_carrier(snapshot.frame.axes)?;
+
+        let mut vertices = Vec::with_capacity(node_count);
+        let mut nodes = Vec::with_capacity(node_count);
+        for row in 0..=radial_cells {
+            for column in 0..angular_cells {
+                let reference_coordinate = [
+                    row as f64 / radial_cells as f64,
+                    column as f64 / angular_cells as f64,
+                ];
+                let evaluation = provider
+                    .evaluate(&reference_coordinate)
+                    .map_err(|error| FinitumError::InvalidCadGeometry(error.to_string()))?;
+                if evaluation.position[2] != snapshot.frame.origin[2] {
+                    return Err(FinitumError::InvalidCadGeometry(
+                        "annulus is not contained in a constant-Z XY carrier".into(),
+                    ));
+                }
+                let vertex = VertexId(vertices.len());
+                vertices.push(vec![evaluation.position[0], evaluation.position[1]]);
+                nodes.push(CadNodeAssociation {
+                    node_id: format!(
+                        "{}/realization/node/r{row}/a{column}",
+                        snapshot.geometry_id.as_str()
+                    ),
+                    vertex,
+                    reference_coordinate,
+                });
+            }
+        }
+
+        let mut mesh_cells = Vec::with_capacity(cell_count);
+        for row in 0..radial_cells {
+            for column in 0..angular_cells {
+                let lower_left = row * angular_cells + column;
+                let upper_left = lower_left + angular_cells;
+                let lower_right = row * angular_cells + (column + 1) % angular_cells;
+                let upper_right = upper_left + (column + 1) % angular_cells - column;
+                // The polar chart is positively oriented, so radial-then-angular
+                // corner walks keep every triangle counter-clockwise.
+                for triangle in [
+                    [lower_left, upper_left, upper_right],
+                    [lower_left, upper_right, lower_right],
+                ] {
+                    mesh_cells.push(Cell {
+                        vertices: triangle.into_iter().map(VertexId).collect(),
+                    });
+                }
+            }
+        }
+        let mesh = Mesh::new(2, vertices, mesh_cells)?;
+        let cells = (0..mesh.cells().len())
+            .map(|cell| CadCellAssociation {
+                cell_id: format!("{}/realization/cell/{cell}", snapshot.geometry_id.as_str()),
+                cell: CellId(cell),
+                region_id: snapshot.region.id.as_str().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let boundaries = annulus_boundaries(
+            [
+                snapshot.boundaries[0].id.clone(),
+                snapshot.boundaries[1].id.clone(),
+            ],
+            angular_cells,
+            radial_cells,
+        );
+        let source = CadGeometrySource {
+            geometry_id: snapshot.geometry_id.as_str().to_owned(),
+            revision: snapshot.revision,
+            semantic_digest: snapshot.semantic_digest.bytes(),
+        };
+        let parameters = snapshot
+            .design_parameters
+            .iter()
+            .map(|parameter| CadParameterCoordinate {
+                parameter_id: parameter.id.as_str().to_owned(),
+                value: parameter.value,
+            })
+            .collect::<Vec<_>>();
+        let digest = association_digest(&source, &parameters, &mesh, &nodes, &cells, &boundaries)?;
+        Ok(Self {
+            source,
+            parameters,
+            mesh,
+            nodes,
+            cells,
+            boundaries,
+            digest,
+        })
+    }
+
+    /// Exact per-node design velocity `dx/dp` for one rectangle parameter.
+    ///
+    /// Velocities come from the provider's analytic first design differential
+    /// at each node's frozen chart coordinate; no finite differencing is used.
+    pub fn rectangle_parameter_velocity(
+        &self,
+        provider: &RectangleProvider,
+        expected_revision: u64,
+        parameter_index: usize,
+    ) -> Result<Vec<[f64; 2]>, FinitumError> {
+        self.require_rectangle_source(provider)?;
+        if expected_revision != self.source.revision {
+            return Err(FinitumError::StaleGeometryRevision {
+                expected: self.source.revision,
+                actual: expected_revision,
+            });
+        }
+        if parameter_index >= 2 {
+            return Err(FinitumError::InvalidCadGeometry(format!(
+                "rectangle design index {parameter_index} is outside the two declared parameters"
+            )));
+        }
+        self.node_velocities(|xi| {
+            provider
+                .evaluate(xi)
+                .map(|evaluation| evaluation.dx_dp[parameter_index])
+        })
+    }
+
+    /// Exact per-node design velocity `dx/dp` for one admitted-family parameter.
+    pub fn family_parameter_velocity(
+        &self,
+        provider: &AnalyticProvider,
+        expected_revision: u64,
+        parameter_index: usize,
+    ) -> Result<Vec<[f64; 2]>, FinitumError> {
+        if provider.snapshot().family != ProviderFamily::Annulus
+            || self.cells().first().is_none_or(|cell| {
+                !cell
+                    .cell_id
+                    .starts_with(provider.snapshot().geometry_id.as_str())
+            })
+        {
+            return Err(FinitumError::CadGeometrySourceMismatch);
+        }
+        if expected_revision != provider.snapshot().revision
+            || expected_revision != self.source.revision
+        {
+            return Err(FinitumError::StaleGeometryRevision {
+                expected: self.source.revision,
+                actual: expected_revision,
+            });
+        }
+        let count = provider.snapshot().design_parameters.len();
+        if parameter_index >= count {
+            return Err(FinitumError::InvalidCadGeometry(format!(
+                "family design index {parameter_index} is outside the {count} declared parameters"
+            )));
+        }
+        self.node_velocities(|xi| {
+            provider
+                .evaluate(&xi)
+                .map(|evaluation| evaluation.dx_dp[parameter_index])
+        })
+    }
+
+    fn node_velocities(
+        &self,
+        evaluate: impl Fn([f64; 2]) -> Result<[f64; 3], cadabra_provider::ProviderError>,
+    ) -> Result<Vec<[f64; 2]>, FinitumError> {
+        let mut velocities = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let velocity = evaluate(node.reference_coordinate)
+                .map_err(|error| FinitumError::InvalidCadGeometry(error.to_string()))?;
+            if !velocity.into_iter().all(f64::is_finite) {
+                return Err(FinitumError::InvalidCadGeometry(
+                    "provider returned a non-finite design velocity".into(),
+                ));
+            }
+            velocities.push([velocity[0], velocity[1]]);
+        }
+        Ok(velocities)
+    }
+}
+
 impl CadPrimalPlan {
     /// Binds a concrete operator plan to exactly the CAD-associated mesh from
     /// which it was realized.
@@ -481,6 +703,24 @@ fn rectangle_boundaries(
     let left = (0..=v_cells).map(|row| VertexId(row * width)).collect();
     ids.into_iter()
         .zip([bottom, right, top, left])
+        .map(|(id, vertices)| CadBoundaryAssociation {
+            entity_id: id.as_str().to_owned(),
+            vertices,
+        })
+        .collect()
+}
+
+fn annulus_boundaries(
+    ids: [StableId; 2],
+    angular_cells: usize,
+    radial_cells: usize,
+) -> Vec<CadBoundaryAssociation> {
+    let inner = (0..angular_cells).map(VertexId).collect();
+    let outer = (0..angular_cells)
+        .map(|column| VertexId(radial_cells * angular_cells + column))
+        .collect();
+    ids.into_iter()
+        .zip([inner, outer])
         .map(|(id, vertices)| CadBoundaryAssociation {
             entity_id: id.as_str().to_owned(),
             vertices,

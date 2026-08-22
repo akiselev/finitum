@@ -77,4 +77,9 @@ pub enum FinitumError {
     AmbiguousCadBoundary(String),
     #[error("invalid CAD geometry realization: {0}")]
     InvalidCadGeometry(String),
+    #[error("CAD family {family} has no R3D realization path: {reason}")]
+    UnsupportedCadFamily {
+        family: String,
+        reason: &'static str,
+    },
 }

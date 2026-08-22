@@ -42,9 +42,9 @@ pub use optimized::{
     TensorProductBasis, TensorProductEvaluation,
 };
 pub use realization::{
-    AssembledOperator, DynamicExternalInput, ExternalInput, MatrixFreeOperator, PointActiveInput,
-    PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, RealizationArtifact, RealizationExternalInput,
-    RealizationPlan,
+    AssembledOperator, DynamicExternalInput, ExternalInput, ExternalSensitivityInput,
+    GeometryParameterSensitivity, MatrixFreeOperator, PointActiveInput, PointEvaluation,
+    REALIZATION_ARTIFACT_SCHEMA, RealizationArtifact, RealizationExternalInput, RealizationPlan,
 };
 pub use space::{DofId, DofMap, ElementRestriction};
 pub use system::SystemRealizationPlan;

@@ -190,6 +190,105 @@ impl ExternalInput {
     }
 }
 
+/// Stored per-quadrature-point direction values for one external input under
+/// one concrete geometry design parameter.
+///
+/// The layout mirrors [`ExternalInput`]: deterministic cell/quadrature/component
+/// order over the baseline chart, so an authored field can declare its exact
+/// design derivative alongside the sampled values it differentiates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalSensitivityInput {
+    pub integral_index: usize,
+    pub input: TensorInputId,
+    component_count: usize,
+    values: Vec<f64>,
+}
+
+impl ExternalSensitivityInput {
+    pub fn new(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        values: Vec<f64>,
+    ) -> Result<Self, FinitumError> {
+        if component_count == 0 {
+            return Err(FinitumError::InvalidRealization(
+                "external sensitivity component count must be non-zero".into(),
+            ));
+        }
+        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+            return Err(FinitumError::InvalidRealization(format!(
+                "external sensitivity contains a non-finite value at index {index}"
+            )));
+        }
+        Ok(Self {
+            integral_index,
+            input,
+            component_count,
+            values,
+        })
+    }
+
+    /// Sample design-direction values in deterministic cell/quadrature order.
+    ///
+    /// The sampler receives baseline physical quadrature points; authored
+    /// closures must differentiate at fixed chart identity, because a fixed
+    /// topology keeps every chart coordinate stable while positions move.
+    pub fn sampled(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        mut sample: impl FnMut(CellId, &[f64]) -> Vec<f64>,
+    ) -> Result<Self, FinitumError> {
+        if mesh.dimension() != element.dimension() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "mesh dimension {} differs from element dimension {}",
+                mesh.dimension(),
+                element.dimension()
+            )));
+        }
+        let mut values = Vec::new();
+        for (cell_index, _) in mesh.cells().iter().enumerate() {
+            let cell = CellGeometry::new(mesh, CellId(cell_index))?;
+            for point in element.quadrature() {
+                let physical = cell.physical_point(&point.coordinates);
+                let sampled = sample(CellId(cell_index), &physical);
+                if sampled.len() != component_count {
+                    return Err(FinitumError::InvalidRealization(format!(
+                        "external sensitivity sampler returned {} components, expected {component_count}",
+                        sampled.len()
+                    )));
+                }
+                values.extend(sampled);
+            }
+        }
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    fn point_values(&self, cell: usize, point: usize, point_count: usize) -> &[f64] {
+        let start = (cell * point_count + point) * self.component_count;
+        &self.values[start..start + self.component_count]
+    }
+}
+
+/// Exact first-order geometry data for one CAD design parameter.
+///
+/// Node velocities are vertex-major physical components supplied by the
+/// geometry producer's analytic design differential. External direction
+/// entries must cover every stored external input of the target plan;
+/// missing or extra entries are refused instead of silently frozen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryParameterSensitivity {
+    /// Design parameter this sensitivity differentiates with respect to.
+    pub parameter_index: usize,
+    /// Vertex-major design velocity components.
+    pub node_velocities: Vec<f64>,
+    /// Per-input external direction values.
+    pub external_directions: Vec<ExternalSensitivityInput>,
+}
+
 #[derive(Clone, Debug)]
 struct BoundBundle {
     bundle: StructuredPointKernelBundle,
@@ -730,6 +829,321 @@ impl RealizationPlan {
         }
         self.validate_action(state, output)?;
         self.validate_action(state_rate, output)
+    }
+
+    /// Exact residual sensitivity `dR/dp_k` at a fixed expanded state.
+    ///
+    /// The state is expanded through the affine constraints exactly like
+    /// [`Self::residual`]; constraint rows carry zero design derivative
+    /// because essential values are frozen inputs of the realization.
+    /// Stored external inputs participate with their authored direction
+    /// tables, because the load term belongs to the residual.
+    pub fn residual_geometry_sensitivity(
+        &self,
+        time: f64,
+        state: &[f64],
+        sensitivity: &GeometryParameterSensitivity,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.validate_time_action(time, state, state, output)?;
+        let physical_state = self.data.constraints.expand(state)?;
+        let mut physical_output = vec![0.0; self.dimension()];
+        self.apply_geometry_sensitivity_cells(
+            time,
+            &physical_state,
+            &physical_state,
+            sensitivity,
+            &mut physical_output,
+        )?;
+        output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
+        for constraint in self.data.constraints.constraints() {
+            output[constraint.target.0] = 0.0;
+        }
+        validate_finite("residual geometry sensitivity", output)
+    }
+
+    fn apply_geometry_sensitivity_cells(
+        &self,
+        time: f64,
+        value_state: &[f64],
+        direction_state: &[f64],
+        sensitivity: &GeometryParameterSensitivity,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        if self
+            .data
+            .external
+            .values()
+            .any(|binding| matches!(binding, ExternalBinding::Dynamic(_)))
+        {
+            return Err(FinitumError::UnsupportedRealization(
+                "geometry sensitivity requires stored external inputs; dynamic callbacks cannot declare an exact design derivative".into(),
+            ));
+        }
+        let dimension = self.data.mesh.dimension();
+        let vertex_count = self.data.mesh.vertices().len();
+        if sensitivity.node_velocities.len() != vertex_count * dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "geometry node velocities have length {}, expected {}",
+                sensitivity.node_velocities.len(),
+                vertex_count * dimension
+            )));
+        }
+        if sensitivity
+            .node_velocities
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(FinitumError::InvalidRealization(
+                "geometry node velocities contain a non-finite component".into(),
+            ));
+        }
+        let directions = validate_sensitivity_inputs(self, sensitivity)?;
+        let zero_rate = vec![0.0; self.dimension()];
+        for cell_index in 0..self.data.dofs.restrictions().len() {
+            self.apply_cell_geometry_sensitivity(
+                cell_index,
+                time,
+                value_state,
+                direction_state,
+                &zero_rate,
+                sensitivity,
+                &directions,
+                dimension,
+                output,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_cell_geometry_sensitivity(
+        &self,
+        cell_index: usize,
+        time: f64,
+        value_state: &[f64],
+        direction_state: &[f64],
+        state_rate: &[f64],
+        sensitivity: &GeometryParameterSensitivity,
+        directions: &BTreeMap<(usize, TensorInputId), &ExternalSensitivityInput>,
+        dimension: usize,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let restriction = &self.data.dofs.restrictions()[cell_index];
+        let geometry = &self.data.geometries[cell_index];
+        let cell = self.data.mesh.cell(CellId(cell_index)).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("mesh has no cell {cell_index}"))
+        })?;
+        let local_state = restriction
+            .dofs
+            .iter()
+            .map(|dof| value_state[dof.0])
+            .collect::<Vec<_>>();
+        let local_direction = restriction
+            .dofs
+            .iter()
+            .map(|dof| direction_state[dof.0])
+            .collect::<Vec<_>>();
+        // Affine map columns are vertex differences, so their design velocity
+        // is the matching difference of exact nodal velocities.
+        let velocity = |slot: usize| {
+            let vertex = cell.vertices[slot].0;
+            let start = vertex * dimension;
+            (0..dimension)
+                .map(|axis| sensitivity.node_velocities[start + axis])
+                .collect::<Vec<_>>()
+        };
+        let origin_velocity = velocity(0);
+        let mut jacobian_direction = vec![0.0; dimension * dimension];
+        for column in 0..dimension {
+            let column_velocity = velocity(column + 1);
+            for row in 0..dimension {
+                jacobian_direction[row * dimension + column] =
+                    column_velocity[row] - origin_velocity[row];
+            }
+        }
+        let (signed_determinant, inverse) =
+            invert(&geometry.jacobian, dimension).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "cell {cell_index} has a singular affine geometry map"
+                ))
+            })?;
+        if signed_determinant <= 0.0 || signed_determinant != geometry.determinant {
+            return Err(FinitumError::InvalidRealization(format!(
+                "cell {cell_index} is not positively oriented; geometry derivatives refuse reflected maps"
+            )));
+        }
+        // det' = det tr(B^{-1} B') and M' = -B^{-1} B' B^{-1}.
+        let mut inverse_jacobian_trace = 0.0;
+        for row in 0..dimension {
+            for column in 0..dimension {
+                inverse_jacobian_trace += inverse[column * dimension + row]
+                    * jacobian_direction[row * dimension + column];
+            }
+        }
+        let determinant_direction = signed_determinant * inverse_jacobian_trace;
+        let mut inverse_direction = vec![0.0; dimension * dimension];
+        for row in 0..dimension {
+            for column in 0..dimension {
+                let mut product = 0.0;
+                for middle_row in 0..dimension {
+                    for middle_column in 0..dimension {
+                        product += inverse[row * dimension + middle_row]
+                            * jacobian_direction[middle_row * dimension + middle_column]
+                            * inverse[middle_column * dimension + column];
+                    }
+                }
+                inverse_direction[row * dimension + column] = -product;
+            }
+        }
+        // Physical gradient direction d(B^{-T} ref)/dp.
+        let gradient_direction = |reference: &[f64]| -> Vec<f64> {
+            (0..dimension)
+                .map(|physical_axis| {
+                    (0..dimension)
+                        .map(|reference_axis| {
+                            inverse_direction[reference_axis * dimension + physical_axis]
+                                * reference[reference_axis]
+                        })
+                        .sum()
+                })
+                .collect()
+        };
+        let mut local_output = vec![0.0; restriction.dofs.len()];
+        for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
+            let scale = point.weight * signed_determinant;
+            let scale_direction = point.weight * determinant_direction;
+            for integral in &self.data.factorization.integrals {
+                let (inputs, _) = self.point_inputs(
+                    integral,
+                    cell_index,
+                    point_index,
+                    geometry,
+                    time,
+                    &local_state,
+                    state_rate,
+                )?;
+                let mut point_directions = BTreeMap::new();
+                for input in &integral.primal.inputs {
+                    if input.source == InputSourceRequirement::Basis {
+                        let direction = match input.binding.evaluation.derivative {
+                            DerivativeEvaluation::Gradient => {
+                                let mut values = vec![0.0; dimension];
+                                for (basis, coefficient) in local_direction.iter().enumerate() {
+                                    let direction_gradient = gradient_direction(
+                                        self.data
+                                            .element
+                                            .basis_gradient(point_index, basis)
+                                            .expect("validated element table"),
+                                    );
+                                    for axis in 0..dimension {
+                                        values[axis] += direction_gradient[axis] * coefficient;
+                                    }
+                                }
+                                values
+                            }
+                            _ => vec![0.0; component_count(&input.shape)?],
+                        };
+                        point_directions.insert(input.id, direction);
+                    } else {
+                        let binding = directions.get(&(integral.integral_index, input.id)).ok_or(
+                            FinitumError::MissingExternalInput {
+                                integral: integral.integral_index,
+                                input: input.id,
+                            },
+                        )?;
+                        point_directions.insert(
+                            input.id,
+                            binding
+                                .point_values(
+                                    cell_index,
+                                    point_index,
+                                    self.data.element.quadrature().len(),
+                                )
+                                .to_vec(),
+                        );
+                    }
+                }
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+                    let point_output = self.execute_primal(
+                        bound,
+                        integral,
+                        cell_index,
+                        point_index,
+                        geometry,
+                        time,
+                        &local_state,
+                        state_rate,
+                    )?;
+                    let point_output_direction =
+                        self.execute_jvp_values(bound, &inputs, &point_directions)?;
+                    let output_arity_ok = match qoutput.binding.evaluation.derivative {
+                        DerivativeEvaluation::Value => point_output.len() == 1,
+                        DerivativeEvaluation::Gradient => point_output.len() == dimension,
+                        _ => true,
+                    };
+                    if !output_arity_ok {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "point output with {} components does not match the {:?} geometry-sensitivity output binding",
+                            point_output.len(),
+                            qoutput.binding.evaluation.derivative
+                        )));
+                    }
+                    for (basis, slot) in local_output.iter_mut().enumerate() {
+                        match qoutput.binding.evaluation.derivative {
+                            DerivativeEvaluation::Value => {
+                                let value = self
+                                    .data
+                                    .element
+                                    .basis_value(point_index, basis)
+                                    .expect("validated element table");
+                                *slot += scale_direction * value * point_output[0]
+                                    + scale * value * point_output_direction[0];
+                            }
+                            DerivativeEvaluation::Gradient => {
+                                let reference = self
+                                    .data
+                                    .element
+                                    .basis_gradient(point_index, basis)
+                                    .expect("validated element table");
+                                let adjoint = (0..dimension)
+                                    .map(|physical_axis| {
+                                        (0..dimension)
+                                            .map(|reference_axis| {
+                                                inverse[reference_axis * dimension + physical_axis]
+                                                    * reference[reference_axis]
+                                            })
+                                            .sum::<f64>()
+                                    })
+                                    .collect::<Vec<_>>();
+                                let adjoint_direction = gradient_direction(reference);
+                                let product = |weights: &[f64], values: &[f64]| {
+                                    weights
+                                        .iter()
+                                        .zip(values)
+                                        .map(|(weight, value)| weight * value)
+                                        .sum::<f64>()
+                                };
+                                *slot += scale_direction * product(&adjoint, &point_output)
+                                    + scale
+                                        * (product(&adjoint_direction, &point_output)
+                                            + product(&adjoint, &point_output_direction));
+                            }
+                            other => {
+                                return Err(FinitumError::UnsupportedRealization(format!(
+                                    "geometry sensitivity supports value and gradient outputs, found {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (local, dof) in restriction.dofs.iter().enumerate() {
+            output[dof.0] += local_output[local];
+        }
+        Ok(())
     }
 
     fn validate_action(&self, input: &[f64], output: &[f64]) -> Result<(), FinitumError> {
@@ -1628,6 +2042,60 @@ fn bind_kernels(
         }
     }
     Ok(bound)
+}
+
+/// Validates that one geometry sensitivity covers exactly the stored external
+/// inputs of the target plan, with matching component and value extents.
+fn validate_sensitivity_inputs<'a>(
+    plan: &RealizationPlan,
+    sensitivity: &'a GeometryParameterSensitivity,
+) -> Result<BTreeMap<(usize, TensorInputId), &'a ExternalSensitivityInput>, FinitumError> {
+    let mut directions = BTreeMap::new();
+    for input in &sensitivity.external_directions {
+        let key = (input.integral_index, input.input);
+        if directions.insert(key, input).is_some() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "geometry sensitivity declares external input {key:?} more than once"
+            )));
+        }
+    }
+    for (key, binding) in &plan.data.external {
+        let ExternalBinding::Stored(stored) = binding else {
+            continue;
+        };
+        let Some(direction) = directions.get(key) else {
+            return Err(FinitumError::MissingExternalInput {
+                integral: key.0,
+                input: key.1,
+            });
+        };
+        if direction.component_count != stored.component_count {
+            return Err(FinitumError::InvalidRealization(format!(
+                "geometry sensitivity for external input {key:?} has {} components, expected {}",
+                direction.component_count, stored.component_count
+            )));
+        }
+        if direction.values.len() != stored.values.len() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "geometry sensitivity for external input {key:?} has {} values, expected {}",
+                direction.values.len(),
+                stored.values.len()
+            )));
+        }
+    }
+    let stored_count = plan
+        .data
+        .external
+        .values()
+        .filter(|binding| matches!(binding, ExternalBinding::Stored(_)))
+        .count();
+    if directions.len() != stored_count {
+        return Err(FinitumError::InvalidRealization(format!(
+            "geometry sensitivity declares {} external inputs, plan stores {stored_count}",
+            directions.len()
+        )));
+    }
+    Ok(directions)
 }
 
 pub(crate) fn evaluate_basis_input(

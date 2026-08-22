@@ -1,7 +1,7 @@
 # Finitum status
 
-Updated: 2026-08-21
-Milestone: SV0-B3 reusable concrete-realization checks
+Updated: 2026-08-22
+Milestone: SV0-B3 reusable concrete-realization checks + R3D/SV1-G0B exact geometry derivatives
 
 ## Implemented
 
@@ -72,6 +72,23 @@ Milestone: SV0-B3 reusable concrete-realization checks
   order providers;
 - versioned, kind-distinct serialized reports whose canonical digest binds subject identity,
   tolerance/policy, probes or refinement samples, measured outputs, and acceptance results.
+- deterministic triangular realization of admitted CADabra planar annuli on the
+  wrapped polar chart (`CadGeometryRealization::from_family`), with stable
+  inner/outer boundary identity, positively oriented cells, and a family-scoped
+  association digest; other Provider V0 families are refused by a typed
+  unsupported-family error rather than silently approximated;
+- exact per-node design velocities `dx/dp` for rectangle and analytic-family
+  realizations, taken from the provider's analytic first design differential at
+  each node's frozen chart coordinate and refused on stale revisions or source
+  mismatch;
+- exact residual geometry sensitivity `dR/dp_k` at a fixed expanded state:
+  affine cell-map derivatives (determinant trace identity, inverse-Jacobian
+  product rule), basis-gradient direction threading through the generated
+  state-JVP kernels, authored stored-external direction tables, and the full
+  product rule through measure, test-basis gradients, and kernel outputs.
+  Missing, extra, or extent-mismatched external direction tables are refused;
+  dynamic callbacks are refused because they cannot declare an exact design
+  derivative. Reflected cells are refused.
 
 ## Boundary
 
@@ -131,15 +148,18 @@ an explicitly supplied owner digest.
 
 ## Validation
 
-Passed on 2026-08-21 with Rust 1.97.0:
+The R3D gate rebuilds the complete realization at perturbed design values and
+compares `dJ/dp = -lambda^T dR/dp|_u` (adjoint solve through the existing
+symmetric conjugate-gradient path) against centered differences of the rebuilt
+objective across two step sizes with tightening error, on both the affine
+rectangle and its two declared parameters.
 
 ```text
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 35 passed, 0 failed
+cargo test --locked --workspace --all-targets           # 43 passed, 0 failed
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
-RUSTDOCFLAGS='-D warnings' cargo test --locked --workspace --doc
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
 ```
@@ -172,7 +192,16 @@ provider revision, rejects stale/source-mismatched or ambiguous associations, an
 Scientia-generated zero-source Poisson case whose nonzero constant essential data are selected
 only by stable CAD boundary identity. Every nodal value matches the independent manufactured
 constant solution; matrix-free and assembled actions and converged primal solutions agree. This first path is
-explicitly limited to affine rectangles in an XY carrier; R3D geometry actions are not present.
+explicitly limited to affine rectangles in an XY carrier.
+
+The R3D gate admits an annulus through the same carrier discipline, refuses
+non-annulus families and stale revisions, verifies both design-velocity fields
+against centered positions of rebuilt providers, matches the exact residual
+sensitivity against centered differences of completely rebuilt realizations at
+two step sizes for both rectangle parameters, refuses missing, duplicated,
+short, and non-finite sensitivity data, and proves the adjoint identity
+`dJ/dp = -lambda^T dR/dp|_u` against centered differences of the fully rebuilt
+primal solve and objective with tightening error.
 
 The SV0-B3 gate exercises the generic checker contracts with a synthetic vector-valued nodal
 field and a prescribed second-order error sequence across three independently constructed segment
@@ -187,8 +216,8 @@ nonuniform sheared affine patch above remains the independent realization oracle
 ## Next
 
 Krasis SV0-B4, Sinbad SV0-B5, and the Sinbad-owned CAD-driven Poisson product
-cut now consume these landed providers. The next geometry capability is R3D's
-global geometry JVP/VJP and parameter pullback; it is not part of the completed
-R3P/E2 primal claim. Extend method topology only from a concrete acceptance
-case, keeping local-kernel meaning, backend policy, and realization identity
-explicit.
+cut now consume these landed providers. R3D/SV1-G0B is complete: Sinbad R4
+consumes the exact residual sensitivity and analytic design velocities for the
+first verified CAD parameter-to-objective gradient. Extend method topology only
+from a concrete acceptance case, keeping local-kernel meaning, backend policy,
+and realization identity explicit.
