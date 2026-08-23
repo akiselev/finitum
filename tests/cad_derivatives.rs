@@ -578,28 +578,156 @@ fn deterministic_vector(dimension: usize, seed: usize) -> Vec<f64> {
 }
 
 #[test]
-fn tmp_dump_factorization_structure() {
-    let provider = rectangle(2.0, 1.0, 5);
-    let geometry = CadGeometryRealization::from_rectangle(&provider, 5, [2, 2]).unwrap();
+fn annulus_residual_sensitivity_matches_rebuilt_centered_differences() {
+    use cadabra_provider::{AnalyticFamily, AnalyticProvider, FamilyRequest};
+    let inner = 0.5_f64;
+    let outer = 2.0_f64;
+    let revision = 91;
+    let admit = |ri: f64, ro: f64| {
+        let request = FamilyRequest::try_new(
+            "fixture/cad/r3d-ring",
+            revision,
+            ProviderFrame::world(),
+            AnalyticFamily::Annulus {
+                inner_radius: ri,
+                outer_radius: ro,
+            },
+        )
+        .unwrap();
+        match AnalyticProvider::admit(request) {
+            DifferentiabilityDisposition::Smooth { value, .. } => value,
+            other => panic!("{other:?}"),
+        }
+    };
+    // Forcing is frozen to zero so the rebuilt centered differences isolate
+    // the pure geometry chain on curved-cell velocity fields.
+    let build = |ri: f64, ro: f64| {
+        let provider = admit(ri, ro);
+        let geometry = CadGeometryRealization::from_family(&provider, revision, [2, 8]).unwrap();
+        let compilation = compile_semantics(POISSON, &UnitRegistry::si_bootstrap()).unwrap();
+        let form = derive_variational_form(&compilation.semantic, "Poisson", "balance").unwrap();
+        let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+        let factorization = factor_operator(&form, &requirements).unwrap();
+        let kernels = lower_operator_kernels(&factorization).unwrap();
+        let model = &compilation.semantic.models[0];
+        let bcs: Vec<CadBoundaryCondition> = provider
+            .snapshot()
+            .boundaries
+            .iter()
+            .map(|b| CadBoundaryCondition {
+                entity_id: b.id.as_str().to_owned(),
+                value: 0.25,
+            })
+            .collect();
+        let constraints = geometry.essential_constraints(&bcs).unwrap();
+        let mesh = geometry.mesh().clone();
+        let element = PreparedElement::linear_simplex(2).unwrap();
+        let mut external = Vec::new();
+        for integral in &factorization.integrals {
+            for input in &integral.primal.inputs {
+                if input.source == InputSourceRequirement::Basis {
+                    continue;
+                }
+                let name = model.symbols[input.binding.symbol.index()].name.clone();
+                let sampled = match name.as_str() {
+                    "k" => ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        &mesh,
+                        &element,
+                        |_, _| vec![1.0],
+                    )
+                    .unwrap(),
+                    "f" => ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        &mesh,
+                        &element,
+                        |_, _| vec![0.0],
+                    )
+                    .unwrap(),
+                    other => panic!("{other}"),
+                };
+                external.push(sampled);
+            }
+        }
+        let plan = RealizationPlan::new(
+            requirements,
+            factorization,
+            kernels,
+            mesh,
+            element,
+            geometry.nodal_dof_map().unwrap(),
+            constraints,
+            external,
+        )
+        .unwrap();
+        (geometry, plan)
+    };
+
+    let (geometry, plan) = build(inner, outer);
+    let dimension = plan.dimension();
+    let state = (0..dimension)
+        .map(|i| ((i * 29 % 83) as f64) / 83.0 - 0.4)
+        .collect::<Vec<_>>();
+    let provider = admit(inner, outer);
+    let mut velocities = Vec::new();
+    for v in geometry
+        .family_parameter_velocity(&provider, revision, 0)
+        .unwrap()
+    {
+        velocities.extend_from_slice(&v);
+    }
     let compilation = compile_semantics(POISSON, &UnitRegistry::si_bootstrap()).unwrap();
     let form = derive_variational_form(&compilation.semantic, "Poisson", "balance").unwrap();
-    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
-    let factorization = factor_operator(&form, &requirements).unwrap();
+    let factorization = factor_operator(
+        &form,
+        &infer_form_requirements(&compilation.semantic, &form).unwrap(),
+    )
+    .unwrap();
+    let mut dirs = Vec::new();
     for integral in &factorization.integrals {
-        eprintln!("== integral {} ==", integral.integral_index);
         for input in &integral.primal.inputs {
-            eprintln!(
-                "input {:?} source {:?} role {:?} eval {:?} shape {:?}",
-                input.id,
-                input.source,
-                input.role,
-                input.binding.evaluation.derivative,
-                input.shape
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            dirs.push(
+                ExternalSensitivityInput::new(
+                    integral.integral_index,
+                    input.id,
+                    1,
+                    vec![0.0; geometry.cells().len()],
+                )
+                .unwrap(),
             );
         }
-        for output in &integral.primal.outputs {
-            eprintln!("output eval {:?}", output.binding.evaluation.derivative);
-        }
     }
-    let _ = geometry;
+    let sensitivity = GeometryParameterSensitivity {
+        parameter_index: 0,
+        node_velocities: velocities,
+        external_directions: dirs,
+    };
+    let mut analytic = vec![0.0; dimension];
+    plan.residual_geometry_sensitivity(0.0, &state, &sensitivity, &mut analytic)
+        .unwrap();
+
+    let step = 1.0e-5;
+    let (_, forward_plan) = build(inner + step, outer);
+    let (_, backward_plan) = build(inner - step, outer);
+    let mut forward = vec![0.0; dimension];
+    let mut backward = vec![0.0; dimension];
+    forward_plan
+        .residual(0.0, &state, &state, &mut forward)
+        .unwrap();
+    backward_plan
+        .residual(0.0, &state, &state, &mut backward)
+        .unwrap();
+    let max_err = analytic
+        .iter()
+        .enumerate()
+        .map(|(i, a)| ((forward[i] - backward[i]) / (2.0 * step) - a).abs())
+        .fold(0.0, f64::max);
+    assert!(max_err < 5.0e-6, "annulus engine mismatch {max_err}");
 }
