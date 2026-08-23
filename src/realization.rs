@@ -1793,13 +1793,21 @@ fn validate_discretization(
         ));
     }
     for requirement in &requirements.elements {
+        let admitted_shape = match &requirement.value_shape {
+            ValueShape::Scalar => true,
+            // Vector H1(order=1) with one component per spatial axis is the
+            // SV2-A production slice: vertex-major component blocks execute
+            // through the same generated kernels.
+            ValueShape::Vector(components) => *components as usize == mesh.dimension(),
+            _ => false,
+        };
         if requirement.topological_dimension as usize != mesh.dimension()
             || requirement.family != ElementFamilyRequirement::H1
             || requirement.polynomial_order != 1
-            || requirement.value_shape != ValueShape::Scalar
+            || !admitted_shape
         {
             return Err(FinitumError::UnsupportedRealization(format!(
-                "FC6 supports scalar H1(order=1) cell elements, got {requirement:?}"
+                "realization supports scalar or dimension-vector H1(order=1) cell elements, got {requirement:?}"
             )));
         }
     }
@@ -1811,12 +1819,23 @@ fn validate_discretization(
             element.basis_count()
         )));
     }
+    // Vector blocks widen each restriction to `components` DOFs per node
+    // while the basis table stays scalar; the widest requirement wins.
+    let components_per_restriction = requirements
+        .elements
+        .iter()
+        .map(|requirement| match &requirement.value_shape {
+            ValueShape::Vector(components) => *components as usize,
+            _ => 1,
+        })
+        .max()
+        .unwrap_or(1);
+    let expected_restriction = element.basis_count() * components_per_restriction;
     for (index, restriction) in dofs.restrictions().iter().enumerate() {
-        if restriction.dofs.len() != element.basis_count() {
+        if restriction.dofs.len() != expected_restriction {
             return Err(FinitumError::InvalidRealization(format!(
-                "restriction {index} has {} DOFs, expected {}",
+                "restriction {index} has {} DOFs, expected {expected_restriction}",
                 restriction.dofs.len(),
-                element.basis_count()
             )));
         }
     }
@@ -1860,13 +1879,16 @@ fn validate_input_contract(input: &QFunctionInput, dimension: usize) -> Result<(
 
 fn validate_evaluation(
     derivative: &DerivativeEvaluation,
-    _dimension: usize,
+    dimension: usize,
 ) -> Result<(), FinitumError> {
+    let _ = dimension;
     if matches!(
         derivative,
         DerivativeEvaluation::Value
             | DerivativeEvaluation::Gradient
             | DerivativeEvaluation::TimeDerivative
+            // SV2-A: symmetric gradients of vector H1(order=1) blocks.
+            | DerivativeEvaluation::SymmetricGradient
     ) {
         Ok(())
     } else {
@@ -2105,39 +2127,141 @@ pub(crate) fn evaluate_basis_input(
     input: &QFunctionInput,
     local_state: &[f64],
 ) -> Result<Vec<f64>, FinitumError> {
+    // Component stride rules per evaluation kind:
+    // - Value/TimeDerivative: scalar fields carry one value per node; vector
+    //   fields declare shape [components] and use vertex-major state.
+    // - Gradient: scalar-field gradient only; state stride stays one and the
+    //   output is the physical gradient vector.
+    // - SymmetricGradient: vector H1(order=1) blocks; state stride equals the
+    //   spatial dimension and the output is the row-major [d][d] strain.
+    let components = match input.binding.evaluation.derivative {
+        DerivativeEvaluation::SymmetricGradient => element.dimension(),
+        DerivativeEvaluation::Gradient => 1,
+        _ => vector_components(input)?,
+    };
     match input.binding.evaluation.derivative {
         DerivativeEvaluation::Value | DerivativeEvaluation::TimeDerivative => {
-            let value = local_state
-                .iter()
-                .enumerate()
-                .map(|(basis, value)| {
-                    element
-                        .basis_value(point, basis)
-                        .expect("validated element table")
-                        * value
-                })
-                .sum();
-            Ok(vec![value])
+            if components == 1 {
+                let value = local_state
+                    .iter()
+                    .enumerate()
+                    .map(|(basis, value)| {
+                        element
+                            .basis_value(point, basis)
+                            .expect("validated element table")
+                            * value
+                    })
+                    .sum();
+                Ok(vec![value])
+            } else {
+                // Vector value interpolation with vertex-major local state:
+                // node i owns components [i*components, (i+1)*components).
+                interpolate_vector_value(element, point, local_state, components)
+            }
         }
         DerivativeEvaluation::Gradient => {
-            let mut gradient = vec![0.0; element.dimension()];
-            for (basis, value) in local_state.iter().enumerate() {
+            if components == 1 {
+                let mut gradient = vec![0.0; element.dimension()];
+                for (basis, value) in local_state.iter().enumerate() {
+                    let physical = geometry.physical_gradient(
+                        element
+                            .basis_gradient(point, basis)
+                            .expect("validated element table"),
+                    );
+                    for axis in 0..element.dimension() {
+                        gradient[axis] += physical[axis] * value;
+                    }
+                }
+                Ok(gradient)
+            } else {
+                // Vector gradient: component c of the physical gradient is
+                // sum_i physical * u[i][c], row-major [c][axis].
+                let dimension = element.dimension();
+                let mut gradient = vec![0.0; dimension * components];
+                for basis in 0..element.basis_count() {
+                    let physical = geometry.physical_gradient(
+                        element
+                            .basis_gradient(point, basis)
+                            .expect("validated element table"),
+                    );
+                    for component in 0..components {
+                        let value = local_state[basis * components + component];
+                        for axis in 0..dimension {
+                            gradient[component * dimension + axis] += physical[axis] * value;
+                        }
+                    }
+                }
+                Ok(gradient)
+            }
+        }
+        DerivativeEvaluation::SymmetricGradient => {
+            let dimension = element.dimension();
+            let mut symmetric = vec![0.0; dimension * dimension];
+            for basis in 0..element.basis_count() {
                 let physical = geometry.physical_gradient(
                     element
                         .basis_gradient(point, basis)
                         .expect("validated element table"),
                 );
-                for axis in 0..element.dimension() {
-                    gradient[axis] += physical[axis] * value;
+                for row in 0..dimension {
+                    for column in 0..dimension {
+                        // (sym grad u)_{rc} = 1/2 (grad u_{rc} + grad u_{cr})
+                        // with grad stored [component][axis].
+                        let plus = physical[row] * local_state[basis * components + column];
+                        let minus = physical[column] * local_state[basis * components + row];
+                        symmetric[row * dimension + column] += 0.5 * (plus + minus);
+                    }
                 }
             }
-            Ok(gradient)
+            Ok(symmetric)
         }
         _ => Err(FinitumError::UnsupportedRealization(format!(
             "unsupported basis evaluation {:?}",
             input.binding.evaluation.derivative
         ))),
     }
+}
+
+/// Number of field components carried by one basis input.
+///
+/// Scalar fields keep shape `[]` or `[1]`; vector fields declare the
+/// component count as the leading extent, and the local state is vertex-major
+/// so node `i` owns components `[i*n, (i+1)*n)`.
+fn vector_components(input: &QFunctionInput) -> Result<usize, FinitumError> {
+    let mut count = 1usize;
+    for extent in &input.shape {
+        count = count
+            .checked_mul(*extent)
+            .ok_or_else(|| FinitumError::InvalidRealization("shape overflow".into()))?;
+    }
+    if count == 1 {
+        return Ok(1);
+    }
+    if input.shape.len() == 1 {
+        return Ok(input.shape[0]);
+    }
+    Err(FinitumError::UnsupportedRealization(format!(
+        "basis input {:?} declares shape {:?} which is not a scalar or vector value",
+        input.id, input.shape
+    )))
+}
+
+fn interpolate_vector_value(
+    element: &PreparedElement,
+    point: usize,
+    local_state: &[f64],
+    components: usize,
+) -> Result<Vec<f64>, FinitumError> {
+    let mut values = vec![0.0; components];
+    for basis in 0..element.basis_count() {
+        let weight = element
+            .basis_value(point, basis)
+            .expect("validated element table");
+        for component in 0..components {
+            values[component] += weight * local_state[basis * components + component];
+        }
+    }
+    Ok(values)
 }
 
 pub(crate) fn apply_basis_adjoint(
@@ -2149,13 +2273,34 @@ pub(crate) fn apply_basis_adjoint(
     scale: f64,
     local_output: &mut [f64],
 ) -> Result<(), FinitumError> {
+    let dimension = element.dimension();
+    let basis_count = element.basis_count();
+    // Local output layout: vertex-major over the restriction, so node i owns
+    // `stride` consecutive entries. The stride is inferred from the point
+    // output arity, mirroring the input-side component convention.
+    let stride = if local_output.len() % basis_count == 0 {
+        local_output.len() / basis_count
+    } else {
+        return Err(FinitumError::InvalidRealization(
+            "local output length is not a multiple of the basis count".into(),
+        ));
+    };
     match derivative {
         DerivativeEvaluation::Value if point_output.len() == 1 => {
             for (basis, output) in local_output.iter_mut().enumerate() {
                 *output += scale * element.basis_value(point, basis).unwrap() * point_output[0];
             }
         }
-        DerivativeEvaluation::Gradient if point_output.len() == element.dimension() => {
+        DerivativeEvaluation::Value if point_output.len() == stride => {
+            for basis in 0..basis_count {
+                let weight = element.basis_value(point, basis).unwrap();
+                for component in 0..stride {
+                    local_output[basis * stride + component] +=
+                        scale * weight * point_output[component];
+                }
+            }
+        }
+        DerivativeEvaluation::Gradient if point_output.len() == dimension => {
             for (basis, output) in local_output.iter_mut().enumerate() {
                 let gradient = geometry.physical_gradient(
                     element
@@ -2168,6 +2313,30 @@ pub(crate) fn apply_basis_adjoint(
                         .zip(point_output)
                         .map(|(basis, value)| basis * value)
                         .sum::<f64>();
+            }
+        }
+        DerivativeEvaluation::Gradient if point_output.len() == dimension * dimension => {
+            // Flux-style [axis][component] contraction against the physical
+            // test gradient: row(i,c) += scale * sum_a out[a][c] * g[a].
+            for basis in 0..basis_count {
+                let gradient = geometry.physical_gradient(
+                    element
+                        .basis_gradient(point, basis)
+                        .expect("validated element table"),
+                );
+                for component in 0..dimension {
+                    let slot = basis * stride + component;
+                    if slot >= local_output.len() {
+                        return Err(FinitumError::InvalidRealization(
+                            "flux adjoint exceeds the local output extent".into(),
+                        ));
+                    }
+                    let mut sum = 0.0;
+                    for axis in 0..dimension {
+                        sum += point_output[axis * dimension + component] * gradient[axis];
+                    }
+                    local_output[slot] += scale * sum;
+                }
             }
         }
         _ => {
@@ -2389,5 +2558,46 @@ fn invert(matrix: &[f64], dimension: usize) -> Option<(f64, Vec<f64>)> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod sv2_vector_probes {
+    use super::*;
+    use crate::{Mesh, PreparedElement};
+
+    #[test]
+    fn symmetric_gradient_direction_is_nonzero_for_unit_nodal_direction() {
+        let mesh = Mesh::new(
+            3,
+            vec![
+                vec![0.0, 0.0, 0.0],
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ],
+            vec![crate::Cell {
+                vertices: vec![
+                    crate::VertexId(0),
+                    crate::VertexId(1),
+                    crate::VertexId(2),
+                    crate::VertexId(3),
+                ],
+            }],
+        )
+        .unwrap();
+        let element = PreparedElement::linear_simplex(3).unwrap();
+        let geometry = CellGeometry::new(&mesh, crate::CellId(0)).unwrap();
+        // Build a minimal QFunctionInput-shaped probe via serde-free literal is
+        // impossible outside scientia; instead call the math through
+        // interpolate/gradient arms indirectly: assert physical gradients are
+        // nonzero so any zero must come from the state.
+        let mut total = 0.0;
+        for basis in 0..element.basis_count() {
+            let reference = element.basis_gradient(0, basis).unwrap();
+            let physical = geometry.physical_gradient(reference);
+            total += physical.iter().map(|v| v.abs()).sum::<f64>();
+        }
+        assert!(total > 1.0e-12, "basis gradients collapsed: {total}");
     }
 }

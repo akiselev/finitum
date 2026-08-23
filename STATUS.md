@@ -1,7 +1,7 @@
 # Finitum status
 
 Updated: 2026-08-22
-Milestone: SV0-B3 reusable concrete-realization checks + R3D/SV1-G0B exact geometry derivatives
+Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity
 
 ## Implemented
 
@@ -71,7 +71,12 @@ Milestone: SV0-B3 reusable concrete-realization checks + R3D/SV1-G0B exact geome
   dimension-complete exact-sequence boundary/rank, and maximum-cell-diameter mesh-refinement
   order providers;
 - versioned, kind-distinct serialized reports whose canonical digest binds subject identity,
-  tolerance/policy, probes or refinement samples, measured outputs, and acceptance results.
+  tolerance/policy, probes or refinement samples, measured outputs, and acceptance results;
+- SV2-A production slice: vector H1(order=1) blocks execute end-to-end through the same
+  generated kernels — vertex-major component DOF maps (`vector_nodal_dof_map`), value,
+  gradient, and symmetric-gradient basis evaluations with component-strided state, flux and
+  vector-value adjoint scatters, and isotropic constitutive laws wired as dynamic external
+  inputs so the tangent flows through the generated parameter kernels (`d sigma = C : d eps`).
 - deterministic triangular realization of admitted CADabra planar annuli on the
   wrapped polar chart (`CadGeometryRealization::from_family`), with stable
   inner/outer boundary identity, positively oriented cells, and a family-scoped

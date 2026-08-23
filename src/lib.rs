@@ -46,7 +46,7 @@ pub use realization::{
     GeometryParameterSensitivity, MatrixFreeOperator, PointActiveInput, PointEvaluation,
     REALIZATION_ARTIFACT_SCHEMA, RealizationArtifact, RealizationExternalInput, RealizationPlan,
 };
-pub use space::{DofId, DofMap, ElementRestriction};
+pub use space::{DofId, DofMap, ElementRestriction, vector_nodal_dof_map};
 pub use system::SystemRealizationPlan;
 pub use topology::{
     CompatibleDofMaps, ExactSequence, FacetId, FacetIncidence, FacetTopology, MeshFacet,
