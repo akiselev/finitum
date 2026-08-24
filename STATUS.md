@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-08-22
+Updated: 2026-08-24
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity
 
 ## Implemented
@@ -163,7 +163,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 43 passed, 0 failed
+cargo test --locked --workspace --all-targets           # 52 passed, 0 failed
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -220,9 +220,8 @@ nonuniform sheared affine patch above remains the independent realization oracle
 
 ## Next
 
-Krasis SV0-B4, Sinbad SV0-B5, and the Sinbad-owned CAD-driven Poisson product
-cut now consume these landed providers. R3D/SV1-G0B is complete: Sinbad R4
-consumes the exact residual sensitivity and analytic design velocities for the
-first verified CAD parameter-to-objective gradient. Extend method topology only
-from a concrete acceptance case, keeping local-kernel meaning, backend policy,
-and realization identity explicit.
+Krasis SV0-B4, Sinbad SV0-B5/R4, and Sinbad D4 now consume these landed
+providers. R3D/SV1-G0B and SV2-A are complete. SV2-B production Stokes is the
+next named realization gap; extend method topology only from its concrete D5
+acceptance case, keeping local-kernel meaning, backend policy, and realization
+identity explicit.
