@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-08-24
+Updated: 2026-08-30
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity
 
 ## Implemented
@@ -218,10 +218,44 @@ ranks. Hostile patch, transpose, cross-kind report, serialized-report tamper, mi
 divergence, and non-refining mesh fixtures are rejected or produce non-accepted reports. The FC6
 nonuniform sheared affine patch above remains the independent realization oracle.
 
+## Known limits recorded by the 2026-08-30 workspace audit (tree `8ec3eac`)
+
+- `Mesh::new(dimension, vertices, cells)` is the only generic mesh
+  constructor; there is no structured-grid builder, no refinement facility,
+  and no region or boundary tags on generic meshes. Structured meshes are
+  hand-rolled in Sinbad four times. The only identity-bearing boundaries are
+  CAD `StableId`s wired positionally.
+- Scientia `RegionId` on `EssentialConstraintRequirement` and
+  `BoundaryPartitionRequirement` is never used to select DOFs; validation
+  checks only non-emptiness parity, so the boundary-partition assumption is
+  not discharged.
+- Every non-basis input enters as a Rust closure; `DynamicExternalInput`
+  identity is a caller-invented string and the direction callback is trusted.
+- Dirichlet only, as explicit DOF rows; every non-cell measure is refused,
+  so there is no Neumann/Robin/traction path. `FacetTopology` exists but is
+  not wired into `RealizationPlan`.
+- H1 order 1 only; one active basis field. Malleus VJP kernels are validated
+  and bound but never executed; `MatrixFreeOperator` never declares
+  `Symmetric`, so consumers hard-code `AssumeSymmetric`.
+- `SystemRealizationPlan` is planning-only (no residual, JVP, or operator);
+  no P2 elements, no multi-order restrictions, no block operator with
+  off-diagonals.
+
 ## Next
 
-Krasis SV0-B4, Sinbad SV0-B5/R4, and Sinbad D4 now consume these landed
-providers. R3D/SV1-G0B and SV2-A are complete. SV2-B production Stokes is the
-next named realization gap; extend method topology only from its concrete D5
-acceptance case, keeping local-kernel meaning, backend policy, and realization
-identity explicit.
+GX-C (see `sinbad/docs/simulation-vision/GX-GENERIC-EXECUTION-PLANE.md`),
+before SV2-B Stokes:
+
+1. `GX-C1` `MeshProfile` (structured simplex boxes 1/2/3-D, uniform
+   refinement families, CAD-provider realizations under one trait);
+2. `GX-C2` `RegionTags` keyed by Scientia `RegionId`; constraints and
+   partitions derived from tags and discharged against `FacetTopology`;
+3. `GX-C5` provable `Symmetric` declaration, executed VJP kernels,
+   `RealizationCapability`/`RealizationReceipt` (SV2-A2);
+4. `GX-C4` exterior facet integrals (SV2-B2 pulled forward);
+5. `GX-C3`/`GX-C6` data-driven `FieldSource` inputs and Dirichlet-from-data
+   once Scientia GX-A2 property kernels exist.
+
+SV2-B production Stokes follows the GX gate; extend method topology only from
+its concrete D5 acceptance case, keeping local-kernel meaning, backend policy,
+and realization identity explicit.
