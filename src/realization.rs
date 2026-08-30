@@ -402,6 +402,9 @@ pub enum RepresentationKind {
 pub enum DerivativeProduct {
     Primal,
     Jvp,
+    /// [`RealizationPlan::vector_jacobian_product`]: the exact transpose action of the state
+    /// JVP at rate direction zero, executing the bound Malleus VJP kernels (GX-F7).
+    Vjp,
 }
 
 /// Source-artifact provenance for one [`RealizationCapability`].
@@ -629,9 +632,13 @@ impl RealizationPlan {
             RepresentationKind::ElementAssembly,
             RepresentationKind::PartialAssembly,
         ];
-        // Malleus VJP kernels are validated and bound at construction but this plan exposes no
-        // method to execute them, so `Vjp` is not reported as an available derivative product.
-        let derivative_products = vec![DerivativeProduct::Primal, DerivativeProduct::Jvp];
+        // GX-F7: `vector_jacobian_product` executes the bound Malleus VJP kernels, but it
+        // refuses affine dependency constraints (their transpose lands with SV1-C2), so `Vjp`
+        // is reported only when this plan has none.
+        let mut derivative_products = vec![DerivativeProduct::Primal, DerivativeProduct::Jvp];
+        if !self.data.constraints.has_affine_dependencies() {
+            derivative_products.push(DerivativeProduct::Vjp);
+        }
         let symmetry = self.matrix_free().symmetry();
         let receipt = RealizationReceipt {
             source_requirements_digest: self.data.requirements.artifact_digest.clone(),
@@ -750,6 +757,75 @@ impl RealizationPlan {
                 .direction_residual(state_direction, constraint.target)?;
         }
         validate_finite("stateful JVP", output)
+    }
+
+    /// Evaluate the exact transpose action of [`Self::jacobian_vector_product`] at the same
+    /// linearization point, with rate direction held at zero (GX-F7).
+    ///
+    /// This executes the bound Malleus VJP kernel for every integral output: the test-side
+    /// scatter's transpose becomes a forward gather of `adjoint` through the test basis, the VJP
+    /// kernel replaces the JVP kernel, and the result is scattered back through the transpose of
+    /// the trial-side gather (the same basis-adjoint machinery the forward JVP's test-side
+    /// scatter uses). A dynamic external input's own forward `direction` closure is reused,
+    /// probed with unit basis directions, to invert its chain-rule contribution exactly under
+    /// the same trusted-linearity contract the forward JVP relies on; a stored external input
+    /// contributes nothing further, matching its always-zero forward direction. Constraint rows
+    /// are transposed exactly like [`AssembledOperator::transpose`] would: a fixed row is its own
+    /// transpose, so its contribution is added back in directly. Affine dependency constraints
+    /// are refused with a typed error because their transpose is not yet implemented (SV1-C2).
+    ///
+    /// Cost: one VJP kernel execution per integral output per quadrature point, matching the
+    /// JVP's per-point kernel cost; a dynamic external input adds a bounded number of additional
+    /// point-local probes (proportional to that input's own and the active inputs' component
+    /// counts, never to the global degree-of-freedom count). No global assembly and no
+    /// dimension-many operator applications are performed.
+    pub fn vector_jacobian_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.validate_time_action(time, state, state_rate, output)?;
+        self.validate_action(adjoint, output)?;
+        if self.data.constraints.has_affine_dependencies() {
+            return Err(FinitumError::UnsupportedRealization(
+                "vector_jacobian_product refuses affine dependency constraints; their exact \
+                 transpose is not yet implemented (SV1-C2)"
+                    .into(),
+            ));
+        }
+        let physical_state = self.data.constraints.expand(state)?;
+        let physical_rate = self.data.constraints.expand_homogeneous(state_rate)?;
+        // Only unconstrained (non-target) rows of `adjoint` flow into the cell-transpose action;
+        // every fixed constraint row contributes only through the constraint's own transpose
+        // below, so it is masked to zero here (mirrors the row/column split of `A =
+        // R*(E^T A_cell E) + C` used to derive this transpose).
+        let mut restricted_adjoint = adjoint.to_vec();
+        for constraint in self.data.constraints.constraints() {
+            restricted_adjoint[constraint.target.0] = 0.0;
+        }
+        let physical_adjoint = self
+            .data
+            .constraints
+            .expand_homogeneous(&restricted_adjoint)?;
+        let mut physical_output = vec![0.0; self.dimension()];
+        self.apply_cells_transpose(
+            time,
+            &physical_state,
+            &physical_rate,
+            &physical_adjoint,
+            &mut physical_output,
+        )?;
+        output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
+        // A fixed constraint row `C[t,:] = e_t^T` is its own transpose, so `C^T adjoint`
+        // contributes `adjoint[t]` back at row `t`; `restrict_transpose` always drops row `t`
+        // (no affine dependencies exist here), so this is additive, not an overwrite.
+        for constraint in self.data.constraints.constraints() {
+            output[constraint.target.0] += adjoint[constraint.target.0];
+        }
+        validate_finite("stateful VJP", output)
     }
 
     /// Return the zero-active-state JVP realization for this globally linear FC6 plan.
@@ -1757,6 +1833,394 @@ impl RealizationPlan {
         }
         Ok(directions)
     }
+
+    fn apply_cells_transpose(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        for cell_index in 0..self.data.dofs.restrictions().len() {
+            self.apply_cell_transpose(cell_index, time, state, state_rate, adjoint, output)?;
+        }
+        Ok(())
+    }
+
+    fn apply_cell_transpose(
+        &self,
+        cell_index: usize,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let restriction = &self.data.dofs.restrictions()[cell_index];
+        let geometry = &self.data.geometries[cell_index];
+        let local_state = restriction
+            .dofs
+            .iter()
+            .map(|dof| state[dof.0])
+            .collect::<Vec<_>>();
+        let local_rate = restriction
+            .dofs
+            .iter()
+            .map(|dof| state_rate[dof.0])
+            .collect::<Vec<_>>();
+        let local_adjoint = restriction
+            .dofs
+            .iter()
+            .map(|dof| adjoint[dof.0])
+            .collect::<Vec<_>>();
+        let mut local_output = vec![0.0; restriction.dofs.len()];
+        for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
+            let scale = point.weight * geometry.determinant;
+            for integral in &self.data.factorization.integrals {
+                let (inputs, evaluation) = self.point_inputs(
+                    integral,
+                    cell_index,
+                    point_index,
+                    geometry,
+                    time,
+                    &local_state,
+                    &local_rate,
+                )?;
+                let active_inputs = active_state_inputs(integral);
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+                    let output_components = component_count(&qoutput.shape)?;
+                    let seed = gather_test_adjoint(
+                        &self.data.element,
+                        geometry,
+                        point_index,
+                        &qoutput.binding.evaluation.derivative,
+                        output_components,
+                        &local_adjoint,
+                    )?;
+                    let mut cotangents = self.execute_vjp_values(bound, &inputs, seed.clone())?;
+                    if !bound.bundle.parameter.independent_operands.is_empty() {
+                        let parameter_cotangents =
+                            self.point_parameter_cotangents(bound, &inputs, &seed)?;
+                        self.accumulate_parameter_cotangents(
+                            integral,
+                            point_index,
+                            geometry,
+                            scale,
+                            &evaluation,
+                            &active_inputs,
+                            &parameter_cotangents,
+                            &mut cotangents,
+                            &mut local_output,
+                        )?;
+                    }
+                    for input in &integral.primal.inputs {
+                        if input.source != InputSourceRequirement::Basis
+                            || input.role != TensorInputRole::Active
+                            || input.binding.evaluation.derivative
+                                == DerivativeEvaluation::TimeDerivative
+                        {
+                            continue;
+                        }
+                        let Some(cotangent) = cotangents.get(&input.id) else {
+                            continue;
+                        };
+                        apply_basis_adjoint(
+                            &self.data.element,
+                            geometry,
+                            point_index,
+                            &input.binding.evaluation.derivative,
+                            cotangent,
+                            scale,
+                            &mut local_output,
+                        )?;
+                    }
+                }
+            }
+        }
+        for (local, dof) in restriction.dofs.iter().enumerate() {
+            output[dof.0] += local_output[local];
+        }
+        Ok(())
+    }
+
+    /// Execute one integral output's bound VJP kernel: feed `seed` into the kernel's cotangent
+    /// seed operand and read back one cotangent per active input operand, summing contributions
+    /// when the same [`TensorInputId`] is read through more than one kernel operand access.
+    fn execute_vjp_values(
+        &self,
+        bound: &BoundBundle,
+        inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+        seed: Vec<f64>,
+    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
+        let input_by_operand = bound
+            .bundle
+            .primal_inputs
+            .iter()
+            .map(|binding| (binding.operand, binding.input))
+            .collect::<BTreeMap<_, _>>();
+        let mut values = BTreeMap::new();
+        for binding in &bound.bundle.primal_inputs {
+            values.insert(binding.operand, inputs[&binding.input].clone());
+        }
+        values.insert(bound.bundle.vjp.dependent_operands[0].derivative, seed);
+        let executable = &bound.executable.kernels()[bound.bundle.vjp.kernel_index];
+        let buffers = execute(executable, &values)?;
+        let mut cotangents: BTreeMap<TensorInputId, Vec<f64>> = BTreeMap::new();
+        for pair in &bound.bundle.vjp.independent_operands {
+            let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "VJP operand {:?} has no QFunction input binding",
+                    pair.primal
+                ))
+            })?;
+            let contribution = operand_values(executable, &buffers, pair.derivative)?;
+            match cotangents.get_mut(&input) {
+                Some(existing) => {
+                    if existing.len() != contribution.len() {
+                        return Err(FinitumError::InvalidRealization(
+                            "VJP cotangent has inconsistent extents across accesses".into(),
+                        ));
+                    }
+                    for (total, value) in existing.iter_mut().zip(&contribution) {
+                        *total += value;
+                    }
+                }
+                None => {
+                    cotangents.insert(input, contribution);
+                }
+            }
+        }
+        Ok(cotangents)
+    }
+
+    /// Extract the exact point-local Jacobian of the bound "parameter" (frozen-input) JVP
+    /// kernel with respect to every one of its independent (non-active) operands, by probing it
+    /// with unit direction columns -- exact because that kernel is Malleus's own linear tangent
+    /// map -- then contract each column against `seed` to produce one cotangent per parameter
+    /// input, summed across repeated accesses of the same [`TensorInputId`].
+    fn point_parameter_cotangents(
+        &self,
+        bound: &BoundBundle,
+        inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+        seed: &[f64],
+    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
+        let input_by_operand = bound
+            .bundle
+            .primal_inputs
+            .iter()
+            .map(|binding| (binding.operand, binding.input))
+            .collect::<BTreeMap<_, _>>();
+        let mut base_values = BTreeMap::new();
+        for binding in &bound.bundle.primal_inputs {
+            base_values.insert(binding.operand, inputs[&binding.input].clone());
+        }
+        let executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+        let output_operand = bound.bundle.parameter.dependent_operands[0].derivative;
+        let mut grad: BTreeMap<TensorInputId, Vec<f64>> = BTreeMap::new();
+        for pair in &bound.bundle.parameter.independent_operands {
+            let component_count = base_values
+                .get(&pair.primal)
+                .map(|values| values.len())
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "parameter-JVP operand {:?} has no base value binding",
+                        pair.primal
+                    ))
+                })?;
+            let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "parameter-JVP operand {:?} has no QFunction input binding",
+                    pair.primal
+                ))
+            })?;
+            let mut cotangent = vec![0.0; component_count];
+            for component in 0..component_count {
+                let mut probe_values = base_values.clone();
+                for other in &bound.bundle.parameter.independent_operands {
+                    let length = base_values[&other.primal].len();
+                    probe_values.insert(other.derivative, vec![0.0; length]);
+                }
+                let mut direction = vec![0.0; component_count];
+                direction[component] = 1.0;
+                probe_values.insert(pair.derivative, direction);
+                let buffers = execute(executable, &probe_values)?;
+                let column = operand_values(executable, &buffers, output_operand)?;
+                if column.len() != seed.len() {
+                    return Err(FinitumError::InvalidRealization(
+                        "parameter-JVP output extent does not match the VJP seed".into(),
+                    ));
+                }
+                cotangent[component] = column
+                    .iter()
+                    .zip(seed)
+                    .map(|(value, seed)| value * seed)
+                    .sum();
+            }
+            match grad.get_mut(&input) {
+                Some(existing) => {
+                    if existing.len() != cotangent.len() {
+                        return Err(FinitumError::InvalidRealization(
+                            "parameter cotangent has inconsistent extents across accesses".into(),
+                        ));
+                    }
+                    for (total, value) in existing.iter_mut().zip(&cotangent) {
+                        *total += value;
+                    }
+                }
+                None => {
+                    grad.insert(input, cotangent);
+                }
+            }
+        }
+        Ok(grad)
+    }
+
+    /// Route each parameter cotangent to its exact destination: a passive basis-sourced input
+    /// (state-dependent but not part of the active JVP/VJP contract) is scattered directly
+    /// through its own trial-side basis, like an active input; a stored external input is a dead
+    /// end, matching its always-zero forward direction; a dynamic external input's cotangent is
+    /// pushed back into the active-gather cotangents by probing its own trusted forward
+    /// `direction` closure with unit active-basis perturbations -- exact because that closure is
+    /// contracted to return the exact (hence linear and homogeneous) directional derivative of
+    /// its value closure.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_parameter_cotangents(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        point: usize,
+        geometry: &CellGeometry,
+        scale: f64,
+        evaluation: &PointEvaluation,
+        active_inputs: &[&QFunctionInput],
+        parameter_cotangents: &BTreeMap<TensorInputId, Vec<f64>>,
+        cotangents: &mut BTreeMap<TensorInputId, Vec<f64>>,
+        local_output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        for (input_id, grad) in parameter_cotangents {
+            let input = integral
+                .primal
+                .inputs
+                .iter()
+                .find(|candidate| candidate.id == *input_id)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "parameter cotangent references undeclared input {input_id:?}"
+                    ))
+                })?;
+            if input.source == InputSourceRequirement::Basis {
+                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                    continue;
+                }
+                apply_basis_adjoint(
+                    &self.data.element,
+                    geometry,
+                    point,
+                    &input.binding.evaluation.derivative,
+                    grad,
+                    scale,
+                    local_output,
+                )?;
+                continue;
+            }
+            let binding = self
+                .data
+                .external
+                .get(&(integral.integral_index, *input_id))
+                .ok_or(FinitumError::MissingExternalInput {
+                    integral: integral.integral_index,
+                    input: *input_id,
+                })?;
+            let dynamic = match binding {
+                ExternalBinding::Stored(_) => continue,
+                ExternalBinding::Dynamic(dynamic) => dynamic,
+            };
+            for probe_input in active_inputs {
+                let count = component_count(&probe_input.shape)?;
+                for component in 0..count {
+                    let probe = probe_direction_evaluation(
+                        evaluation,
+                        active_inputs,
+                        probe_input.id,
+                        component,
+                    )?;
+                    let response = (dynamic.direction)(evaluation, &probe);
+                    if response.len() != grad.len() {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "dynamic external input {input_id:?} direction returned {} \
+                             components, expected {}",
+                            response.len(),
+                            grad.len()
+                        )));
+                    }
+                    let contribution = response
+                        .iter()
+                        .zip(grad.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                    let entry = cotangents
+                        .entry(probe_input.id)
+                        .or_insert_with(|| vec![0.0; count]);
+                    entry[component] += contribution;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every active, basis-sourced, non-time-derivative input of one integral: the exact probe basis
+/// for a dynamic external input's chain rule back into `state_direction`'s gather space (rate
+/// direction is fixed at zero for [`RealizationPlan::vector_jacobian_product`], so
+/// time-derivative-kind active inputs never contribute and are excluded).
+fn active_state_inputs(integral: &IntegralOperatorFactorization) -> Vec<&QFunctionInput> {
+    integral
+        .primal
+        .inputs
+        .iter()
+        .filter(|input| {
+            input.source == InputSourceRequirement::Basis
+                && input.role == TensorInputRole::Active
+                && input.binding.evaluation.derivative != DerivativeEvaluation::TimeDerivative
+        })
+        .collect()
+}
+
+/// Build a synthetic direction [`PointEvaluation`] that is zero everywhere except a single unit
+/// component of `hot_input`, for probing a [`DynamicExternalInput`]'s trusted `direction`
+/// closure at the real (unperturbed) `evaluation`.
+fn probe_direction_evaluation(
+    evaluation: &PointEvaluation,
+    active_inputs: &[&QFunctionInput],
+    hot_input: TensorInputId,
+    hot_component: usize,
+) -> Result<PointEvaluation, FinitumError> {
+    let mut active = Vec::with_capacity(active_inputs.len());
+    for input in active_inputs {
+        let count = component_count(&input.shape)?;
+        let mut values = vec![0.0; count];
+        if input.id == hot_input {
+            if hot_component >= count {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "probe component {hot_component} is outside input {:?} extent {count}",
+                    input.id
+                )));
+            }
+            values[hot_component] = 1.0;
+        }
+        active.push(PointActiveInput {
+            input: input.id,
+            derivative: input.binding.evaluation.derivative,
+            values,
+        });
+    }
+    Ok(PointEvaluation {
+        time: evaluation.time,
+        cell: evaluation.cell,
+        coordinates: evaluation.coordinates.clone(),
+        active,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2602,6 +3066,34 @@ pub(crate) fn apply_basis_adjoint(
                 }
             }
         }
+        DerivativeEvaluation::SymmetricGradient if point_output.len() == dimension * dimension => {
+            // Transpose of the symmetric-gradient gather `evaluate_basis_input` builds:
+            // sym[r][c] = sum_basis 0.5 * (g[r]*u[basis][c] + g[c]*u[basis][r]). Differentiating
+            // with respect to state[basis][component] and contracting against `point_output`
+            // gives the row/column pair below (GX-F7, used by the VJP trial-side scatter of a
+            // symmetric-gradient active input, e.g. vector H1 elasticity strain).
+            for basis in 0..basis_count {
+                let gradient = geometry.physical_gradient(
+                    element
+                        .basis_gradient(point, basis)
+                        .expect("validated element table"),
+                );
+                for component in 0..dimension {
+                    let slot = basis * stride + component;
+                    if slot >= local_output.len() {
+                        return Err(FinitumError::InvalidRealization(
+                            "symmetric-gradient adjoint exceeds the local output extent".into(),
+                        ));
+                    }
+                    let mut sum = 0.0;
+                    for axis in 0..dimension {
+                        sum += point_output[axis * dimension + component] * gradient[axis];
+                        sum += point_output[component * dimension + axis] * gradient[axis];
+                    }
+                    local_output[slot] += scale * 0.5 * sum;
+                }
+            }
+        }
         _ => {
             return Err(FinitumError::InvalidRealization(format!(
                 "point output with {} components does not match {derivative:?}",
@@ -2610,6 +3102,90 @@ pub(crate) fn apply_basis_adjoint(
         }
     }
     Ok(())
+}
+
+/// Exact transpose of [`apply_basis_adjoint`]: gather a point-space cotangent from a restricted
+/// adjoint vector through the test basis of `derivative`, mirroring the same four evaluation
+/// shapes (GX-F7, used by the VJP's test-side gather of the adjoint before the bound VJP kernel
+/// runs). Unlike `apply_basis_adjoint`, this never scales by the quadrature weight: scale is
+/// applied once, at the trial-side scatter that follows the kernel, matching where
+/// `evaluate_basis_input`'s own forward gather (unscaled) sits in the JVP pipeline.
+pub(crate) fn gather_test_adjoint(
+    element: &PreparedElement,
+    geometry: &CellGeometry,
+    point: usize,
+    derivative: &DerivativeEvaluation,
+    output_components: usize,
+    local_adjoint: &[f64],
+) -> Result<Vec<f64>, FinitumError> {
+    let dimension = element.dimension();
+    let basis_count = element.basis_count();
+    let stride = if local_adjoint.len() % basis_count == 0 {
+        local_adjoint.len() / basis_count
+    } else {
+        return Err(FinitumError::InvalidRealization(
+            "local adjoint length is not a multiple of the basis count".into(),
+        ));
+    };
+    match derivative {
+        DerivativeEvaluation::Value if output_components == 1 => {
+            let mut value = 0.0;
+            for (basis, coefficient) in local_adjoint.iter().enumerate().take(basis_count) {
+                value += element.basis_value(point, basis).unwrap() * coefficient;
+            }
+            Ok(vec![value])
+        }
+        DerivativeEvaluation::Value if output_components == stride => {
+            let mut value = vec![0.0; stride];
+            for basis in 0..basis_count {
+                let weight = element.basis_value(point, basis).unwrap();
+                for component in 0..stride {
+                    value[component] += weight * local_adjoint[basis * stride + component];
+                }
+            }
+            Ok(value)
+        }
+        DerivativeEvaluation::Gradient if output_components == dimension => {
+            let mut value = vec![0.0; dimension];
+            for (basis, coefficient) in local_adjoint.iter().enumerate().take(basis_count) {
+                let gradient = geometry.physical_gradient(
+                    element
+                        .basis_gradient(point, basis)
+                        .expect("validated element table"),
+                );
+                for axis in 0..dimension {
+                    value[axis] += gradient[axis] * coefficient;
+                }
+            }
+            Ok(value)
+        }
+        DerivativeEvaluation::Gradient if output_components == dimension * dimension => {
+            let mut value = vec![0.0; dimension * dimension];
+            for basis in 0..basis_count {
+                let gradient = geometry.physical_gradient(
+                    element
+                        .basis_gradient(point, basis)
+                        .expect("validated element table"),
+                );
+                for component in 0..dimension {
+                    let slot = basis * stride + component;
+                    if slot >= local_adjoint.len() {
+                        return Err(FinitumError::InvalidRealization(
+                            "flux adjoint gather exceeds the local adjoint extent".into(),
+                        ));
+                    }
+                    let coefficient = local_adjoint[slot];
+                    for axis in 0..dimension {
+                        value[axis * dimension + component] += gradient[axis] * coefficient;
+                    }
+                }
+            }
+            Ok(value)
+        }
+        _ => Err(FinitumError::InvalidRealization(format!(
+            "adjoint output with {output_components} components does not match {derivative:?}"
+        ))),
+    }
 }
 
 fn execute(
