@@ -82,4 +82,24 @@ pub enum FinitumError {
         family: String,
         reason: &'static str,
     },
+    #[error("mesh profile is unsupported: {0}")]
+    MeshProfileUnsupported(String),
+    #[error("region {0} has no entry in the caller-supplied region map")]
+    RealizationRegionUnmapped(String),
+    #[error(
+        "boundary partition failed: {uncovered} exterior facets uncovered, \
+         {overlapping} facets covered by more than one mapped region"
+    )]
+    RealizationPartitionFailed {
+        uncovered: usize,
+        overlapping: usize,
+    },
+    #[error(
+        "region tags {left} and {right} assign conflicting essential values at vertex {vertex}"
+    )]
+    ConflictingRegionValue {
+        left: String,
+        right: String,
+        vertex: usize,
+    },
 }

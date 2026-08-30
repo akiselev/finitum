@@ -12,6 +12,7 @@ mod mapping;
 mod mesh;
 mod method;
 mod optimized;
+mod profile;
 mod realization;
 mod space;
 mod system;
@@ -41,10 +42,16 @@ pub use optimized::{
     AcceleratorLayout, CellBatchLayout, ElementAssemblyOperator, PartialAssemblyOperator,
     TensorProductBasis, TensorProductEvaluation,
 };
+pub use profile::{
+    FieldSource, MeshProfile, MeshProvenance, PartitionReport, RegionMap, RegionTagId, RegionTags,
+    TaggedMesh, check_boundary_partition, essential_constraints_from, realize, refine_uniform,
+};
 pub use realization::{
-    AssembledOperator, DynamicExternalInput, ExternalInput, ExternalSensitivityInput,
-    GeometryParameterSensitivity, MatrixFreeOperator, PointActiveInput, PointEvaluation,
-    REALIZATION_ARTIFACT_SCHEMA, RealizationArtifact, RealizationExternalInput, RealizationPlan,
+    AssembledOperator, CapabilityElement, ConstraintKind, DerivativeProduct, DynamicExternalInput,
+    ExternalInput, ExternalSensitivityInput, GeometryParameterSensitivity, MatrixFreeOperator,
+    PointActiveInput, PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
+    RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
+    RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP,
 };
 pub use space::{DofId, DofMap, ElementRestriction, vector_nodal_dof_map};
 pub use system::SystemRealizationPlan;

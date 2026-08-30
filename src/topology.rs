@@ -2,7 +2,7 @@ use crate::{CellId, DofId, FinitumError, Mesh, VertexId};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct FacetId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

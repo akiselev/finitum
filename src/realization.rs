@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use malleus::{
     AccessMode, BufferBinding, Executable, ExecutableModule, Interpreter, OperandId,
@@ -10,12 +10,13 @@ use scientia::scientific::ValueShape;
 use scientia::{
     DerivativeEvaluation, Digest, ElementFamilyRequirement, EvaluationSite, FormRequirements,
     InputSourceRequirement, IntegralOperatorFactorization, OperatorFactorization, QFunctionInput,
-    SemanticMeasure, StructuredOperatorKernels, StructuredPointKernelBundle, TensorInputId,
-    TensorInputRole,
+    SemanticMeasure, StructuredOperatorKernels, StructuredPointKernelBundle, SymbolId,
+    TensorInputId, TensorInputRole,
 };
 use serde::Serialize;
 
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
+use crate::profile::{PartitionReport, RegionMap, RegionTags, partition_report_for};
 use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};
 
 pub const REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-realization-plan/2";
@@ -308,6 +309,9 @@ struct RealizationData {
     constraints: ConstraintSet,
     external: BTreeMap<(usize, TensorInputId), ExternalBinding>,
     bundles: BTreeMap<(usize, usize), BoundBundle>,
+    /// Lazily proven, then cached, symmetry declaration of the matrix-free action. The proof
+    /// assembles the action once per realization; every later `symmetry()` query is a read.
+    symmetry_proof: OnceLock<OperatorSymmetry>,
 }
 
 /// Digest-linked binding of FC3 requirements, an FC4 factorization, FC5 executables, and
@@ -358,6 +362,87 @@ pub enum RealizationExternalInput {
         component_count: usize,
         identity: String,
     },
+}
+
+pub const REALIZATION_CAPABILITY_SCHEMA: &str = "finitum-realization-capability/1";
+
+/// One admitted Scientia element requirement, as reported by [`RealizationPlan::capability`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CapabilityElement {
+    pub symbol: SymbolId,
+    pub topological_dimension: u8,
+    pub family: ElementFamilyRequirement,
+    pub polynomial_order: u8,
+    pub value_shape: ValueShape,
+}
+
+/// The kinds of essential-constraint rows a [`RealizationPlan`] admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintKind {
+    /// A fixed row with no weighted dependencies.
+    Fixed,
+    /// A row expressed as an affine combination of other degrees of freedom.
+    AffineDependency,
+}
+
+/// A global operator representation this plan can produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepresentationKind {
+    MatrixFree,
+    Assembled,
+    ElementAssembly,
+    PartialAssembly,
+}
+
+/// A derivative product this plan can execute through its public API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivativeProduct {
+    Primal,
+    Jvp,
+}
+
+/// Source-artifact provenance for one [`RealizationCapability`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RealizationReceipt {
+    pub source_requirements_digest: Digest,
+    pub source_factorization_digest: Digest,
+    pub source_kernels_digest: Digest,
+    pub realization_digest: Digest,
+}
+
+/// Versioned, serializable description of what one [`RealizationPlan`] admitted (SV2-A2): the
+/// topology dimension, admitted element family/order/value shapes, measures realized,
+/// constraint kinds present, representation kinds and derivative products this plan exposes,
+/// and its declared symmetry, bound to a canonical digest. Purely descriptive: it carries no
+/// admissibility policy of its own.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RealizationCapability {
+    pub schema: String,
+    pub topology_dimension: usize,
+    pub elements: Vec<CapabilityElement>,
+    pub measures: Vec<SemanticMeasure>,
+    pub constraint_kinds: Vec<ConstraintKind>,
+    pub representation_kinds: Vec<RepresentationKind>,
+    pub derivative_products: Vec<DerivativeProduct>,
+    pub symmetry: OperatorSymmetry,
+    pub receipt: RealizationReceipt,
+    pub digest: Digest,
+}
+
+#[derive(Serialize)]
+struct CapabilityDigestPayload<'a> {
+    schema: &'static str,
+    topology_dimension: usize,
+    elements: &'a [CapabilityElement],
+    measures: &'a [SemanticMeasure],
+    constraint_kinds: &'a [ConstraintKind],
+    representation_kinds: &'a [RepresentationKind],
+    derivative_products: &'a [DerivativeProduct],
+    symmetry: OperatorSymmetry,
+    receipt: &'a RealizationReceipt,
 }
 
 impl RealizationPlan {
@@ -442,6 +527,7 @@ impl RealizationPlan {
                 constraints,
                 external,
                 bundles,
+                symmetry_proof: OnceLock::new(),
             }),
         })
     }
@@ -501,6 +587,100 @@ impl RealizationPlan {
             constraints: self.data.constraints.clone(),
             external_inputs,
         }
+    }
+
+    /// Describes what this plan admitted: topology dimension, element family/order/value
+    /// shapes, measures realized, constraint kinds, the representation and derivative products
+    /// this plan exposes, and its declared symmetry (SV2-A2). This is purely descriptive: it
+    /// reports what the plan already does, adding no policy of its own.
+    pub fn capability(&self) -> RealizationCapability {
+        let elements = self
+            .data
+            .requirements
+            .elements
+            .iter()
+            .map(|element| CapabilityElement {
+                symbol: element.symbol,
+                topological_dimension: element.topological_dimension,
+                family: element.family,
+                polynomial_order: element.polynomial_order,
+                value_shape: element.value_shape.clone(),
+            })
+            .collect::<Vec<_>>();
+        let measures = self
+            .data
+            .factorization
+            .integrals
+            .iter()
+            .map(|integral| integral.measure.clone())
+            .collect::<Vec<_>>();
+        let mut constraint_kinds = BTreeSet::new();
+        for constraint in self.data.constraints.constraints() {
+            if constraint.dependencies.is_empty() {
+                constraint_kinds.insert(ConstraintKind::Fixed);
+            } else {
+                constraint_kinds.insert(ConstraintKind::AffineDependency);
+            }
+        }
+        let constraint_kinds = constraint_kinds.into_iter().collect::<Vec<_>>();
+        let representation_kinds = vec![
+            RepresentationKind::MatrixFree,
+            RepresentationKind::Assembled,
+            RepresentationKind::ElementAssembly,
+            RepresentationKind::PartialAssembly,
+        ];
+        // Malleus VJP kernels are validated and bound at construction but this plan exposes no
+        // method to execute them, so `Vjp` is not reported as an available derivative product.
+        let derivative_products = vec![DerivativeProduct::Primal, DerivativeProduct::Jvp];
+        let symmetry = self.matrix_free().symmetry();
+        let receipt = RealizationReceipt {
+            source_requirements_digest: self.data.requirements.artifact_digest.clone(),
+            source_factorization_digest: self.data.factorization.artifact_digest.clone(),
+            source_kernels_digest: self.data.kernels_digest.clone(),
+            realization_digest: self.data.digest.clone(),
+        };
+        let payload = CapabilityDigestPayload {
+            schema: REALIZATION_CAPABILITY_SCHEMA,
+            topology_dimension: self.data.mesh.dimension(),
+            elements: &elements,
+            measures: &measures,
+            constraint_kinds: &constraint_kinds,
+            representation_kinds: &representation_kinds,
+            derivative_products: &derivative_products,
+            symmetry,
+            receipt: &receipt,
+        };
+        let digest = Digest::blake3(
+            &serde_json::to_vec(&payload).expect("capability payload is serializable"),
+        );
+        RealizationCapability {
+            schema: REALIZATION_CAPABILITY_SCHEMA.into(),
+            topology_dimension: self.data.mesh.dimension(),
+            elements,
+            measures,
+            constraint_kinds,
+            representation_kinds,
+            derivative_products,
+            symmetry,
+            receipt,
+            digest,
+        }
+    }
+
+    /// Checks every `BoundaryPartitionRequirement` this plan's source requirements declared
+    /// against `tags`/`region_map`, without requiring a [`crate::TaggedMesh`] wrapper around
+    /// this plan's own mesh. Additive: existing callers that never call this are unaffected.
+    pub fn validate_boundary_partition(
+        &self,
+        tags: &RegionTags,
+        region_map: &RegionMap,
+    ) -> Result<Vec<PartitionReport>, FinitumError> {
+        self.data
+            .requirements
+            .boundary_partitions
+            .iter()
+            .map(|requirement| partition_report_for(&self.data.mesh, tags, requirement, region_map))
+            .collect()
     }
 
     /// Evaluate the generated global residual at independent state and state-rate vectors.
@@ -575,6 +755,46 @@ impl RealizationPlan {
     /// Return the zero-active-state JVP realization for this globally linear FC6 plan.
     pub fn matrix_free(&self) -> MatrixFreeOperator {
         MatrixFreeOperator { plan: self.clone() }
+    }
+
+    /// Establish, once per realization, whether the matrix-free action is self-adjoint, and
+    /// record the answer so every later [`MatrixFreeOperator::symmetry`] query on this
+    /// realization (and its clones) reports it.
+    ///
+    /// The proof assembles the action through the same generated JVP kernels `apply` executes
+    /// and compares every entry against its transpose with the relative `tolerance`
+    /// (`|a_ij - a_ji| <= tolerance * max(|a_ij|, |a_ji|, 1)`), so floating-point reassociation
+    /// across cells does not masquerade as nonsymmetry. It is explicit and bounded: affine
+    /// dependency constraints short-circuit to `Nonsymmetric`; realizations larger than
+    /// [`SYMMETRY_PROOF_DIMENSION_CAP`] are refused rather than probed; a non-finite or
+    /// negative tolerance is refused. Repeated calls return the recorded proof without
+    /// reassembling, regardless of the tolerance they pass.
+    pub fn prove_symmetry(&self, tolerance: f64) -> Result<OperatorSymmetry, FinitumError> {
+        if self.data.constraints.has_affine_dependencies() {
+            return Ok(OperatorSymmetry::Nonsymmetric);
+        }
+        if let Some(proof) = self.data.symmetry_proof.get() {
+            return Ok(*proof);
+        }
+        if !(tolerance.is_finite() && tolerance >= 0.0) {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "symmetry proof tolerance must be finite and nonnegative, got {tolerance}"
+            )));
+        }
+        if self.dimension() > SYMMETRY_PROOF_DIMENSION_CAP {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "symmetry proof by assembly is refused above {SYMMETRY_PROOF_DIMENSION_CAP} \
+                 degrees of freedom (realization has {})",
+                self.dimension()
+            )));
+        }
+        let assembled = self.assemble()?;
+        let proof = if csr_is_symmetric_within(&assembled.matrix, tolerance) {
+            OperatorSymmetry::Symmetric
+        } else {
+            OperatorSymmetry::Nonsymmetric
+        };
+        Ok(*self.data.symmetry_proof.get_or_init(|| proof))
     }
 
     /// Assemble by applying the matrix-free realization to canonical coordinate vectors. Both
@@ -1556,6 +1776,12 @@ pub struct MatrixFreeOperator {
     plan: RealizationPlan,
 }
 
+/// Largest `dimension()` for which [`RealizationPlan::prove_symmetry`] is willing to assemble the
+/// action (`dimension()` operator applications) to establish a symmetry proof. Above it the
+/// proof is refused rather than attempted; a structural proof from the factorization is the
+/// intended replacement (GX-C5 follow-up).
+pub const SYMMETRY_PROOF_DIMENSION_CAP: usize = 4_096;
+
 impl MatrixFreeOperator {
     pub fn source_factorization_digest(&self) -> &Digest {
         self.plan.source_factorization_digest()
@@ -1571,12 +1797,21 @@ impl LinearOperator for MatrixFreeOperator {
         self.plan.dimension()
     }
 
+    /// Declared symmetry: `Nonsymmetric` whenever an affine dependency constraint replaces a
+    /// target row with a constraint residual (the existing rule); otherwise the proof recorded
+    /// by an explicit [`RealizationPlan::prove_symmetry`] call on this realization, or `Unknown`
+    /// when no proof has been established. This method never assembles or probes the action
+    /// itself, so it is cheap to call from solver loops.
     fn symmetry(&self) -> OperatorSymmetry {
         if self.plan.data.constraints.has_affine_dependencies() {
-            OperatorSymmetry::Nonsymmetric
-        } else {
-            OperatorSymmetry::Unknown
+            return OperatorSymmetry::Nonsymmetric;
         }
+        self.plan
+            .data
+            .symmetry_proof
+            .get()
+            .copied()
+            .unwrap_or(OperatorSymmetry::Unknown)
     }
 
     fn apply(
@@ -1600,6 +1835,34 @@ pub struct AssembledOperator {
     matrix: CsrMatrix,
     source_factorization_digest: Digest,
     symmetry: OperatorSymmetry,
+}
+
+/// Entrywise transpose comparison of a square CSR matrix under a relative tolerance. Missing
+/// transposed entries count as zero, so a structurally one-sided but numerically negligible
+/// entry still passes; any pair that differs beyond `tolerance * max(|a|, |b|, 1)` fails.
+fn csr_is_symmetric_within(matrix: &CsrMatrix, tolerance: f64) -> bool {
+    let rows = matrix.rows();
+    if rows != matrix.columns() {
+        return false;
+    }
+    let offsets = matrix.row_offsets();
+    let columns = matrix.column_indices();
+    let values = matrix.values();
+    let entry = |row: usize, column: usize| -> f64 {
+        let range = offsets[row]..offsets[row + 1];
+        columns[range.clone()]
+            .binary_search(&column)
+            .map_or(0.0, |offset| values[range.start + offset])
+    };
+    (0..rows).all(|row| {
+        (offsets[row]..offsets[row + 1]).all(|index| {
+            let column = columns[index];
+            let value = values[index];
+            let mirrored = entry(column, row);
+            let scale = value.abs().max(mirrored.abs()).max(1.0);
+            (value - mirrored).abs() <= tolerance * scale
+        })
+    })
 }
 
 impl AssembledOperator {
