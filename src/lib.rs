@@ -43,15 +43,16 @@ pub use optimized::{
     TensorProductBasis, TensorProductEvaluation,
 };
 pub use profile::{
-    FieldSource, MeshProfile, MeshProvenance, PartitionReport, RegionMap, RegionTagId, RegionTags,
-    TaggedMesh, check_boundary_partition, essential_constraints_from, realize, refine_uniform,
+    ComponentSelection, FieldSource, MeshProfile, MeshProvenance, PartitionReport, RegionMap,
+    RegionTagId, RegionTags, TaggedMesh, check_boundary_partition, essential_constraints_from,
+    essential_constraints_from_selected, facet_membership_from, realize, refine_uniform,
 };
 pub use realization::{
     AssembledOperator, CapabilityElement, ConstraintKind, DerivativeProduct, DynamicExternalInput,
     ExternalInput, ExternalSensitivityInput, GeometryParameterSensitivity, MatrixFreeOperator,
     PointActiveInput, PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
     RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
-    RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP,
+    RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from,
 };
 pub use space::{DofId, DofMap, ElementRestriction, vector_nodal_dof_map};
 pub use system::SystemRealizationPlan;

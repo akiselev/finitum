@@ -16,8 +16,15 @@ use scientia::{
 use serde::Serialize;
 
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
-use crate::profile::{PartitionReport, RegionMap, RegionTags, partition_report_for};
-use crate::{CellId, ConstraintSet, DofMap, FinitumError, Mesh, PreparedElement};
+use crate::profile::{
+    FieldSource, PartitionReport, RegionMap, RegionTags, evaluate_kernel_partial,
+    evaluate_kernel_value, evaluate_table_slope, evaluate_table_value, named_coordinate_inputs,
+    partition_report_for,
+};
+use crate::{
+    CellId, ConstraintSet, DofMap, FacetId, FacetIncidence, FacetTopology, FinitumError, Mesh,
+    PreparedElement,
+};
 
 pub const REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-realization-plan/2";
 
@@ -185,10 +192,394 @@ impl ExternalInput {
         Self::new(integral_index, input, component_count, values)
     }
 
+    /// GX-C4: sample and own input values in the deterministic order of `facet_ids` (one
+    /// centroid quadrature point per facet, matching `FacetGeometry`'s single-point rule).
+    /// `facet_ids` must be exactly the facet list a `SemanticMeasure::ExteriorFacet { region }`
+    /// integral resolves through its `RegionMap`/`RegionTags` binding, in the same order the
+    /// realization itself will use -- passing a different order silently mismatches values to
+    /// facets, since this stored array carries no facet identity of its own.
+    pub fn sampled_on_facets(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        facets: &FacetTopology,
+        facet_ids: &[FacetId],
+        mut sample: impl FnMut(FacetId, &[f64]) -> Vec<f64>,
+    ) -> Result<Self, FinitumError> {
+        let mut values = Vec::new();
+        for &facet_id in facet_ids {
+            let facet = facets.facets().get(facet_id.0).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!("facet {} does not exist", facet_id.0))
+            })?;
+            if !facet.is_exterior() {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "facet {} is not exterior; exterior facet integrals refuse interior facets",
+                    facet_id.0
+                )));
+            }
+            let geometry = FacetGeometry::compute(mesh, facet.minus())?;
+            let sampled = sample(facet_id, &geometry.physical_centroid);
+            if sampled.len() != component_count {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "facet external input sampler returned {} components, expected {component_count}",
+                    sampled.len()
+                )));
+            }
+            values.extend(sampled);
+        }
+        Self::new(integral_index, input, component_count, values)
+    }
+
     fn point_values(&self, cell: usize, point: usize, point_count: usize) -> &[f64] {
         let start = (cell * point_count + point) * self.component_count;
         &self.values[start..start + self.component_count]
     }
+
+    fn facet_point_values(&self, facet_position: usize) -> &[f64] {
+        let start = facet_position * self.component_count;
+        &self.values[start..start + self.component_count]
+    }
+}
+
+/// GX-C3: builds `ExternalInput`/`DynamicExternalInput` bindings for every non-basis QFunction
+/// input of `factorization`'s **cell** integrals (`SemanticMeasure::Cell`) from a caller-supplied
+/// `(SymbolId, FieldSource)` table, replacing hand-written per-input closures such as the ones
+/// `fc7_runtime_state_rate_and_property_chain_rule_match_finite_differences` writes by hand.
+/// GX-C4 facet integrals build their external inputs separately, since they sample at facet
+/// points rather than cell quadrature points (see `ExternalInput::sampled_on_facets`).
+///
+/// A `Constant`/`Nodal`/`Sampled`/`Table` source, or a `Kernel` source whose declared inputs are
+/// all resolvable as coordinates/time (names `"x"`/`"y"`/`"z"`/`"t"`/`"time"`), is sampled once
+/// per cell quadrature point into a stored `ExternalInput` — coordinates only, so it cannot vary
+/// with the runtime evaluation time or the active field.
+///
+/// A `Kernel` or `Table` source whose declared inputs (or axes) include the name of exactly one
+/// active, basis-sourced field of the same integral becomes a `DynamicExternalInput`: its value
+/// closure evaluates the kernel/table at the point's coordinates and the active field's current
+/// value; its direction closure evaluates the exact tangent/slope with respect to that one input
+/// and multiplies by the supplied direction (the chain rule for every other declared input is
+/// zero, since only coordinates/time and the one active field may appear). A source referencing
+/// more than one active field by name is refused (ambiguous chain-rule combination, out of
+/// bounded scope). A `Kernel` whose `DerivativeContract` supplied no tangent for that input, or a
+/// `Table` with `TableDerivativePolicy::Unavailable`, is refused at build time
+/// (`FinitumError::RealizationTangentUnavailable`) rather than silently trusted with a zero or
+/// approximate direction.
+pub fn external_inputs_from(
+    factorization: &OperatorFactorization,
+    model: &scientia::SemanticModel,
+    mesh: &Mesh,
+    element: &PreparedElement,
+    sources: &[(SymbolId, FieldSource)],
+) -> Result<(Vec<ExternalInput>, Vec<DynamicExternalInput>), FinitumError> {
+    let sources_by_symbol = sources
+        .iter()
+        .map(|(symbol, source)| (*symbol, source))
+        .collect::<BTreeMap<_, _>>();
+    let mut stored = Vec::new();
+    let mut dynamic = Vec::new();
+    for integral in &factorization.integrals {
+        if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+            continue;
+        }
+        let active_inputs = integral
+            .primal
+            .inputs
+            .iter()
+            .filter(|input| {
+                input.source == InputSourceRequirement::Basis
+                    && input.role == TensorInputRole::Active
+            })
+            .collect::<Vec<_>>();
+        let active_names = active_inputs
+            .iter()
+            .map(|input| model.symbols[input.binding.symbol.index()].name.clone())
+            .collect::<BTreeSet<_>>();
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let symbol = input.binding.symbol;
+            let source = *sources_by_symbol.get(&symbol).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "external_inputs_from has no FieldSource for symbol {symbol:?}"
+                ))
+            })?;
+            let components = component_count(&input.shape)?;
+            match source {
+                FieldSource::Kernel { kernel, executable } => {
+                    let state_names = kernel
+                        .inputs
+                        .iter()
+                        .filter(|slot| active_names.contains(&slot.name))
+                        .map(|slot| slot.name.clone())
+                        .collect::<Vec<_>>();
+                    if state_names.is_empty() {
+                        let mut sampler_error = None;
+                        let sample_kernel = kernel.clone();
+                        let sample_executable = executable.clone();
+                        let built = ExternalInput::sampled(
+                            integral.integral_index,
+                            input.id,
+                            components,
+                            mesh,
+                            element,
+                            |_, point| {
+                                let named = named_coordinate_inputs(point, 0.0);
+                                match evaluate_kernel_value(
+                                    &sample_kernel,
+                                    &sample_executable,
+                                    &named,
+                                ) {
+                                    Ok(value) => vec![value],
+                                    Err(error) => {
+                                        sampler_error.get_or_insert(error);
+                                        vec![f64::NAN]
+                                    }
+                                }
+                            },
+                        )?;
+                        if let Some(error) = sampler_error {
+                            return Err(error);
+                        }
+                        stored.push(built);
+                        continue;
+                    }
+                    if state_names.len() > 1 || components != 1 {
+                        return Err(FinitumError::UnsupportedRealization(
+                            "state-dependent kernel external inputs support one scalar active \
+                             field reference only"
+                                .into(),
+                        ));
+                    }
+                    let active_name = state_names[0].clone();
+                    let active_input = *active_inputs
+                        .iter()
+                        .find(|candidate| {
+                            model.symbols[candidate.binding.symbol.index()].name == active_name
+                        })
+                        .expect("active_name was derived from active_inputs");
+                    if !kernel
+                        .tangents
+                        .iter()
+                        .any(|tangent| tangent.input == active_name)
+                    {
+                        return Err(FinitumError::RealizationTangentUnavailable(format!(
+                            "property kernel {:?} declares no tangent for its state-dependent \
+                             input {active_name:?}",
+                            kernel.identity
+                        )));
+                    }
+                    let active_derivative = active_input.binding.evaluation.derivative;
+                    let identity = format!("finitum.field-source-kernel/1:{}", kernel.identity);
+                    let value_kernel = kernel.clone();
+                    let value_executable = executable.clone();
+                    let value_active_name = active_name.clone();
+                    let direction_kernel = kernel.clone();
+                    let direction_executable = executable.clone();
+                    let direction_active_name = active_name.clone();
+                    dynamic.push(DynamicExternalInput::new(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        identity,
+                        move |point: &PointEvaluation| {
+                            let mut named = named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value = point
+                                .values(active_derivative)
+                                .expect("active input was declared on this integral")[0];
+                            named.insert(value_active_name.clone(), active_value);
+                            vec![
+                                evaluate_kernel_value(&value_kernel, &value_executable, &named)
+                                    .expect(
+                                        "kernel value was validated at external_inputs_from build time",
+                                    ),
+                            ]
+                        },
+                        move |point: &PointEvaluation, direction: &PointEvaluation| {
+                            let mut named =
+                                named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value = point
+                                .values(active_derivative)
+                                .expect("active input was declared on this integral")[0];
+                            named.insert(direction_active_name.clone(), active_value);
+                            let partial = evaluate_kernel_partial(
+                                &direction_kernel,
+                                &direction_executable,
+                                &named,
+                                &direction_active_name,
+                            )
+                            .expect("kernel tangent was validated at external_inputs_from build time")
+                            .expect("kernel tangent availability was validated at build time");
+                            let active_direction = direction
+                                .values(active_derivative)
+                                .expect("active direction was declared on this integral")[0];
+                            vec![partial * active_direction]
+                        },
+                    )?);
+                }
+                FieldSource::Table(table) => {
+                    let state_names = table
+                        .axes
+                        .iter()
+                        .filter(|axis| active_names.contains(&axis.name))
+                        .map(|axis| axis.name.clone())
+                        .collect::<Vec<_>>();
+                    if state_names.is_empty() {
+                        let mut sampler_error = None;
+                        let sample_table = table.clone();
+                        let built = ExternalInput::sampled(
+                            integral.integral_index,
+                            input.id,
+                            components,
+                            mesh,
+                            element,
+                            |_, point| {
+                                let named = named_coordinate_inputs(point, 0.0);
+                                let axis_point = sample_table
+                                    .axes
+                                    .iter()
+                                    .map(|axis| named.get(&axis.name).copied().ok_or_else(|| {
+                                        FinitumError::InvalidRealization(format!(
+                                            "property table axis {:?} is not a coordinate/time name",
+                                            axis.name
+                                        ))
+                                    }))
+                                    .collect::<Result<Vec<_>, _>>();
+                                match axis_point
+                                    .and_then(|point| evaluate_table_value(&sample_table, &point))
+                                {
+                                    Ok(value) => vec![value],
+                                    Err(error) => {
+                                        sampler_error.get_or_insert(error);
+                                        vec![f64::NAN]
+                                    }
+                                }
+                            },
+                        )?;
+                        if let Some(error) = sampler_error {
+                            return Err(error);
+                        }
+                        stored.push(built);
+                        continue;
+                    }
+                    if state_names.len() > 1 || components != 1 {
+                        return Err(FinitumError::UnsupportedRealization(
+                            "state-dependent table external inputs support one scalar active \
+                             field axis only"
+                                .into(),
+                        ));
+                    }
+                    if table.derivative_policy == scientia::TableDerivativePolicy::Unavailable {
+                        return Err(FinitumError::RealizationTangentUnavailable(format!(
+                            "property table axis {:?} has no derivative policy",
+                            state_names[0]
+                        )));
+                    }
+                    let active_name = state_names[0].clone();
+                    let axis_index = table
+                        .axes
+                        .iter()
+                        .position(|axis| axis.name == active_name)
+                        .expect("active_name was derived from table.axes");
+                    let active_input = *active_inputs
+                        .iter()
+                        .find(|candidate| {
+                            model.symbols[candidate.binding.symbol.index()].name == active_name
+                        })
+                        .expect("active_name was derived from active_inputs");
+                    let active_derivative = active_input.binding.evaluation.derivative;
+                    let identity = format!(
+                        "finitum.field-source-table/1:{}",
+                        field_source_table_digest(table)
+                    );
+                    let value_table = table.clone();
+                    let value_active_name = active_name.clone();
+                    let slope_table = table.clone();
+                    let slope_active_name = active_name.clone();
+                    dynamic.push(DynamicExternalInput::new(
+                        integral.integral_index,
+                        input.id,
+                        1,
+                        identity,
+                        move |point: &PointEvaluation| {
+                            let mut named =
+                                named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value = point
+                                .values(active_derivative)
+                                .expect("active input was declared on this integral")[0];
+                            named.insert(value_active_name.clone(), active_value);
+                            let axis_point = value_table
+                                .axes
+                                .iter()
+                                .map(|axis| named[&axis.name])
+                                .collect::<Vec<_>>();
+                            vec![evaluate_table_value(&value_table, &axis_point).expect(
+                                "table axis point was validated at external_inputs_from build time",
+                            )]
+                        },
+                        move |point: &PointEvaluation, direction: &PointEvaluation| {
+                            let mut named =
+                                named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value = point
+                                .values(active_derivative)
+                                .expect("active input was declared on this integral")[0];
+                            named.insert(slope_active_name.clone(), active_value);
+                            let axis_point = slope_table
+                                .axes
+                                .iter()
+                                .map(|axis| named[&axis.name])
+                                .collect::<Vec<_>>();
+                            let slope = evaluate_table_slope(&slope_table, &axis_point, axis_index)
+                                .expect(
+                                    "table axis point was validated at external_inputs_from build time",
+                                );
+                            let active_direction = direction
+                                .values(active_derivative)
+                                .expect("active direction was declared on this integral")[0];
+                            vec![slope * active_direction]
+                        },
+                    )?);
+                }
+                FieldSource::Constant(_) | FieldSource::Nodal(_) | FieldSource::Sampled(_) => {
+                    let mut sampler_error = None;
+                    let source = source.clone();
+                    let built = ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        components,
+                        mesh,
+                        element,
+                        |_, point| match &source {
+                            FieldSource::Constant(values) => values.clone(),
+                            FieldSource::Sampled(sampler) => sampler(point),
+                            FieldSource::Nodal(_) => {
+                                sampler_error.get_or_insert(FinitumError::UnsupportedRealization(
+                                    "a Nodal field source has no coordinate sampler; supply its \
+                                     already-projected quadrature-point values directly as an \
+                                     ExternalInput instead of through external_inputs_from"
+                                        .into(),
+                                ));
+                                vec![f64::NAN; components]
+                            }
+                            FieldSource::Table(_) | FieldSource::Kernel { .. } => {
+                                unreachable!("handled by their own match arms above")
+                            }
+                        },
+                    )?;
+                    if let Some(error) = sampler_error {
+                        return Err(error);
+                    }
+                    stored.push(built);
+                }
+            }
+        }
+    }
+    Ok((stored, dynamic))
+}
+
+fn field_source_table_digest(table: &scientia::PropertyTable) -> Digest {
+    FieldSource::Table(table.clone()).identity()
 }
 
 /// Stored per-quadrature-point direction values for one external input under
@@ -309,6 +700,12 @@ struct RealizationData {
     constraints: ConstraintSet,
     external: BTreeMap<(usize, TensorInputId), ExternalBinding>,
     bundles: BTreeMap<(usize, usize), BoundBundle>,
+    /// GX-C4: exterior facets in scope for each `SemanticMeasure::ExteriorFacet { region }`
+    /// integral, resolved by the caller through a `RegionMap`/`RegionTags` binding before
+    /// construction. Empty for a realization with no facet integrals.
+    facet_regions: BTreeMap<scientia::RegionId, Vec<FacetId>>,
+    /// Precomputed geometry for every facet referenced by `facet_regions`, keyed by [`FacetId`].
+    facet_geometries: BTreeMap<FacetId, FacetGeometry>,
     /// Lazily proven, then cached, symmetry declaration of the matrix-free action. The proof
     /// assembles the action once per realization; every later `symmetry()` query is a read.
     symmetry_proof: OnceLock<OperatorSymmetry>,
@@ -486,6 +883,40 @@ impl RealizationPlan {
         external_inputs: Vec<ExternalInput>,
         dynamic_external_inputs: Vec<DynamicExternalInput>,
     ) -> Result<Self, FinitumError> {
+        Self::new_with_facets(
+            requirements,
+            factorization,
+            kernels,
+            mesh,
+            element,
+            dofs,
+            constraints,
+            external_inputs,
+            dynamic_external_inputs,
+            BTreeMap::new(),
+        )
+    }
+
+    /// GX-C4: as [`Self::new_stateful`], additionally admitting `SemanticMeasure::ExteriorFacet`
+    /// integrals. `facet_regions` maps each such integral's `region` to the concrete exterior
+    /// [`FacetId`]s it integrates over -- resolved by the caller through a `RegionMap`/
+    /// `RegionTags` binding (mirroring [`crate::essential_constraints_from`]) before calling
+    /// this constructor, since a bare [`Mesh`] carries no region tags of its own. A
+    /// `SemanticMeasure::ExteriorFacet { region }` integral whose `region` has no entry (or an
+    /// empty entry) here is refused (`FinitumError::RealizationRegionUnmapped`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_facets(
+        requirements: FormRequirements,
+        factorization: OperatorFactorization,
+        kernels: StructuredOperatorKernels,
+        mesh: Mesh,
+        element: PreparedElement,
+        dofs: DofMap,
+        constraints: ConstraintSet,
+        external_inputs: Vec<ExternalInput>,
+        dynamic_external_inputs: Vec<DynamicExternalInput>,
+        facet_regions: BTreeMap<scientia::RegionId, Vec<FacetId>>,
+    ) -> Result<Self, FinitumError> {
         validate_artifacts(&requirements, &factorization, &kernels)?;
         validate_discretization(
             &requirements,
@@ -494,6 +925,7 @@ impl RealizationPlan {
             &element,
             &dofs,
             &constraints,
+            &facet_regions,
         )?;
         let external = validate_external_inputs(
             &factorization,
@@ -501,6 +933,7 @@ impl RealizationPlan {
             &element,
             external_inputs,
             dynamic_external_inputs,
+            &facet_regions,
         )?;
         let digest = realization_digest(
             &requirements,
@@ -517,6 +950,29 @@ impl RealizationPlan {
         let geometries = (0..mesh.cells().len())
             .map(|cell| CellGeometry::new(&mesh, CellId(cell)))
             .collect::<Result<Vec<_>, _>>()?;
+        let facet_geometries = if facet_regions.is_empty() {
+            BTreeMap::new()
+        } else {
+            let facet_topology = FacetTopology::from_mesh(&mesh)?;
+            let mut referenced = BTreeSet::new();
+            for facet_ids in facet_regions.values() {
+                referenced.extend(facet_ids.iter().copied());
+            }
+            let mut geometries = BTreeMap::new();
+            for facet_id in referenced {
+                let facet = facet_topology.facets().get(facet_id.0).ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!("facet {} does not exist", facet_id.0))
+                })?;
+                if !facet.is_exterior() {
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "facet {} is not exterior; GX-C4 refuses interior facet integrals",
+                        facet_id.0
+                    )));
+                }
+                geometries.insert(facet_id, FacetGeometry::compute(&mesh, facet.minus())?);
+            }
+            geometries
+        };
         Ok(Self {
             data: Arc::new(RealizationData {
                 digest,
@@ -530,6 +986,8 @@ impl RealizationPlan {
                 constraints,
                 external,
                 bundles,
+                facet_regions,
+                facet_geometries,
                 symmetry_proof: OnceLock::new(),
             }),
         })
@@ -711,6 +1169,15 @@ impl RealizationPlan {
             &mut physical_output,
             Action::Primal,
         )?;
+        self.apply_facets(
+            time,
+            &physical_state,
+            &physical_rate,
+            None,
+            None,
+            &mut physical_output,
+            Action::Primal,
+        )?;
         output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
         for constraint in self.data.constraints.constraints() {
             output[constraint.target.0] = self
@@ -741,6 +1208,15 @@ impl RealizationPlan {
         let physical_rate_direction = self.data.constraints.expand_homogeneous(rate_direction)?;
         let mut physical_output = vec![0.0; self.dimension()];
         self.apply_cells(
+            time,
+            &physical_state,
+            &physical_rate,
+            Some(&physical_state_direction),
+            Some(&physical_rate_direction),
+            &mut physical_output,
+            Action::Jvp,
+        )?;
+        self.apply_facets(
             time,
             &physical_state,
             &physical_rate,
@@ -812,6 +1288,13 @@ impl RealizationPlan {
             .expand_homogeneous(&restricted_adjoint)?;
         let mut physical_output = vec![0.0; self.dimension()];
         self.apply_cells_transpose(
+            time,
+            &physical_state,
+            &physical_rate,
+            &physical_adjoint,
+            &mut physical_output,
+        )?;
+        self.apply_facets_transpose(
             time,
             &physical_state,
             &physical_rate,
@@ -913,6 +1396,11 @@ impl RealizationPlan {
         &self,
         lane_width: usize,
     ) -> Result<ElementAssemblyOperator, FinitumError> {
+        if !self.data.facet_regions.is_empty() {
+            return Err(FinitumError::UnsupportedRealization(
+                "element assembly does not yet cover exterior facet integrals (GX-C4)".into(),
+            ));
+        }
         let dimension = self.dimension();
         let zero = vec![0.0; dimension];
         let mut local_matrices = Vec::with_capacity(self.data.dofs.restrictions().len());
@@ -966,6 +1454,11 @@ impl RealizationPlan {
         {
             return Err(FinitumError::UnsupportedRealization(
                 "partial assembly currently requires state-independent external inputs".into(),
+            ));
+        }
+        if !self.data.facet_regions.is_empty() {
+            return Err(FinitumError::UnsupportedRealization(
+                "partial assembly does not yet cover exterior facet integrals (GX-C4)".into(),
             ));
         }
         let mut point_actions = Vec::with_capacity(self.data.dofs.restrictions().len());
@@ -1093,6 +1586,15 @@ impl RealizationPlan {
             &mut physical_output,
             Action::Jvp,
         )?;
+        self.apply_facets(
+            0.0,
+            &zero,
+            &zero,
+            Some(&homogeneous),
+            Some(&zero),
+            &mut physical_output,
+            Action::Jvp,
+        )?;
         output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
         for constraint in self.data.constraints.constraints() {
             output[constraint.target.0] = self
@@ -1108,6 +1610,7 @@ impl RealizationPlan {
         output.fill(0.0);
         let zero = vec![0.0; self.dimension()];
         self.apply_cells(0.0, state, &zero, None, None, output, Action::Primal)?;
+        self.apply_facets(0.0, state, &zero, None, None, output, Action::Primal)?;
         validate_finite("primal residual", output)
     }
 
@@ -1166,6 +1669,11 @@ impl RealizationPlan {
         sensitivity: &GeometryParameterSensitivity,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
+        if !self.data.facet_regions.is_empty() {
+            return Err(FinitumError::UnsupportedRealization(
+                "geometry sensitivity does not yet cover exterior facet integrals (GX-C4)".into(),
+            ));
+        }
         if self
             .data
             .external
@@ -1310,6 +1818,9 @@ impl RealizationPlan {
             let scale = point.weight * signed_determinant;
             let scale_direction = point.weight * determinant_direction;
             for integral in &self.data.factorization.integrals {
+                if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                    continue;
+                }
                 let (inputs, _) = self.point_inputs(
                     integral,
                     cell_index,
@@ -1522,6 +2033,9 @@ impl RealizationPlan {
         for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
             let scale = point.weight * geometry.determinant;
             for integral in &self.data.factorization.integrals {
+                if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                    continue;
+                }
                 for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
                     let bound = &self.data.bundles[&(integral.integral_index, output_index)];
                     let point_output = match action {
@@ -1572,6 +2086,339 @@ impl RealizationPlan {
             output[dof.0] += local_output[local];
         }
         Ok(())
+    }
+
+    /// GX-C4: exterior facet analog of [`Self::apply_cells`]. Every `SemanticMeasure::
+    /// ExteriorFacet { region }` integral is resolved through `self.data.facet_regions` (already
+    /// validated non-empty at construction) into concrete facets, each contributing through its
+    /// single incident cell's restriction.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_facets(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        state_direction: Option<&[f64]>,
+        rate_direction: Option<&[f64]>,
+        output: &mut [f64],
+        action: Action,
+    ) -> Result<(), FinitumError> {
+        for integral in &self.data.factorization.integrals {
+            let region = match &integral.measure {
+                SemanticMeasure::ExteriorFacet { region } => *region,
+                _ => continue,
+            };
+            let facet_ids = self
+                .data
+                .facet_regions
+                .get(&region)
+                .expect("validated non-empty by validate_discretization");
+            for (facet_position, &facet_id) in facet_ids.iter().enumerate() {
+                self.apply_facet(
+                    integral,
+                    facet_position,
+                    facet_id,
+                    time,
+                    state,
+                    state_rate,
+                    state_direction,
+                    rate_direction,
+                    output,
+                    action,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_facet(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        facet_position: usize,
+        facet_id: FacetId,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        state_direction: Option<&[f64]>,
+        rate_direction: Option<&[f64]>,
+        output: &mut [f64],
+        action: Action,
+    ) -> Result<(), FinitumError> {
+        let geometry = self
+            .data
+            .facet_geometries
+            .get(&facet_id)
+            .expect("facet geometry was precomputed at construction");
+        let restriction = &self.data.dofs.restrictions()[geometry.cell.0];
+        let local_state = restriction
+            .dofs
+            .iter()
+            .map(|dof| state[dof.0])
+            .collect::<Vec<_>>();
+        let local_rate = restriction
+            .dofs
+            .iter()
+            .map(|dof| state_rate[dof.0])
+            .collect::<Vec<_>>();
+        let local_state_direction = state_direction.map(|direction| {
+            restriction
+                .dofs
+                .iter()
+                .map(|dof| direction[dof.0])
+                .collect::<Vec<_>>()
+        });
+        let local_rate_direction = rate_direction.map(|direction| {
+            restriction
+                .dofs
+                .iter()
+                .map(|dof| direction[dof.0])
+                .collect::<Vec<_>>()
+        });
+        let basis_values = p1_trace_basis_values(&geometry.reference_centroid);
+        let scale = geometry.scale(self.data.mesh.dimension());
+        let mut local_output = vec![0.0; restriction.dofs.len()];
+        for (output_index, _qoutput) in integral.primal.outputs.iter().enumerate() {
+            let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+            let point_output = match action {
+                Action::Primal => self.execute_facet_primal(
+                    bound,
+                    integral,
+                    facet_position,
+                    geometry,
+                    &basis_values,
+                    time,
+                    &local_state,
+                    &local_rate,
+                )?,
+                Action::Jvp => self.execute_facet_jvp(
+                    bound,
+                    integral,
+                    facet_position,
+                    geometry,
+                    &basis_values,
+                    time,
+                    &local_state,
+                    &local_rate,
+                    local_state_direction.as_deref().ok_or_else(|| {
+                        FinitumError::InvalidRealization(
+                            "JVP action is missing a state direction".into(),
+                        )
+                    })?,
+                    local_rate_direction.as_deref().ok_or_else(|| {
+                        FinitumError::InvalidRealization(
+                            "JVP action is missing a rate direction".into(),
+                        )
+                    })?,
+                )?,
+            };
+            apply_trace_basis_adjoint(&basis_values, &point_output, scale, &mut local_output)?;
+        }
+        for (local, dof) in restriction.dofs.iter().enumerate() {
+            output[dof.0] += local_output[local];
+        }
+        Ok(())
+    }
+
+    /// Facet analog of [`Self::point_inputs`]: basis-sourced inputs are gathered through the
+    /// cell's trace basis at the facet centroid (`Value`/`TimeDerivative` only, enforced by
+    /// `validate_facet_evaluation`); external inputs are looked up by `facet_position` in
+    /// `self.data.facet_regions`' order.
+    #[allow(clippy::too_many_arguments)]
+    fn point_inputs_facet(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        facet_position: usize,
+        geometry: &FacetGeometry,
+        basis_values: &[f64],
+        time: f64,
+        local_state: &[f64],
+        local_rate: &[f64],
+    ) -> Result<(BTreeMap<TensorInputId, Vec<f64>>, PointEvaluation), FinitumError> {
+        let mut inputs = BTreeMap::new();
+        let mut active = Vec::new();
+        for input in &integral.primal.inputs {
+            if input.source != InputSourceRequirement::Basis {
+                continue;
+            }
+            let dofs =
+                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                    local_rate
+                } else {
+                    local_state
+                };
+            let values = evaluate_trace_basis_input(basis_values, input, dofs)?;
+            if input.role == TensorInputRole::Active {
+                active.push(PointActiveInput {
+                    input: input.id,
+                    derivative: input.binding.evaluation.derivative,
+                    values: values.clone(),
+                });
+            }
+            inputs.insert(input.id, values);
+        }
+        let evaluation = PointEvaluation {
+            time,
+            cell: geometry.cell,
+            coordinates: geometry.physical_centroid.clone(),
+            active,
+        };
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let binding = &self.data.external[&(integral.integral_index, input.id)];
+            let values = match binding {
+                ExternalBinding::Stored(stored) => {
+                    stored.facet_point_values(facet_position).to_vec()
+                }
+                ExternalBinding::Dynamic(dynamic) => (dynamic.value)(&evaluation),
+            };
+            validate_components(input, &values, "facet external input")?;
+            inputs.insert(input.id, values);
+        }
+        Ok((inputs, evaluation))
+    }
+
+    /// Facet analog of [`Self::point_directions`].
+    #[allow(clippy::too_many_arguments)]
+    fn point_directions_facet(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        geometry: &FacetGeometry,
+        basis_values: &[f64],
+        time: f64,
+        local_state_direction: &[f64],
+        local_rate_direction: &[f64],
+        evaluation: &PointEvaluation,
+    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
+        let mut directions = BTreeMap::new();
+        let mut active = Vec::new();
+        for input in &integral.primal.inputs {
+            if input.source != InputSourceRequirement::Basis {
+                continue;
+            }
+            let dofs =
+                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                    local_rate_direction
+                } else {
+                    local_state_direction
+                };
+            let values = evaluate_trace_basis_input(basis_values, input, dofs)?;
+            if input.role == TensorInputRole::Active {
+                active.push(PointActiveInput {
+                    input: input.id,
+                    derivative: input.binding.evaluation.derivative,
+                    values: values.clone(),
+                });
+            }
+            directions.insert(input.id, values);
+        }
+        let direction_evaluation = PointEvaluation {
+            time,
+            cell: geometry.cell,
+            coordinates: evaluation.coordinates.clone(),
+            active,
+        };
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let binding = &self.data.external[&(integral.integral_index, input.id)];
+            let values = match binding {
+                ExternalBinding::Stored(stored) => vec![0.0; stored.component_count],
+                ExternalBinding::Dynamic(dynamic) => {
+                    (dynamic.direction)(evaluation, &direction_evaluation)
+                }
+            };
+            validate_components(input, &values, "facet external input direction")?;
+            directions.insert(input.id, values);
+        }
+        Ok(directions)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_facet_primal(
+        &self,
+        bound: &BoundBundle,
+        integral: &IntegralOperatorFactorization,
+        facet_position: usize,
+        geometry: &FacetGeometry,
+        basis_values: &[f64],
+        time: f64,
+        local_state: &[f64],
+        local_rate: &[f64],
+    ) -> Result<Vec<f64>, FinitumError> {
+        let (inputs, _) = self.point_inputs_facet(
+            integral,
+            facet_position,
+            geometry,
+            basis_values,
+            time,
+            local_state,
+            local_rate,
+        )?;
+        let values = bound
+            .bundle
+            .primal_inputs
+            .iter()
+            .map(|binding| {
+                inputs
+                    .get(&binding.input)
+                    .cloned()
+                    .map(|values| (binding.operand, values))
+                    .ok_or_else(|| {
+                        FinitumError::InvalidRealization(format!(
+                            "bundle input {:?} is absent from integral {}",
+                            binding.input, integral.integral_index
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let buffers = execute(
+            &bound.executable.kernels()[bound.bundle.primal_kernel_index],
+            &values,
+        )?;
+        operand_values(
+            &bound.executable.kernels()[bound.bundle.primal_kernel_index],
+            &buffers,
+            bound.bundle.primal_output,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_facet_jvp(
+        &self,
+        bound: &BoundBundle,
+        integral: &IntegralOperatorFactorization,
+        facet_position: usize,
+        geometry: &FacetGeometry,
+        basis_values: &[f64],
+        time: f64,
+        local_state: &[f64],
+        local_rate: &[f64],
+        local_state_direction: &[f64],
+        local_rate_direction: &[f64],
+    ) -> Result<Vec<f64>, FinitumError> {
+        let (inputs, evaluation) = self.point_inputs_facet(
+            integral,
+            facet_position,
+            geometry,
+            basis_values,
+            time,
+            local_state,
+            local_rate,
+        )?;
+        let directions = self.point_directions_facet(
+            integral,
+            geometry,
+            basis_values,
+            time,
+            local_state_direction,
+            local_rate_direction,
+            &evaluation,
+        )?;
+        self.execute_jvp_values(bound, &inputs, &directions)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1878,6 +2725,9 @@ impl RealizationPlan {
         for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
             let scale = point.weight * geometry.determinant;
             for integral in &self.data.factorization.integrals {
+                if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                    continue;
+                }
                 let (inputs, evaluation) = self.point_inputs(
                     integral,
                     cell_index,
@@ -1941,6 +2791,201 @@ impl RealizationPlan {
         }
         for (local, dof) in restriction.dofs.iter().enumerate() {
             output[dof.0] += local_output[local];
+        }
+        Ok(())
+    }
+
+    /// GX-C4: exterior facet analog of [`Self::apply_cells_transpose`].
+    fn apply_facets_transpose(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        for integral in &self.data.factorization.integrals {
+            let region = match &integral.measure {
+                SemanticMeasure::ExteriorFacet { region } => *region,
+                _ => continue,
+            };
+            let facet_ids = self
+                .data
+                .facet_regions
+                .get(&region)
+                .expect("validated non-empty by validate_discretization");
+            for (facet_position, &facet_id) in facet_ids.iter().enumerate() {
+                self.apply_facet_transpose(
+                    integral,
+                    facet_position,
+                    facet_id,
+                    time,
+                    state,
+                    state_rate,
+                    adjoint,
+                    output,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_facet_transpose(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        facet_position: usize,
+        facet_id: FacetId,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let geometry = self
+            .data
+            .facet_geometries
+            .get(&facet_id)
+            .expect("facet geometry was precomputed at construction");
+        let restriction = &self.data.dofs.restrictions()[geometry.cell.0];
+        let local_state = restriction
+            .dofs
+            .iter()
+            .map(|dof| state[dof.0])
+            .collect::<Vec<_>>();
+        let local_rate = restriction
+            .dofs
+            .iter()
+            .map(|dof| state_rate[dof.0])
+            .collect::<Vec<_>>();
+        let local_adjoint = restriction
+            .dofs
+            .iter()
+            .map(|dof| adjoint[dof.0])
+            .collect::<Vec<_>>();
+        let basis_values = p1_trace_basis_values(&geometry.reference_centroid);
+        let scale = geometry.scale(self.data.mesh.dimension());
+        let mut local_output = vec![0.0; restriction.dofs.len()];
+        let (inputs, evaluation) = self.point_inputs_facet(
+            integral,
+            facet_position,
+            geometry,
+            &basis_values,
+            time,
+            &local_state,
+            &local_rate,
+        )?;
+        let active_inputs = active_state_inputs(integral);
+        for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+            let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+            let output_components = component_count(&qoutput.shape)?;
+            let seed = gather_trace_test_adjoint(&basis_values, output_components, &local_adjoint)?;
+            let mut cotangents = self.execute_vjp_values(bound, &inputs, seed.clone())?;
+            if !bound.bundle.parameter.independent_operands.is_empty() {
+                let parameter_cotangents =
+                    self.point_parameter_cotangents(bound, &inputs, &seed)?;
+                self.accumulate_parameter_cotangents_facet(
+                    integral,
+                    &basis_values,
+                    scale,
+                    &evaluation,
+                    &active_inputs,
+                    &parameter_cotangents,
+                    &mut cotangents,
+                    &mut local_output,
+                )?;
+            }
+            for input in &integral.primal.inputs {
+                if input.source != InputSourceRequirement::Basis
+                    || input.role != TensorInputRole::Active
+                    || input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative
+                {
+                    continue;
+                }
+                let Some(cotangent) = cotangents.get(&input.id) else {
+                    continue;
+                };
+                apply_trace_basis_adjoint(&basis_values, cotangent, scale, &mut local_output)?;
+            }
+        }
+        for (local, dof) in restriction.dofs.iter().enumerate() {
+            output[dof.0] += local_output[local];
+        }
+        Ok(())
+    }
+
+    /// Facet analog of [`Self::accumulate_parameter_cotangents`].
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_parameter_cotangents_facet(
+        &self,
+        integral: &IntegralOperatorFactorization,
+        basis_values: &[f64],
+        scale: f64,
+        evaluation: &PointEvaluation,
+        active_inputs: &[&QFunctionInput],
+        parameter_cotangents: &BTreeMap<TensorInputId, Vec<f64>>,
+        cotangents: &mut BTreeMap<TensorInputId, Vec<f64>>,
+        local_output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        for (input_id, grad) in parameter_cotangents {
+            let input = integral
+                .primal
+                .inputs
+                .iter()
+                .find(|candidate| candidate.id == *input_id)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "parameter cotangent references undeclared input {input_id:?}"
+                    ))
+                })?;
+            if input.source == InputSourceRequirement::Basis {
+                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                    continue;
+                }
+                apply_trace_basis_adjoint(basis_values, grad, scale, local_output)?;
+                continue;
+            }
+            let binding = self
+                .data
+                .external
+                .get(&(integral.integral_index, *input_id))
+                .ok_or(FinitumError::MissingExternalInput {
+                    integral: integral.integral_index,
+                    input: *input_id,
+                })?;
+            let dynamic = match binding {
+                ExternalBinding::Stored(_) => continue,
+                ExternalBinding::Dynamic(dynamic) => dynamic,
+            };
+            for probe_input in active_inputs {
+                let count = component_count(&probe_input.shape)?;
+                for component in 0..count {
+                    let probe = probe_direction_evaluation(
+                        evaluation,
+                        active_inputs,
+                        probe_input.id,
+                        component,
+                    )?;
+                    let response = (dynamic.direction)(evaluation, &probe);
+                    if response.len() != grad.len() {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "dynamic external input {input_id:?} direction returned {} \
+                             components, expected {}",
+                            response.len(),
+                            grad.len()
+                        )));
+                    }
+                    let contribution = response
+                        .iter()
+                        .zip(grad.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                    let entry = cotangents
+                        .entry(probe_input.id)
+                        .or_insert_with(|| vec![0.0; count]);
+                    entry[component] += contribution;
+                }
+            }
         }
         Ok(())
     }
@@ -2483,6 +3528,7 @@ fn validate_discretization(
     element: &PreparedElement,
     dofs: &DofMap,
     constraints: &ConstraintSet,
+    facet_regions: &BTreeMap<scientia::RegionId, Vec<FacetId>>,
 ) -> Result<(), FinitumError> {
     if mesh.dimension() != element.dimension() {
         return Err(FinitumError::InvalidRealization(format!(
@@ -2567,20 +3613,51 @@ fn validate_discretization(
         }
     }
     for integral in &factorization.integrals {
-        if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
-            return Err(FinitumError::UnsupportedRealization(
-                "FC6 realizes cell integrals; facet, interface, and point traversal is deferred"
-                    .into(),
-            ));
-        }
-        for input in &integral.primal.inputs {
-            validate_input_contract(input, mesh.dimension())?;
-        }
-        for output in &integral.primal.outputs {
-            validate_evaluation(&output.binding.evaluation.derivative, mesh.dimension())?;
-            if output.binding.evaluation.site != EvaluationSite::Cell {
+        match &integral.measure {
+            SemanticMeasure::Cell { .. } => {
+                for input in &integral.primal.inputs {
+                    validate_input_contract(input, mesh.dimension())?;
+                }
+                for output in &integral.primal.outputs {
+                    validate_evaluation(&output.binding.evaluation.derivative, mesh.dimension())?;
+                    if output.binding.evaluation.site != EvaluationSite::Cell {
+                        return Err(FinitumError::UnsupportedRealization(
+                            "FC6 realizes cell evaluation sites only".into(),
+                        ));
+                    }
+                }
+            }
+            SemanticMeasure::ExteriorFacet { region } => {
+                // GX-C4 (SV2-B2 pulled forward): bounded to mesh dimension 2/3, Value-only
+                // trace evaluation, and a caller-resolved, non-empty facet list per region.
+                reference_facet_weight(mesh.dimension())?;
+                let facets = facet_regions
+                    .get(region)
+                    .filter(|facets| !facets.is_empty());
+                if facets.is_none() {
+                    return Err(FinitumError::RealizationRegionUnmapped(format!(
+                        "{region:?}"
+                    )));
+                }
+                for input in &integral.primal.inputs {
+                    validate_facet_input_contract(input)?;
+                }
+                for output in &integral.primal.outputs {
+                    validate_facet_evaluation(&output.binding.evaluation.derivative)?;
+                    if output.binding.evaluation.site != EvaluationSite::ExteriorTrace {
+                        return Err(FinitumError::UnsupportedRealization(
+                            "GX-C4 realizes exterior facet trace evaluation sites only".into(),
+                        ));
+                    }
+                }
+            }
+            SemanticMeasure::InteriorFacet { .. }
+            | SemanticMeasure::Interface { .. }
+            | SemanticMeasure::Point { .. } => {
                 return Err(FinitumError::UnsupportedRealization(
-                    "FC6 realizes cell evaluation sites only".into(),
+                    "interior facet, interface, and point traversal is deferred; only cell and \
+                     exterior facet integrals (GX-C4) are realized"
+                        .into(),
                 ));
             }
         }
@@ -2625,12 +3702,46 @@ fn validate_evaluation(
     }
 }
 
+/// GX-C4: as [`validate_input_contract`], for an exterior facet trace input. Every basis-sourced
+/// input must be `Active`, exactly like the cell path; only `Value`/`TimeDerivative` trace
+/// evaluation is admitted (Gradient traces are refused per the bounded contract).
+fn validate_facet_input_contract(input: &QFunctionInput) -> Result<(), FinitumError> {
+    if input.binding.evaluation.site != EvaluationSite::ExteriorTrace {
+        return Err(FinitumError::UnsupportedRealization(
+            "GX-C4 realizes exterior facet trace evaluation sites only".into(),
+        ));
+    }
+    validate_facet_evaluation(&input.binding.evaluation.derivative)?;
+    if input.source == InputSourceRequirement::Basis && input.role != TensorInputRole::Active {
+        return Err(FinitumError::UnsupportedRealization(
+            "GX-C4 has one active field trace; additional basis-backed coefficients are deferred"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_facet_evaluation(derivative: &DerivativeEvaluation) -> Result<(), FinitumError> {
+    if matches!(
+        derivative,
+        DerivativeEvaluation::Value | DerivativeEvaluation::TimeDerivative
+    ) {
+        Ok(())
+    } else {
+        Err(FinitumError::UnsupportedRealization(format!(
+            "GX-C4 exterior facet integrals support Value and time-derivative trace evaluation \
+             only (Gradient traces are refused), got {derivative:?}"
+        )))
+    }
+}
+
 fn validate_external_inputs(
     factorization: &OperatorFactorization,
     mesh: &Mesh,
     element: &PreparedElement,
     external_inputs: Vec<ExternalInput>,
     dynamic_external_inputs: Vec<DynamicExternalInput>,
+    facet_regions: &BTreeMap<scientia::RegionId, Vec<FacetId>>,
 ) -> Result<BTreeMap<(usize, TensorInputId), ExternalBinding>, FinitumError> {
     let mut external = BTreeMap::new();
     for input in external_inputs {
@@ -2672,16 +3783,28 @@ fn validate_external_inputs(
             let components = component_count(&input.shape)?;
             match supplied {
                 ExternalBinding::Stored(supplied) => {
-                    let expected = mesh
-                        .cells()
-                        .len()
-                        .checked_mul(element.quadrature().len())
-                        .and_then(|count| count.checked_mul(components))
-                        .ok_or_else(|| {
-                            FinitumError::InvalidRealization(
-                                "external input storage extent overflows usize".into(),
-                            )
-                        })?;
+                    let expected = match &integral.measure {
+                        SemanticMeasure::ExteriorFacet { region } => facet_regions
+                            .get(region)
+                            .map(Vec::len)
+                            .unwrap_or(0)
+                            .checked_mul(components)
+                            .ok_or_else(|| {
+                                FinitumError::InvalidRealization(
+                                    "facet external input storage extent overflows usize".into(),
+                                )
+                            })?,
+                        _ => mesh
+                            .cells()
+                            .len()
+                            .checked_mul(element.quadrature().len())
+                            .and_then(|count| count.checked_mul(components))
+                            .ok_or_else(|| {
+                                FinitumError::InvalidRealization(
+                                    "external input storage extent overflows usize".into(),
+                                )
+                            })?,
+                    };
                     if supplied.component_count != components || supplied.values.len() != expected {
                         return Err(FinitumError::InvalidRealization(format!(
                             "external input {key:?} has {} components and {} values, expected {components} and {expected}",
@@ -3355,6 +4478,288 @@ impl CellGeometry {
     }
 }
 
+/// GX-C4: exterior facet geometry for one facet's single incident cell. Scope is bounded to mesh
+/// dimension 2 (segment facets of triangles) and 3 (triangular facets of tetrahedra), per the
+/// SV2-B2 pulled-forward contract. Quadrature is a single reference-facet centroid point,
+/// matching the same degree-1-exact convention `PreparedElement::linear_simplex` uses for cells
+/// (the boundary integrand of a P1 form is itself affine, so one point is exact).
+#[derive(Clone, Debug)]
+pub(crate) struct FacetGeometry {
+    pub(crate) cell: CellId,
+    #[allow(dead_code)]
+    pub(crate) local_facet: usize,
+    /// Physical coordinates of the facet centroid quadrature point.
+    pub(crate) physical_centroid: Vec<f64>,
+    /// The centroid in the owning cell's reference coordinates (same convention as
+    /// [`CellGeometry`]: reference vertex 0 is the origin, reference vertex `i` is the `i`-th
+    /// standard basis vector), used to evaluate the cell's own trace basis functions.
+    reference_centroid: Vec<f64>,
+    /// Physical facet measure divided by the reference facet's own measure (`1` for a segment,
+    /// `0.5` for a triangle) -- i.e. the exact analog of [`CellGeometry::determinant`] for the
+    /// facet's own affine embedding.
+    jacobian_determinant: f64,
+    /// Unit outward normal in physical coordinates.
+    #[allow(dead_code)]
+    pub(crate) normal: Vec<f64>,
+}
+
+/// Reference measure of the (mesh_dimension - 1)-simplex facet, matching
+/// `PreparedElement::linear_simplex`'s weight formula (`1/(d-1)!`).
+fn reference_facet_weight(mesh_dimension: usize) -> Result<f64, FinitumError> {
+    match mesh_dimension {
+        2 => Ok(1.0),
+        3 => Ok(0.5),
+        other => Err(FinitumError::UnsupportedRealization(format!(
+            "exterior facet integrals are supported for mesh dimension 2 or 3, got {other}"
+        ))),
+    }
+}
+
+impl FacetGeometry {
+    fn compute(mesh: &Mesh, incidence: FacetIncidence) -> Result<Self, FinitumError> {
+        let dimension = mesh.dimension();
+        reference_facet_weight(dimension)?;
+        let cell = mesh.cell(incidence.cell).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("mesh has no cell {}", incidence.cell.0))
+        })?;
+        if incidence.local_facet >= cell.vertices.len() {
+            return Err(FinitumError::InvalidRealization(
+                "facet incidence local_facet index is out of range".into(),
+            ));
+        }
+        let omitted = incidence.local_facet;
+        let retained_slots = (0..cell.vertices.len())
+            .filter(|&slot| slot != omitted)
+            .collect::<Vec<_>>();
+        let physical_vertices = retained_slots
+            .iter()
+            .map(|&slot| &mesh.vertices()[cell.vertices[slot].0])
+            .collect::<Vec<_>>();
+        let physical_centroid = mean_point(&physical_vertices, dimension);
+        let reference_vertices = retained_slots
+            .iter()
+            .map(|&slot| reference_vertex(slot, dimension))
+            .collect::<Vec<_>>();
+        let reference_centroid =
+            mean_point(&reference_vertices.iter().collect::<Vec<_>>(), dimension);
+        let origin = physical_vertices[0];
+        let tangents = physical_vertices[1..]
+            .iter()
+            .map(|vertex| {
+                (0..dimension)
+                    .map(|axis| vertex[axis] - origin[axis])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let (jacobian_determinant, mut normal) = match dimension {
+            2 => {
+                let t = &tangents[0];
+                let measure = (t[0] * t[0] + t[1] * t[1]).sqrt();
+                (measure, vec![t[1], -t[0]])
+            }
+            3 => {
+                let t1 = &tangents[0];
+                let t2 = &tangents[1];
+                let cross = [
+                    t1[1] * t2[2] - t1[2] * t2[1],
+                    t1[2] * t2[0] - t1[0] * t2[2],
+                    t1[0] * t2[1] - t1[1] * t2[0],
+                ];
+                let norm = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+                (norm, cross.to_vec())
+            }
+            _ => unreachable!("reference_facet_weight already validated the dimension"),
+        };
+        if !jacobian_determinant.is_finite() || jacobian_determinant <= 0.0 {
+            return Err(FinitumError::InvalidRealization(format!(
+                "facet {} of cell {} has a degenerate geometry",
+                incidence.local_facet, incidence.cell.0
+            )));
+        }
+        let normal_norm = normal.iter().map(|value| value * value).sum::<f64>().sqrt();
+        for value in &mut normal {
+            *value /= normal_norm;
+        }
+        let opposite = &mesh.vertices()[cell.vertices[omitted].0];
+        let to_opposite = (0..dimension)
+            .map(|axis| opposite[axis] - origin[axis])
+            .collect::<Vec<_>>();
+        let dot = normal
+            .iter()
+            .zip(&to_opposite)
+            .map(|(a, b)| a * b)
+            .sum::<f64>();
+        if dot > 0.0 {
+            for value in &mut normal {
+                *value = -*value;
+            }
+        }
+        if normal.iter().any(|value| !value.is_finite()) {
+            return Err(FinitumError::InvalidRealization(format!(
+                "facet {} of cell {} has a non-finite normal",
+                incidence.local_facet, incidence.cell.0
+            )));
+        }
+        Ok(Self {
+            cell: incidence.cell,
+            local_facet: omitted,
+            physical_centroid,
+            reference_centroid,
+            jacobian_determinant,
+            normal,
+        })
+    }
+
+    /// `PreparedElement::linear_simplex`-style scale: reference facet weight times the physical
+    /// Jacobian determinant, the exact analog of `quadrature.weight * geometry.determinant` for
+    /// the single-point facet rule.
+    fn scale(&self, mesh_dimension: usize) -> f64 {
+        reference_facet_weight(mesh_dimension).expect("validated at construction")
+            * self.jacobian_determinant
+    }
+}
+
+fn reference_vertex(slot: usize, dimension: usize) -> Vec<f64> {
+    let mut vertex = vec![0.0; dimension];
+    if slot > 0 {
+        vertex[slot - 1] = 1.0;
+    }
+    vertex
+}
+
+fn mean_point(points: &[&Vec<f64>], dimension: usize) -> Vec<f64> {
+    let mut mean = vec![0.0; dimension];
+    for point in points {
+        for axis in 0..dimension {
+            mean[axis] += point[axis];
+        }
+    }
+    for value in &mut mean {
+        *value /= points.len() as f64;
+    }
+    mean
+}
+
+/// P1 barycentric basis values at an arbitrary cell reference point (not restricted to the
+/// cell's own stored quadrature table), for facet trace evaluation: `basis[0] = 1 - sum(x)`,
+/// `basis[i] = x[i - 1]` for `i = 1..=dimension`, matching `CellGeometry`'s reference-vertex
+/// convention.
+fn p1_trace_basis_values(reference: &[f64]) -> Vec<f64> {
+    let mut values = Vec::with_capacity(reference.len() + 1);
+    values.push(1.0 - reference.iter().sum::<f64>());
+    values.extend_from_slice(reference);
+    values
+}
+
+/// Value-only analog of [`evaluate_basis_input`] at a facet trace point: gathers the local state
+/// through the cell's P1 basis evaluated at `basis_values` (already computed at the facet
+/// centroid's cell-reference coordinates). Refuses non-`Value`/`TimeDerivative` evaluations,
+/// since GX-C4's bounded scope refuses Gradient traces at `validate_discretization` time.
+pub(crate) fn evaluate_trace_basis_input(
+    basis_values: &[f64],
+    input: &QFunctionInput,
+    local_state: &[f64],
+) -> Result<Vec<f64>, FinitumError> {
+    if !matches!(
+        input.binding.evaluation.derivative,
+        DerivativeEvaluation::Value | DerivativeEvaluation::TimeDerivative
+    ) {
+        return Err(FinitumError::UnsupportedRealization(format!(
+            "exterior facet trace evaluation supports Value only, got {:?}",
+            input.binding.evaluation.derivative
+        )));
+    }
+    let components = vector_components(input)?;
+    if components == 1 {
+        let value = local_state
+            .iter()
+            .zip(basis_values)
+            .map(|(state, basis)| state * basis)
+            .sum();
+        Ok(vec![value])
+    } else {
+        let mut values = vec![0.0; components];
+        for (basis_index, basis) in basis_values.iter().enumerate() {
+            for component in 0..components {
+                values[component] += basis * local_state[basis_index * components + component];
+            }
+        }
+        Ok(values)
+    }
+}
+
+/// Value-only analog of [`apply_basis_adjoint`] for a facet trace point.
+pub(crate) fn apply_trace_basis_adjoint(
+    basis_values: &[f64],
+    point_output: &[f64],
+    scale: f64,
+    local_output: &mut [f64],
+) -> Result<(), FinitumError> {
+    let basis_count = basis_values.len();
+    let stride = if local_output.len() % basis_count == 0 {
+        local_output.len() / basis_count
+    } else {
+        return Err(FinitumError::InvalidRealization(
+            "local output length is not a multiple of the basis count".into(),
+        ));
+    };
+    if point_output.len() == 1 {
+        for (basis, output) in local_output.iter_mut().enumerate() {
+            *output += scale * basis_values[basis] * point_output[0];
+        }
+        Ok(())
+    } else if point_output.len() == stride {
+        for basis in 0..basis_count {
+            for component in 0..stride {
+                local_output[basis * stride + component] +=
+                    scale * basis_values[basis] * point_output[component];
+            }
+        }
+        Ok(())
+    } else {
+        Err(FinitumError::InvalidRealization(format!(
+            "point output with {} components does not match a facet trace Value evaluation",
+            point_output.len()
+        )))
+    }
+}
+
+/// Value-only analog of [`gather_test_adjoint`] for a facet trace point.
+pub(crate) fn gather_trace_test_adjoint(
+    basis_values: &[f64],
+    output_components: usize,
+    local_adjoint: &[f64],
+) -> Result<Vec<f64>, FinitumError> {
+    let basis_count = basis_values.len();
+    let stride = if local_adjoint.len() % basis_count == 0 {
+        local_adjoint.len() / basis_count
+    } else {
+        return Err(FinitumError::InvalidRealization(
+            "local adjoint length is not a multiple of the basis count".into(),
+        ));
+    };
+    if output_components == 1 {
+        let mut value = 0.0;
+        for (basis, coefficient) in local_adjoint.iter().enumerate().take(basis_count) {
+            value += basis_values[basis] * coefficient;
+        }
+        Ok(vec![value])
+    } else if output_components == stride {
+        let mut value = vec![0.0; stride];
+        for basis in 0..basis_count {
+            for component in 0..stride {
+                value[component] += basis_values[basis] * local_adjoint[basis * stride + component];
+            }
+        }
+        Ok(value)
+    } else {
+        Err(FinitumError::InvalidRealization(format!(
+            "adjoint output with {output_components} components does not match a facet trace \
+             Value evaluation"
+        )))
+    }
+}
+
 fn invert(matrix: &[f64], dimension: usize) -> Option<(f64, Vec<f64>)> {
     match dimension {
         1 => {
@@ -3438,5 +4843,93 @@ mod sv2_vector_probes {
             total += physical.iter().map(|v| v.abs()).sum::<f64>();
         }
         assert!(total > 1.0e-12, "basis gradients collapsed: {total}");
+    }
+}
+
+#[cfg(test)]
+mod gx_c4_facets {
+    use super::*;
+    use crate::{Cell, Mesh, VertexId};
+
+    #[test]
+    fn facet_evaluation_refuses_gradient_traces_but_admits_value_and_time_derivative() {
+        assert!(validate_facet_evaluation(&DerivativeEvaluation::Value).is_ok());
+        assert!(validate_facet_evaluation(&DerivativeEvaluation::TimeDerivative).is_ok());
+        assert!(validate_facet_evaluation(&DerivativeEvaluation::Gradient).is_err());
+        assert!(validate_facet_evaluation(&DerivativeEvaluation::SymmetricGradient).is_err());
+    }
+
+    #[test]
+    fn reference_facet_weight_admits_only_dimension_two_and_three() {
+        assert_eq!(reference_facet_weight(2).unwrap(), 1.0);
+        assert_eq!(reference_facet_weight(3).unwrap(), 0.5);
+        assert!(reference_facet_weight(1).is_err());
+        assert!(reference_facet_weight(4).is_err());
+    }
+
+    /// Unit right triangle (0,0)-(1,0)-(0,1): the facet opposite vertex 0 (the hypotenuse,
+    /// local_facet = 0) has physical length `sqrt(2)`, centroid `(0.5, 0.5)`, and outward normal
+    /// `(1/sqrt(2), 1/sqrt(2))` (pointing away from the origin).
+    #[test]
+    fn facet_geometry_matches_hand_computation_on_a_unit_right_triangle() {
+        let mesh = Mesh::new(
+            2,
+            vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![Cell {
+                vertices: vec![VertexId(0), VertexId(1), VertexId(2)],
+            }],
+        )
+        .unwrap();
+        let incidence = FacetIncidence {
+            cell: CellId(0),
+            local_facet: 0,
+            orientation: 1,
+        };
+        let geometry = FacetGeometry::compute(&mesh, incidence).unwrap();
+        assert!((geometry.physical_centroid[0] - 0.5).abs() <= 1.0e-12);
+        assert!((geometry.physical_centroid[1] - 0.5).abs() <= 1.0e-12);
+        let expected_length = std::f64::consts::SQRT_2;
+        assert!((geometry.jacobian_determinant - expected_length).abs() <= 1.0e-12);
+        let expected_normal = 1.0 / std::f64::consts::SQRT_2;
+        assert!((geometry.normal[0] - expected_normal).abs() <= 1.0e-12);
+        assert!((geometry.normal[1] - expected_normal).abs() <= 1.0e-12);
+        // scale() for a dim-2 mesh is reference weight 1.0 times the Jacobian determinant.
+        assert!((geometry.scale(2) - expected_length).abs() <= 1.0e-12);
+    }
+
+    /// The facet opposite vertex 1 (the segment from (0,0) to (0,1), local_facet = 1) has
+    /// outward normal `(-1, 0)` and length `1`.
+    #[test]
+    fn facet_geometry_normal_points_away_from_the_opposite_vertex() {
+        let mesh = Mesh::new(
+            2,
+            vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![Cell {
+                vertices: vec![VertexId(0), VertexId(1), VertexId(2)],
+            }],
+        )
+        .unwrap();
+        let incidence = FacetIncidence {
+            cell: CellId(0),
+            local_facet: 1,
+            orientation: 1,
+        };
+        let geometry = FacetGeometry::compute(&mesh, incidence).unwrap();
+        assert!((geometry.jacobian_determinant - 1.0).abs() <= 1.0e-12);
+        assert!((geometry.normal[0] - (-1.0)).abs() <= 1.0e-12);
+        assert!(geometry.normal[1].abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn p1_trace_basis_values_vanish_at_the_omitted_vertex_reference() {
+        // Facet opposite vertex 0: cell reference centroid of vertices 1 and 2 is (0.5, 0.5).
+        let values = p1_trace_basis_values(&[0.5, 0.5]);
+        assert_eq!(values.len(), 3);
+        assert!(
+            values[0].abs() <= 1.0e-12,
+            "basis 0 should vanish: {values:?}"
+        );
+        assert!((values[1] - 0.5).abs() <= 1.0e-12);
+        assert!((values[2] - 0.5).abs() <= 1.0e-12);
     }
 }

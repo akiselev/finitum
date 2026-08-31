@@ -102,4 +102,6 @@ pub enum FinitumError {
         right: String,
         vertex: usize,
     },
+    #[error("REALIZATION_TANGENT_UNAVAILABLE: {0}")]
+    RealizationTangentUnavailable(String),
 }
