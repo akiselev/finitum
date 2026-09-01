@@ -7,7 +7,8 @@ use crate::mixed::{
 use crate::profile::{RegionMap, TaggedMesh};
 use crate::realization::{
     BoundBundle, CellGeometry, PointActiveInput, PointEvaluation, apply_basis_adjoint,
-    bind_kernels, component_count, evaluate_basis_input, execute_jvp_values, validate_finite,
+    bind_kernels, component_count, evaluate_basis_input, execute_jvp_values, execute_primal_values,
+    validate_finite,
 };
 use crate::space::{DofMap, quadratic_simplex_dof_map, vector_nodal_dof_map};
 use crate::{
@@ -816,6 +817,54 @@ impl SystemOperator {
         self.apply_action(direction, output)
     }
 
+    /// The affine forcing contribution `apply_action`/`residual`/`jacobian_vector_product`
+    /// cannot see: those three evaluate only the generated JVP, and the JVP of a state-
+    /// independent (no active `Basis` input) primal output -- exactly the shape a bound source
+    /// term like a body-force closure has -- is always exactly zero, by construction (a
+    /// directional derivative with nothing to differentiate). This method instead executes every
+    /// block's bound PRIMAL Malleus kernel at zero active state (mirroring `RealizationPlan::
+    /// execute_primal`, sharing its kernel-execution core via the promoted `crate::realization::
+    /// execute_primal_values` rather than duplicating it), scattering the result per-field
+    /// through [`Self::layout`] exactly as [`Self::apply_action`] does, then negates it so that,
+    /// for a globally linear system, `apply_action(u) == load_vector()` is the correct
+    /// zero-Dirichlet weak-form equation (the same sign convention `RealizationPlan::
+    /// load_vector` reaches for the single-field case: `PRIMAL(0) = a(0, v) - L(v) = -L(v)`
+    /// since `a` is bilinear, so `-PRIMAL(0) = L(v)`, the positive forcing functional).
+    ///
+    /// Each block's contribution is scaled by its own `equation_sign` exactly as
+    /// [`Self::apply_action`] scales its own per-block contribution, so a flipped equation's row
+    /// stays consistent between the operator and this load vector (a system solved as
+    /// `A * x = load_vector()` remains the same solved system after any subset of rows is
+    /// flipped by [`SystemRealizationPlan::bind_kernels`]'s `equation_sign`).
+    ///
+    /// Full [`Self::dimension`]-length, unconstrained -- this is the multi-block analogue of
+    /// `RealizationPlan::load_vector`'s own PRIMAL-kernel execution, but stops short of that
+    /// method's Dirichlet-lifting composition (which needs a [`ConstraintSet`] this operator
+    /// does not itself own). See [`ReducedSystemOperator::load_vector`] for the composed,
+    /// elimination-ready right-hand side.
+    ///
+    /// A system with no bound source (every non-`Basis` input's closure returns zero, or no
+    /// block has one) produces the exact zero vector: every PRIMAL kernel evaluated at zero
+    /// active state with an all-zero-valued external/constitutive input returns zero (the
+    /// generated kernel is a pure function of its inputs), so there is nothing for the adjoint
+    /// scatter to accumulate -- matching `SystemOperator`'s documented all-zero-RHS behavior
+    /// today when no source is representable.
+    pub fn load_vector(&self) -> Result<Vec<f64>, FinitumError> {
+        let dimension = self.dimension();
+        let mut output = vec![0.0; dimension];
+        for cell in 0..self.data.plan.mesh().cells().len() {
+            let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
+            for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
+                self.apply_block_cell_load(block_index, block, cell, &geometry, &mut output)?;
+            }
+        }
+        for value in &mut output {
+            *value = -*value;
+        }
+        validate_finite("system operator load vector", &output)?;
+        Ok(output)
+    }
+
     /// Essential-constraint-eliminated action, mirroring `MixedOperator::apply_reduced_action`
     /// (reusing the same shared `crate::constraint::apply_constrained_action` transform).
     pub fn apply_reduced_action(
@@ -1017,6 +1066,87 @@ impl SystemOperator {
         }
         Ok(())
     }
+
+    /// [`Self::load_vector`]'s per-cell, per-block core: the PRIMAL analogue of
+    /// [`Self::apply_block_cell`], evaluated at zero active state for every field (no direction
+    /// to gather -- PRIMAL takes no direction argument), executed through the promoted
+    /// `execute_primal_values` rather than `execute_jvp_values`. Structurally identical to
+    /// `apply_block_cell` otherwise, including the same per-block `equation_sign` scaling.
+    fn apply_block_cell_load(
+        &self,
+        block_index: usize,
+        block: &OperatorSystemBlock,
+        cell: usize,
+        geometry: &CellGeometry,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let layout = self.layout();
+        let row_field = self.data.fields.get(&block.row).ok_or_else(|| {
+            FinitumError::ArtifactMismatch(format!(
+                "equation `{}` row field {} was not realized",
+                block.equation, block.row
+            ))
+        })?;
+        let row_block = layout
+            .block(block.row)
+            .expect("row field implies a layout block");
+        let row_restriction = &row_field.dofs.restrictions()[cell];
+        let mut local_output = vec![0.0; row_restriction.dofs.len()];
+
+        let mut local_zero = BTreeMap::new();
+        for (&symbol, field) in &self.data.fields {
+            let restriction = &field.dofs.restrictions()[cell];
+            local_zero.insert(symbol, vec![0.0; restriction.dofs.len()]);
+        }
+
+        let bindings = &self.data.bindings[&block_index];
+        for integral in &block.factorization.integrals {
+            for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                let bound = bindings
+                    .get(&(integral.integral_index, output_index))
+                    .ok_or_else(|| {
+                        FinitumError::ArtifactMismatch(format!(
+                            "equation `{}` integral {} output {output_index} has no bound kernel",
+                            block.equation, integral.integral_index
+                        ))
+                    })?;
+                for point in 0..row_field.element.quadrature().len() {
+                    let scale =
+                        row_field.element.quadrature()[point].weight * geometry.determinant();
+                    let (inputs, _evaluation) = point_inputs_system(
+                        &self.data.fields,
+                        integral,
+                        cell,
+                        point,
+                        geometry,
+                        &local_zero,
+                        &self.data.constitutive,
+                        block_index,
+                    )?;
+                    let point_output = execute_primal_values(bound, &inputs)?;
+                    apply_basis_adjoint(
+                        &row_field.element,
+                        geometry,
+                        point,
+                        &qoutput.binding.evaluation.derivative,
+                        &point_output,
+                        scale,
+                        &mut local_output,
+                    )?;
+                }
+            }
+        }
+        let sign = self
+            .data
+            .equation_sign
+            .get(&block_index)
+            .copied()
+            .unwrap_or(1.0);
+        for (local_index, dof) in row_restriction.dofs.iter().enumerate() {
+            output[row_block.offset + dof.0] += sign * local_output[local_index];
+        }
+        Ok(())
+    }
 }
 
 impl LinearOperator for SystemOperator {
@@ -1093,6 +1223,59 @@ impl ReducedSystemOperator {
 
     pub fn constraints(&self) -> &ConstraintSet {
         &self.constraints
+    }
+
+    /// The elimination-ready right-hand side for `self` (mission item 2): the exact multi-block
+    /// analogue of `RealizationPlan::load_vector`'s own no-argument contract (this is why
+    /// composition lives here rather than on [`SystemOperator`] -- [`SystemOperator`] does not
+    /// itself own a [`ConstraintSet`]).
+    ///
+    /// # Composition contract
+    ///
+    /// `reduced RHS = load + Dirichlet lifting`, matching `RealizationPlan::load_vector`'s
+    /// convention exactly:
+    ///
+    /// - `load = self.operator().load_vector()` -- the pure, state-independent forcing
+    ///   contribution (mission item 1), full [`SystemOperator::dimension`]-length, unconstrained.
+    /// - `lifting = self.constraints().expand(&vec![0.0; dimension])` -- the physical-space
+    ///   vector that is zero at every free coordinate and the constrained value at every
+    ///   constrained coordinate.
+    /// - Because this system is globally linear, `self.operator().apply_action(&lifting, ..)`
+    ///   computes exactly the bilinear form's action on the lifted state (`jacobian_vector_product`'s own
+    ///   doc comment: "The JVP of a linear map is the map itself"), so no separate PRIMAL
+    ///   evaluation at the lifted state is needed for this term.
+    /// - `combined[dof] = load[dof] - (A * lifting)[dof]` in full physical space, then
+    ///   `constraints().restrict_transpose(&combined)` folds it down to
+    ///   [`SystemOperator::dimension`] free/constrained coordinates.
+    /// - Every constrained row is finally overwritten with its own `AffineConstraint::offset`
+    ///   (the constrained value itself), so the returned vector is ready to use as-is on the
+    ///   right-hand side of `self.apply(..)`/`methodus::solve_minres`/`solve_cg` et al: solving
+    ///   `self * x = self.load_vector()` returns `x` with the constrained rows honoring their
+    ///   Dirichlet data automatically, exactly as `RealizationPlan`'s reduced system already
+    ///   does.
+    ///
+    /// This is a drop-in replacement for any caller that today hand-builds only the Dirichlet-
+    /// lifting half of this (i.e. calls `self.operator().apply_action` on the lifting and negates
+    /// it, without a `load` term): that caller's existing computation is exactly this method's
+    /// `combined` term with `load` fixed at all-zero, so switching to this method changes nothing
+    /// when no source is bound, and adds the previously-unrepresentable forcing contribution when
+    /// one is.
+    pub fn load_vector(&self) -> Result<Vec<f64>, FinitumError> {
+        let dimension = self.operator.dimension();
+        let load = self.operator.load_vector()?;
+        let lifting = self.constraints.expand(&vec![0.0; dimension])?;
+        let mut lifted_action = vec![0.0; dimension];
+        self.operator.apply_action(&lifting, &mut lifted_action)?;
+        let mut combined = vec![0.0; dimension];
+        for index in 0..dimension {
+            combined[index] = load[index] - lifted_action[index];
+        }
+        let mut rhs = self.constraints.restrict_transpose(&combined)?;
+        for constraint in self.constraints.constraints() {
+            rhs[constraint.target.0] = constraint.offset;
+        }
+        validate_finite("reduced system operator load vector", &rhs)?;
+        Ok(rhs)
     }
 }
 

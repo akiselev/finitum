@@ -23,7 +23,7 @@
 //! assembly (`SystemOperator::prove_symmetry`), not assumed.
 
 use finitum::{
-    BlockCoupling, BlockLayout, Cell, ConstraintSet, CouplingKind, FieldSource, FieldSpec,
+    BlockCoupling, BlockLayout, Cell, ConstraintSet, CouplingKind, DofId, FieldSource, FieldSpec,
     FinitumError, Mesh, MeshProfile, MixedOperator, MixedSpace, PointEvaluation, RegionMap,
     RegionTagId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
     SystemRealizationPlan, VertexId, essential_constraints_from_system, quadratic_simplex_dof_map,
@@ -107,12 +107,20 @@ fn taylor_hood_layout(mesh: &Mesh, velocity: SymbolId, pressure: SymbolId) -> Bl
 /// Every non-`Basis` primal input across the compiled system, resolved generically by shape (no
 /// physics-name dispatch): a 4-component (`[2,2]`) tensor input is the momentum block's
 /// `ModelDefinedConstitutive` viscous stress (`2 * mu * sym_grad(velocity)`, linear, so its
-/// value/direction share the same formula); everything else (the `ExternalValue` body-force
-/// input) is bound to an always-zero closure, since this file builds the pure bilinear operator
-/// action (no forcing term) for a MINRES demonstration against a synthetically constructed,
-/// self-consistent right-hand side -- mirroring `tests/sv2b_mixed.rs`'s own MINRES fixture,
-/// which likewise builds its right-hand side from a known solution rather than a physical load.
-fn stokes_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> {
+/// value/direction share the same formula); a 2-component input is the `ExternalValue`
+/// body-force, bound to the caller-supplied `body_force(coordinates)` closure (its JVP direction
+/// is exactly zero regardless of the closure's own spatial variation, since a closure with no
+/// dependence on the active velocity/pressure state is state-independent by construction);
+/// anything else falls back to an always-zero closure (unexercised by this corpus, kept only so
+/// an unexpected shape still resolves rather than panicking). Passing `|_| [0.0, 0.0]` reproduces
+/// this file's original "no forcing term" fixture exactly (a MINRES demonstration against a
+/// synthetically constructed, self-consistent right-hand side -- mirroring `tests/sv2b_mixed.rs`'s
+/// own MINRES fixture); a nonzero `body_force` is `SystemOperator::load_vector`'s own
+/// decisive-acceptance fixture (mission item 3/E6-sysload).
+fn stokes_constitutive(
+    system: &OperatorSystem,
+    body_force: impl Fn(&[f64]) -> [f64; 2] + Clone + Send + Sync + 'static,
+) -> Vec<SystemConstitutiveInput> {
     let mut constitutive = Vec::new();
     for block in &system.blocks {
         for integral in &block.factorization.integrals {
@@ -144,6 +152,21 @@ fn stokes_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> 
                                     .values(DerivativeEvaluation::SymmetricGradient)
                                     .expect("active symmetric-gradient direction"),
                             )
+                        },
+                    )
+                } else if components == 2 {
+                    let body_force = body_force.clone();
+                    SystemConstitutiveInput::new(
+                        equation,
+                        integral_index,
+                        input_id,
+                        components,
+                        "sv2b4-stokes/body-force",
+                        move |evaluation: &PointEvaluation| {
+                            body_force(&evaluation.coordinates).to_vec()
+                        },
+                        move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
+                            vec![0.0; components]
                         },
                     )
                 } else {
@@ -214,7 +237,7 @@ fn unsigned_stokes_operator_reports_unknown_symmetry_and_minres_refuses_it() {
     let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
     let plan =
         SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
-    let constitutive = stokes_constitutive(&compiled.system);
+    let constitutive = stokes_constitutive(&compiled.system, |_coordinates: &[f64]| [0.0, 0.0]);
     let operator = plan.bind_kernels(constitutive, BTreeMap::new()).unwrap();
 
     let structure = operator.structure();
@@ -260,7 +283,7 @@ fn signed_stokes_system_matches_mixed_operator_and_minres_converges() {
     let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
     let plan =
         SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
-    let constitutive = stokes_constitutive(&compiled.system);
+    let constitutive = stokes_constitutive(&compiled.system, |_coordinates: &[f64]| [0.0, 0.0]);
     let equation_sign = BTreeMap::from([("incompressibility".to_string(), -1.0)]);
     let operator = plan.bind_kernels(constitutive, equation_sign).unwrap();
     let dimension = operator.dimension();
@@ -526,4 +549,414 @@ fn mixed_darcy_hdiv_pairing_is_refused_typed_not_faked_as_lagrange() {
         element_message.contains("H1") || element_message.contains("L2"),
         "expected the refusal to name the admitted Lagrange families, got: {element_message}"
     );
+}
+
+/// From-scratch dense Gaussian elimination with partial pivoting for a general square system --
+/// the independent, non-shared solver mission item 3's decisive-acceptance test cross-checks
+/// `solve_minres` against. Shares no code with `methodus`' own solvers.
+#[allow(clippy::needless_range_loop)]
+fn gaussian_eliminate_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Vec<f64> {
+    let dimension = rhs.len();
+    assert_eq!(matrix.len(), dimension);
+    for column in 0..dimension {
+        let mut pivot_row = column;
+        let mut pivot_value = matrix[column][column].abs();
+        for row in (column + 1)..dimension {
+            if matrix[row][column].abs() > pivot_value {
+                pivot_row = row;
+                pivot_value = matrix[row][column].abs();
+            }
+        }
+        assert!(
+            pivot_value > 1.0e-10,
+            "dense Gaussian elimination found a singular pivot at column {column}"
+        );
+        matrix.swap(column, pivot_row);
+        rhs.swap(column, pivot_row);
+        let pivot = matrix[column][column];
+        for row in (column + 1)..dimension {
+            let factor = matrix[row][column] / pivot;
+            if factor == 0.0 {
+                continue;
+            }
+            for entry in column..dimension {
+                matrix[row][entry] -= factor * matrix[column][entry];
+            }
+            rhs[row] -= factor * rhs[column];
+        }
+    }
+    let mut solution = vec![0.0; dimension];
+    for row in (0..dimension).rev() {
+        let mut value = rhs[row];
+        for column in (row + 1)..dimension {
+            value -= matrix[row][column] * solution[column];
+        }
+        solution[row] = value / matrix[row][row];
+    }
+    solution
+}
+
+/// Mission item 1 (E6-sysload): `SystemOperator::load_vector` executes each block's bound PRIMAL
+/// Malleus kernel at zero active state, scattering the result through `BlockLayout` -- the
+/// multi-block analogue of `RealizationPlan::load_vector`'s own PRIMAL-kernel execution. Verifies
+/// both halves of its documented contract: an all-zero-bound source (today's existing "no
+/// forcing" fixture, unchanged) loads to the exact zero vector, and a nonzero constant body-force
+/// closure loads to a genuinely nonzero vector whose momentum-block entries match an independent
+/// closed-form reference -- the Lagrange partition-of-unity identity `sum_i integral(f_c * phi_i)
+/// dOmega = f_c * |domain|` (any Lagrange basis sums to `1` pointwise) -- computed here without
+/// touching any of `SystemOperator`'s own kernel-execution code.
+#[test]
+fn system_operator_load_vector_zero_source_is_zero_and_nonzero_source_matches_partition_of_unity() {
+    let compiled = compile_stokes();
+    let mesh = unit_square(2);
+    let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
+    let plan =
+        SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
+
+    let zero_constitutive =
+        stokes_constitutive(&compiled.system, |_coordinates: &[f64]| [0.0, 0.0]);
+    let zero_operator = plan
+        .bind_kernels(zero_constitutive, BTreeMap::new())
+        .unwrap();
+    let zero_load = zero_operator.load_vector().unwrap();
+    assert!(
+        zero_load.iter().all(|&value| value == 0.0),
+        "an all-zero-bound source must load to the exact zero vector"
+    );
+
+    let force = [0.3, -0.7];
+    let force_constitutive =
+        stokes_constitutive(&compiled.system, move |_coordinates: &[f64]| force);
+    let operator = plan
+        .bind_kernels(force_constitutive, BTreeMap::new())
+        .unwrap();
+    let load = operator.load_vector().unwrap();
+
+    let velocity_block = operator.layout().block(compiled.velocity).unwrap();
+    let pressure_block = operator.layout().block(compiled.pressure).unwrap();
+
+    // `incompressibility` declares no source term at all: its rows stay exactly zero regardless
+    // of the momentum block's body force.
+    assert!(
+        load[pressure_block.offset..pressure_block.offset + pressure_block.extent]
+            .iter()
+            .all(|&value| value == 0.0)
+    );
+    assert!(
+        load[velocity_block.offset..velocity_block.offset + velocity_block.extent]
+            .iter()
+            .any(|&value| value != 0.0)
+    );
+
+    let domain_area = 1.0; // the unit-square fixture
+    let node_count = velocity_block.extent / velocity_block.component_count;
+    for component in 0..velocity_block.component_count {
+        let sum: f64 = (0..node_count)
+            .map(|node| {
+                load[velocity_block.offset + node * velocity_block.component_count + component]
+            })
+            .sum();
+        let expected = force[component] * domain_area;
+        assert!(
+            (sum - expected).abs() < 1.0e-9,
+            "component {component}: partition-of-unity sum {sum} != {expected}"
+        );
+    }
+}
+
+/// Decisive acceptance for the system-load-vector capability (E6-sysload, mission items 2/3): a
+/// genuinely nonzero body-force closure bound on the real `25-stokes.res` system, through
+/// `ReducedSystemOperator::load_vector`'s composed right-hand side, drives `solve_minres` (the
+/// auto-derived pressure-mode projector) to a nontrivial solution -- cross-checked against a
+/// from-scratch dense direct solve of the independently assembled reduced system, not a
+/// manufactured `x_true` and not any code `solve_minres` itself uses.
+///
+/// The body force here is deliberately *spatially varying* (`f(x, y) = [y - 0.5, 0]`, a pure
+/// shear with `curl(f) = -1` everywhere), not merely nonzero: a *constant* body force on a fully
+/// enclosed no-slip cavity (this corpus's own boundary condition on every wall) is an exact
+/// hydrostatic balance -- `(u, p) = (0, f . x + C)` satisfies `grad(p) = f` pointwise with `u`
+/// left exactly zero -- so a constant forcing would only ever exercise `load_vector` without ever
+/// exercising a genuinely nontrivial *velocity* solution. `curl(f) != 0` rules out any pressure-
+/// only balance, forcing real flow.
+#[test]
+fn nonzero_body_force_stokes_system_solves_to_a_nontrivial_solution_matching_an_independent_dense_solve()
+ {
+    let compiled = compile_stokes();
+    let mesh = unit_square(2);
+    let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
+    let plan =
+        SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
+    let constitutive = stokes_constitutive(&compiled.system, |coordinates: &[f64]| {
+        [coordinates[1] - 0.5, 0.0]
+    });
+    let equation_sign = BTreeMap::from([("incompressibility".to_string(), -1.0)]);
+    let operator = plan.bind_kernels(constitutive, equation_sign).unwrap();
+    let dimension = operator.dimension();
+    assert_eq!(
+        operator.prove_symmetry(1.0e-9).unwrap(),
+        OperatorSymmetry::Symmetric
+    );
+
+    let momentum_requirement = compiled
+        .system
+        .blocks
+        .iter()
+        .find(|block| block.equation == "momentum")
+        .unwrap()
+        .factorization
+        .essential_constraints
+        .first()
+        .expect("momentum declares one essential-constraint requirement (the walls boundary)")
+        .clone();
+    let region_map = walls_region_map(momentum_requirement.region);
+    let constraints = essential_constraints_from_system(
+        &operator,
+        &mesh,
+        &region_map,
+        &[SystemEssentialConstraintRequirement {
+            field: compiled.velocity,
+            requirement: momentum_requirement,
+            value: FieldSource::constant(vec![0.0, 0.0]),
+        }],
+    )
+    .unwrap();
+    assert!(constraints.constraints().next().is_some());
+
+    let reduced = operator.reduced(constraints.clone()).unwrap();
+    let rhs = reduced.load_vector().unwrap();
+    assert!(
+        rhs.iter().any(|&value| value != 0.0),
+        "a nonzero body force must produce a genuinely nonzero reduced right-hand side"
+    );
+
+    let velocity_block = operator.layout().block(compiled.velocity).unwrap();
+    let pressure_block = operator.layout().block(compiled.pressure).unwrap();
+
+    // The corpus's own Dirichlet data is the homogeneous `[0, 0]` literal, so the lifting
+    // contribution to the composed right-hand side is exactly zero and `load_vector`'s
+    // composition contract reduces, here, to the restricted raw load -- verified directly against
+    // `SystemOperator::load_vector` (item 1), not merely assumed from item 2's documented
+    // contract.
+    let raw_load = operator.load_vector().unwrap();
+    let restricted_raw_load = constraints.restrict_transpose(&raw_load).unwrap();
+    for index in 0..dimension {
+        if constraints.is_constrained(DofId(index)) {
+            assert_eq!(rhs[index], 0.0);
+        } else {
+            assert!((rhs[index] - restricted_raw_load[index]).abs() < 1.0e-12);
+        }
+    }
+    // The incompressibility block declares no source: the composed right-hand side's pressure
+    // rows are exactly zero, so it is automatically orthogonal to the declared constant-pressure
+    // nullspace mode -- no manufactured `x_true` gauge choice is needed to make this system
+    // consistent.
+    assert!(
+        rhs[pressure_block.offset..pressure_block.offset + pressure_block.extent]
+            .iter()
+            .all(|&value| value == 0.0)
+    );
+
+    let candidates = operator.nullspace_candidates();
+    assert_eq!(candidates.len(), 1);
+    let mode = candidates[0].resolve(operator.layout()).unwrap();
+    assert!(
+        mode.verify_in_kernel(&reduced, 1.0e-8).unwrap(),
+        "the auto-derived constant pressure mode should verify against the reduced operator"
+    );
+    let nullspace_dot_rhs: f64 = mode
+        .vector()
+        .iter()
+        .zip(&rhs)
+        .map(|(basis, value)| basis * value)
+        .sum();
+    assert!(
+        nullspace_dot_rhs.abs() < 1.0e-10,
+        "the right-hand side must be orthogonal to the declared nullspace for a consistent solve, \
+         got dot product {nullspace_dot_rhs}"
+    );
+
+    let config = MinresConfig {
+        max_iterations: 4 * dimension,
+        absolute_tolerance: 1.0e-12,
+        relative_tolerance: 1.0e-10,
+    };
+    let report = solve_minres(
+        &reduced,
+        None,
+        Some(mode.projector() as &dyn NullspaceProjector),
+        &EvaluationContext::reproducible(),
+        &rhs,
+        &vec![0.0; dimension],
+        &config,
+    )
+    .unwrap();
+    assert!(
+        report.converged,
+        "minres did not converge on the nonzero-body-force Stokes system"
+    );
+    println!(
+        "nonzero-body-force Stokes: minres converged in {} iterations",
+        report.trace.len()
+    );
+    assert!(
+        report.solution.iter().any(|&value| value.abs() > 1.0e-6),
+        "a nonzero body force must produce a genuinely nontrivial solution, not the trivial zero"
+    );
+
+    // Independent cross-check: assemble the reduced operator by unit-column probing of
+    // `methodus::LinearOperator::apply` (not `SystemOperator::assemble`'s own CSR path) into a
+    // dense matrix, border it with the declared nullspace mode as a zero-mean-pressure gauge
+    // constraint (the same gauge `solve_minres`'s nullspace projector enforces), and solve with a
+    // from-scratch dense Gaussian elimination that shares no code with `solve_minres`.
+    let mut dense = vec![vec![0.0; dimension]; dimension];
+    let mut probe = vec![0.0; dimension];
+    for column in 0..dimension {
+        probe[column] = 1.0;
+        let mut output = vec![0.0; dimension];
+        reduced
+            .apply(&EvaluationContext::default(), &probe, &mut output)
+            .unwrap();
+        for row in 0..dimension {
+            dense[row][column] = output[row];
+        }
+        probe[column] = 0.0;
+    }
+    let bordered_dimension = dimension + 1;
+    let mut bordered = vec![vec![0.0; bordered_dimension]; bordered_dimension];
+    for row in 0..dimension {
+        bordered[row][..dimension].copy_from_slice(&dense[row]);
+        bordered[row][dimension] = mode.vector()[row];
+        bordered[dimension][row] = mode.vector()[row];
+    }
+    let mut bordered_rhs = vec![0.0; bordered_dimension];
+    bordered_rhs[..dimension].copy_from_slice(&rhs);
+    let bordered_solution = gaussian_eliminate_solve(bordered, bordered_rhs);
+    let dense_solution = &bordered_solution[..dimension];
+
+    assert_close(dense_solution, &report.solution, 1.0e-6);
+
+    let mut recovered = vec![0.0; dimension];
+    reduced
+        .apply(
+            &EvaluationContext::default(),
+            &report.solution,
+            &mut recovered,
+        )
+        .unwrap();
+    assert_close(&recovered, &rhs, 1.0e-6);
+
+    // Solution-level evidence, reported honestly rather than forced to an arbitrary bound: the
+    // incompressibility row's residual is the discrete weak divergence `integral(q * div(u))`
+    // tested against every pressure basis function. Its own right-hand side is exactly zero and
+    // the solve enforces `reduced * solution == rhs` to `solve_minres`'s own tolerance, so this
+    // residual sits at solver-tolerance scale, not merely at discretization-truncation scale.
+    let divergence_residual_norm = recovered
+        [pressure_block.offset..pressure_block.offset + pressure_block.extent]
+        .iter()
+        .zip(&rhs[pressure_block.offset..pressure_block.offset + pressure_block.extent])
+        .map(|(actual, expected)| (actual - expected).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    println!(
+        "nonzero-body-force Stokes: velocity divergence residual norm = {divergence_residual_norm:e}"
+    );
+    assert!(
+        divergence_residual_norm < 1.0e-6,
+        "velocity divergence residual norm {divergence_residual_norm} is not small"
+    );
+
+    let pressure_mean = report.solution
+        [pressure_block.offset..pressure_block.offset + pressure_block.extent]
+        .iter()
+        .sum::<f64>()
+        / pressure_block.extent as f64;
+    println!("nonzero-body-force Stokes: pressure mean = {pressure_mean:e}");
+    assert!(
+        pressure_mean.abs() < 1.0e-6,
+        "pressure mean {pressure_mean} should be at solver-tolerance-level zero given the \
+         zero-mean-orthogonal nullspace projector"
+    );
+
+    let velocity_norm = report.solution
+        [velocity_block.offset..velocity_block.offset + velocity_block.extent]
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    println!("nonzero-body-force Stokes: velocity solution norm = {velocity_norm:e}");
+    assert!(
+        velocity_norm > 1.0e-6,
+        "the nontrivial body force must produce a nonzero velocity field"
+    );
+}
+
+/// Mission item 4 (falls out cheaply): `equation_sign` must flip a signed row's load
+/// contribution exactly as it flips that row's operator contribution, so the row's own weak-form
+/// equation (`a_i(x, v) - L_i(v) = 0`) is unchanged by the sign -- the same "solution-preserving"
+/// property `SystemRealizationPlan::bind_kernels`'s own doc comment claims for `equation_sign`,
+/// now verified with a genuinely nonzero load bound to the *flipped* row (`momentum`, which --
+/// unlike `incompressibility` -- has a real source term in this corpus). No solve is needed here:
+/// this checks the row-level residual invariance the sign transform is defined by.
+#[test]
+fn equation_sign_flips_the_load_vectors_row_consistently_with_the_operator() {
+    let compiled = compile_stokes();
+    let mesh = unit_square(2);
+    let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
+    let plan =
+        SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
+    let constitutive_unsigned = stokes_constitutive(&compiled.system, |coordinates: &[f64]| {
+        [coordinates[1] - 0.5, 0.0]
+    });
+    let constitutive_signed = stokes_constitutive(&compiled.system, |coordinates: &[f64]| {
+        [coordinates[1] - 0.5, 0.0]
+    });
+
+    let unsigned = plan
+        .bind_kernels(constitutive_unsigned, BTreeMap::new())
+        .unwrap();
+    let signed = plan
+        .bind_kernels(
+            constitutive_signed,
+            BTreeMap::from([("momentum".to_string(), -1.0)]),
+        )
+        .unwrap();
+    let dimension = unsigned.dimension();
+    assert_eq!(signed.dimension(), dimension);
+
+    let unsigned_load = unsigned.load_vector().unwrap();
+    let signed_load = signed.load_vector().unwrap();
+
+    let probe = pseudo_random_vector(dimension, 777);
+    let mut unsigned_action = vec![0.0; dimension];
+    unsigned.apply_action(&probe, &mut unsigned_action).unwrap();
+    let mut signed_action = vec![0.0; dimension];
+    signed.apply_action(&probe, &mut signed_action).unwrap();
+
+    let velocity_block = unsigned.layout().block(compiled.velocity).unwrap();
+    let pressure_block = unsigned.layout().block(compiled.pressure).unwrap();
+
+    // `momentum` (the row field is `velocity`) is flipped: both its operator action and its load
+    // flip sign together, so the row's own residual `action - load` is exactly negated -- the
+    // row's zero set (its solutions) is unchanged.
+    for index in velocity_block.offset..velocity_block.offset + velocity_block.extent {
+        let unsigned_residual = unsigned_action[index] - unsigned_load[index];
+        let signed_residual = signed_action[index] - signed_load[index];
+        assert!(
+            (signed_residual + unsigned_residual).abs() < 1.0e-9,
+            "momentum row {index}: signed residual {signed_residual} is not the exact negation \
+             of the unsigned residual {unsigned_residual}"
+        );
+        assert!(
+            (signed_load[index] + unsigned_load[index]).abs() < 1.0e-9,
+            "momentum row {index}: signed load {} is not the exact negation of the unsigned \
+             load {}",
+            signed_load[index],
+            unsigned_load[index]
+        );
+    }
+    // `incompressibility` (row field `pressure`) is unsigned in this variant: unaffected, exactly.
+    for index in pressure_block.offset..pressure_block.offset + pressure_block.extent {
+        assert_eq!(signed_load[index], unsigned_load[index]);
+        assert_eq!(signed_action[index], unsigned_action[index]);
+    }
 }

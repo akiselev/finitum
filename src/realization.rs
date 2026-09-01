@@ -2442,32 +2442,7 @@ impl RealizationPlan {
             local_state,
             local_rate,
         )?;
-        let values = bound
-            .bundle
-            .primal_inputs
-            .iter()
-            .map(|binding| {
-                inputs
-                    .get(&binding.input)
-                    .cloned()
-                    .map(|values| (binding.operand, values))
-                    .ok_or_else(|| {
-                        FinitumError::InvalidRealization(format!(
-                            "bundle input {:?} is absent from integral {}",
-                            binding.input, integral.integral_index
-                        ))
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let buffers = execute(
-            &bound.executable.kernels()[bound.bundle.primal_kernel_index],
-            &values,
-        )?;
-        operand_values(
-            &bound.executable.kernels()[bound.bundle.primal_kernel_index],
-            &buffers,
-            bound.bundle.primal_output,
-        )
+        execute_primal_values(bound, &inputs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4400,6 +4375,43 @@ pub(crate) fn execute_jvp_values(
         *value += parameter;
     }
     Ok(output)
+}
+
+/// Execute one bound bundle's PRIMAL kernel against already-gathered point `inputs`, returning
+/// its declared primal output -- the shared kernel-execution core [`RealizationPlan::
+/// execute_primal`] and [`crate::system::SystemOperator::load_vector`] both drive, promoted here
+/// (mirroring [`execute_jvp_values`]'s own promotion) so the single-field and system realization
+/// paths share one PRIMAL-kernel-execution implementation rather than each repeating it.
+pub(crate) fn execute_primal_values(
+    bound: &BoundBundle,
+    inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+) -> Result<Vec<f64>, FinitumError> {
+    let values = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| {
+            inputs
+                .get(&binding.input)
+                .cloned()
+                .map(|values| (binding.operand, values))
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "bundle input {:?} is absent from the gathered point inputs",
+                        binding.input
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let buffers = execute(
+        &bound.executable.kernels()[bound.bundle.primal_kernel_index],
+        &values,
+    )?;
+    operand_values(
+        &bound.executable.kernels()[bound.bundle.primal_kernel_index],
+        &buffers,
+        bound.bundle.primal_output,
+    )
 }
 
 pub(crate) fn execute(
