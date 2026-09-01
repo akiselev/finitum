@@ -2,8 +2,9 @@
 
 Updated: 2026-09-01
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
-SV2-B1 P2 elements/mixed product layouts + SV2-B4 (block operator composition, essential-
-constraint elimination, and content-addressed identity)
+SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
+(Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and
+H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpus systems solve)
 
 ## Implemented
 
@@ -139,6 +140,30 @@ constraint elimination, and content-addressed identity)
   identity over space and couplings (mirroring `RealizationPlan::digest()`), and a P2 vector
   test / P2 *scalar* trial `DivergenceValue` coupling (SV2-B1's deferred order-generic exercise)
   is now covered against an independently-derived reference.
+
+- E6 executable system realization (`739e2aa`): `SystemRealizationPlan::bind_kernels` →
+  `SystemOperator`/`ReducedSystemOperator` — real per-`(row, column)` Malleus kernel binding and a
+  monolithic multi-block matrix-free action over `BlockLayout` (single-field kernel-execution code
+  shared, not duplicated); region-tag multi-field Dirichlet constraints with P2 edge-node
+  resolution; Scientia `OperatorStructure` (C5.4) threaded into declared symmetry/properties with
+  a realized-coordinate cross-check and auto-derived nullspace candidates; typed `equation_sign`
+  (±1, solution-preserving) with assembly-based `SystemOperator::prove_symmetry`; the real
+  `25-stokes.res` system agrees entrywise (5e-11) with the independently hand-composed
+  `mixed::MixedOperator` and solves under MINRES with the auto-derived pressure projector.
+- E6 system load vector (`5da4744`): `SystemOperator::load_vector` (primal kernels at zero active
+  state; zero source → exact zero; constant source verified against the Lagrange
+  partition-of-unity closed form) and `ReducedSystemOperator::load_vector` (the elimination
+  composition) — nontrivial forced solves reachable, cross-checked against an independent dense
+  Gaussian-elimination solve.
+- E6 H(div)/RT0 + P0 compatible realization (`1af8946`): `rt0_reference_basis` (omitted-vertex
+  facet convention shared with `CompatibleDofMaps::hdiv`), `cell_constant_dof_map`,
+  `FieldKind::{Lagrange, Hdiv0}` dispatch with per-cell signed contravariant Piola pullback
+  (gather/scatter proven exact algebraic transposes by a dot-product identity test), and
+  `bind_kernels_with_facets` executing RT0's closed-form exterior-facet normal trace — the real
+  `13-mixed-darcy.res` RT0-P0 system solves (MINRES, 79 iterations, 1e-6 against an independent
+  dense reference). Load-bearing finding: the corpus's data-independent impermeable boundary term
+  makes the discrete system genuinely full rank, so the structural constant-pressure nullspace
+  candidate correctly does not verify against the realized operator.
 
 ## Boundary
 
@@ -321,17 +346,13 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    GX-CONTRACTS C11.15 after it blocked 04-fick-diffusion's Neumann form);
 3. P2 facet traces (the trace basis is hardcoded P1) and a
    degree-4-exact tetrahedron quadrature rule for honest 3-D P2 claims;
-4. wiring mixed/multi-order product layouts into the Scientia-form/
-   Malleus-kernel realization path (`SystemRealizationPlan` is still
-   planning-only) as the SV2-B7 Stokes acceptance case demands it -- the SV2-B4
-   batch report carries a precise inventory of what this needs (per-block
-   `DofMap` construction beyond P1/P2 Lagrange, `bind_kernels`-equivalent
-   per-`(row, column)` executables, a monolithic multi-block apply/scatter,
-   region-tag-driven multi-field essential constraints, facet region/geometry
-   binding, external inputs per block, a content-addressed
-   `SystemRealizationPlan::digest()`, and threading Scientia's `OperatorStructure`
-   (C5.4) through to a realized operator's declared `OperatorProperties` so
-   Sinbad's C5.3 admissibility table can route a saddle-point case to MINRES);
+4. Done (E6: `739e2aa`, `5da4744`, `1af8946`): the executable Scientia-form-driven system
+   realization — `SystemOperator` with per-block bound kernels, load vector, equation-sign
+   symmetry proof, `OperatorStructure` threading, and H(div)/RT0 + P0 compatible realization;
+   the real Stokes and mixed-Darcy corpus systems both solve. Remaining in this area:
+   per-block stored/regional external inputs (only the closure-based `SystemConstitutiveInput`
+   slice exists), a content-addressed digest over the executable system realization (the
+   shape-only `artifact_digest` remains), Hcurl realization, and interior-facet/DG measures;
 5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
    under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).
 
