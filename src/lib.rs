@@ -64,7 +64,10 @@ pub use space::{
     DofId, DofMap, ElementRestriction, quadratic_simplex_dof_map, quadratic_simplex_node_points,
     vector_nodal_dof_map,
 };
-pub use system::SystemRealizationPlan;
+pub use system::{
+    ReducedSystemOperator, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
+    SystemOperator, SystemRealizationPlan, essential_constraints_from_system,
+};
 pub use topology::{
     CompatibleDofMaps, ExactSequence, FacetId, FacetIncidence, FacetTopology, MeshFacet,
     OrientedFacetPair, OrientedRestriction, SignedIncidence,

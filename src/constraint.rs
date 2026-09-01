@@ -256,3 +256,33 @@ impl ConstraintSet {
         Ok(())
     }
 }
+
+/// Shared essential-constraint-elimination transform: identity rows on constrained degrees of
+/// freedom, zeroed columns for their contribution elsewhere, applied around one caller-supplied
+/// unconstrained `apply_action` closure.
+///
+/// This is the exact identity-row/zero-column treatment `RealizationPlan::apply_direction` uses
+/// for its own constraint set: `constraints.expand_homogeneous` zeroes a constrained column's
+/// contribution before `apply_action` runs, `constraints.restrict_transpose` drops the
+/// constrained rows, and `constraints.direction_residual` turns each into an identity row
+/// (`output[t] = input[t]`). Vectors stay the full `constraints.dof_count()` length. Factored out
+/// so every finitum realization that eliminates Dirichlet rows this way --
+/// `RealizationPlan::apply_direction`, `MixedOperator::apply_reduced_action`, and
+/// [`crate::system`]'s system-operator equivalent -- shares one implementation instead of
+/// repeating it.
+pub(crate) fn apply_constrained_action(
+    constraints: &ConstraintSet,
+    input: &[f64],
+    output: &mut [f64],
+    mut apply_action: impl FnMut(&[f64], &mut [f64]) -> Result<(), FinitumError>,
+) -> Result<(), FinitumError> {
+    let dimension = constraints.dof_count();
+    let homogeneous = constraints.expand_homogeneous(input)?;
+    let mut physical_output = vec![0.0; dimension];
+    apply_action(&homogeneous, &mut physical_output)?;
+    output.copy_from_slice(&constraints.restrict_transpose(&physical_output)?);
+    for constraint in constraints.constraints() {
+        output[constraint.target.0] = constraints.direction_residual(input, constraint.target)?;
+    }
+    Ok(())
+}

@@ -295,6 +295,70 @@ fn block_apply_agrees_with_an_independently_assembled_monolithic_reference() {
     assert_eq!(block_layout.dimension(), dimension);
 }
 
+/// SV2-B4: `CouplingKind::SymmetricGradientGradient` agrees entrywise with a genuinely
+/// independent reference (its own nested-loop contraction, not the closed form
+/// `local_symmetric_gradient_gradient` shares no code with) -- and, on the same probe vectors,
+/// disagrees with plain `GradientGradient` at the same scale, confirming the two coupling kinds
+/// realize different bilinear forms exactly as `CouplingKind::SymmetricGradientGradient`'s own
+/// doc comment argues (the sym_grad:sym_grad viscosity term real Stokes momentum equations use is
+/// not a rescaling of grad:grad).
+#[test]
+fn symmetric_gradient_gradient_coupling_agrees_with_independent_reference_and_differs_from_plain_gradient_gradient()
+ {
+    let space = fixture_space(2);
+    let couplings = vec![BlockCoupling {
+        test: FIELD_A,
+        trial: FIELD_A,
+        kind: CouplingKind::SymmetricGradientGradient,
+        scale: 2.0,
+    }];
+    let reference =
+        independent_reference_matrix(&space, &couplings, &independent_triangle_quadrature());
+    let operator = MixedOperator::new(space, couplings).unwrap();
+    let dimension = operator.dimension();
+
+    for seed in 0..5u64 {
+        let input = pseudo_random_vector(dimension, seed);
+        let mut actual = vec![0.0; dimension];
+        operator.apply_action(&input, &mut actual).unwrap();
+        let expected = dense_matvec(&reference, dimension, &input);
+        assert_close(&actual, &expected, 5.0e-11);
+    }
+    assert_eq!(operator.symmetry(), methodus::OperatorSymmetry::Symmetric);
+
+    let plain_gradient_space = fixture_space(2);
+    let plain_gradient_operator = MixedOperator::new(
+        plain_gradient_space,
+        vec![BlockCoupling {
+            test: FIELD_A,
+            trial: FIELD_A,
+            kind: CouplingKind::GradientGradient,
+            scale: 2.0,
+        }],
+    )
+    .unwrap();
+    let probe = pseudo_random_vector(dimension, 41);
+    let mut symmetric_gradient_output = vec![0.0; dimension];
+    operator
+        .apply_action(&probe, &mut symmetric_gradient_output)
+        .unwrap();
+    let mut plain_gradient_output = vec![0.0; dimension];
+    plain_gradient_operator
+        .apply_action(&probe, &mut plain_gradient_output)
+        .unwrap();
+    let max_difference = symmetric_gradient_output
+        .iter()
+        .zip(&plain_gradient_output)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        max_difference > 1.0e-6,
+        "SymmetricGradientGradient and GradientGradient at the same scale should realize \
+         different bilinear forms on a generic probe vector, but differed by only \
+         {max_difference:e}"
+    );
+}
+
 /// SV2-B1: the pressure-nullspace representation, resolved against this fixture's `field_b`
 /// block, matches the mathematically expected structure -- exactly zero on `field_b` rows and
 /// on every interior `field_a` dof, and genuinely nonzero on at least one boundary `field_a`
@@ -866,6 +930,44 @@ fn independent_reference_matrix(
                                         + restriction.dofs[j * field.components + component].0;
                                     matrix[row * dimension + column] +=
                                         coupling.scale * scale * dot;
+                                }
+                            }
+                        }
+                    }
+                }
+                CouplingKind::SymmetricGradientGradient => {
+                    let field = space.field(coupling.test).unwrap();
+                    let block = space.layout().block(coupling.test).unwrap();
+                    let restriction = &space.dof_map(coupling.test).unwrap().restrictions()[cell];
+                    let basis_count = restriction.dofs.len() / field.components;
+                    for &(x, y, weight) in quadrature {
+                        let (_, gradients) =
+                            simplex_basis(mesh_dimension, field.order, &[x, y]).unwrap();
+                        let physical = gradients
+                            .iter()
+                            .map(|gradient| map.covariant_piola(gradient).unwrap())
+                            .collect::<Vec<_>>();
+                        let scale = weight * map.determinant();
+                        let dot = |left: &[f64], right: &[f64]| -> f64 {
+                            left.iter().zip(right).map(|(a, b)| a * b).sum()
+                        };
+                        for i in 0..basis_count {
+                            for ci in 0..field.components {
+                                for j in 0..basis_count {
+                                    for cj in 0..field.components {
+                                        let contraction = 0.5
+                                            * (if ci == cj {
+                                                dot(&physical[i], &physical[j])
+                                            } else {
+                                                0.0
+                                            } + physical[i][cj] * physical[j][ci]);
+                                        let row = block.offset
+                                            + restriction.dofs[i * field.components + ci].0;
+                                        let column = block.offset
+                                            + restriction.dofs[j * field.components + cj].0;
+                                        matrix[row * dimension + column] +=
+                                            coupling.scale * scale * contraction;
+                                    }
                                 }
                             }
                         }

@@ -682,9 +682,9 @@ pub struct GeometryParameterSensitivity {
 }
 
 #[derive(Clone, Debug)]
-struct BoundBundle {
-    bundle: StructuredPointKernelBundle,
-    executable: ExecutableModule,
+pub(crate) struct BoundBundle {
+    pub(crate) bundle: StructuredPointKernelBundle,
+    pub(crate) executable: ExecutableModule,
 }
 
 #[derive(Clone, Debug)]
@@ -1511,7 +1511,7 @@ impl RealizationPlan {
                                 }
                                 offset += count;
                             }
-                            columns.push(self.execute_jvp_values(bound, &inputs, &directions)?);
+                            columns.push(execute_jvp_values(bound, &inputs, &directions)?);
                         }
                         let output_components = columns[0].len();
                         if columns
@@ -1884,7 +1884,7 @@ impl RealizationPlan {
                         state_rate,
                     )?;
                     let point_output_direction =
-                        self.execute_jvp_values(bound, &inputs, &point_directions)?;
+                        execute_jvp_values(bound, &inputs, &point_directions)?;
                     let output_arity_ok = match qoutput.binding.evaluation.derivative {
                         DerivativeEvaluation::Value => point_output.len() == 1,
                         DerivativeEvaluation::Gradient => point_output.len() == dimension,
@@ -2418,7 +2418,7 @@ impl RealizationPlan {
             local_rate_direction,
             &evaluation,
         )?;
-        self.execute_jvp_values(bound, &inputs, &directions)
+        execute_jvp_values(bound, &inputs, &directions)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2503,68 +2503,7 @@ impl RealizationPlan {
             local_rate_direction,
             &evaluation,
         )?;
-        self.execute_jvp_values(bound, &inputs, &directions)
-    }
-
-    fn execute_jvp_values(
-        &self,
-        bound: &BoundBundle,
-        inputs: &BTreeMap<TensorInputId, Vec<f64>>,
-        directions: &BTreeMap<TensorInputId, Vec<f64>>,
-    ) -> Result<Vec<f64>, FinitumError> {
-        let input_by_operand = bound
-            .bundle
-            .primal_inputs
-            .iter()
-            .map(|binding| (binding.operand, binding.input))
-            .collect::<BTreeMap<_, _>>();
-        let mut values = BTreeMap::new();
-        for binding in &bound.bundle.primal_inputs {
-            values.insert(binding.operand, inputs[&binding.input].clone());
-        }
-        for pair in &bound.bundle.jvp.independent_operands {
-            let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
-                FinitumError::InvalidRealization(format!(
-                    "JVP operand {:?} has no QFunction input binding",
-                    pair.primal
-                ))
-            })?;
-            values.insert(pair.derivative, directions[input].clone());
-        }
-        let executable = &bound.executable.kernels()[bound.bundle.jvp.kernel_index];
-        let buffers = execute(executable, &values)?;
-        let mut output = operand_values(
-            executable,
-            &buffers,
-            bound.bundle.jvp.dependent_operands[0].derivative,
-        )?;
-
-        let mut parameter_values = bound
-            .bundle
-            .primal_inputs
-            .iter()
-            .map(|binding| (binding.operand, inputs[&binding.input].clone()))
-            .collect::<BTreeMap<_, _>>();
-        for pair in &bound.bundle.parameter.independent_operands {
-            let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
-                FinitumError::InvalidRealization(format!(
-                    "parameter-JVP operand {:?} has no QFunction input binding",
-                    pair.primal
-                ))
-            })?;
-            parameter_values.insert(pair.derivative, directions[input].clone());
-        }
-        let parameter_executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
-        let parameter_buffers = execute(parameter_executable, &parameter_values)?;
-        let parameter_output = operand_values(
-            parameter_executable,
-            &parameter_buffers,
-            bound.bundle.parameter.dependent_operands[0].derivative,
-        )?;
-        for (value, parameter) in output.iter_mut().zip(parameter_output) {
-            *value += parameter;
-        }
-        Ok(output)
+        execute_jvp_values(bound, &inputs, &directions)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3349,7 +3288,7 @@ pub struct AssembledOperator {
 /// Entrywise transpose comparison of a square CSR matrix under a relative tolerance. Missing
 /// transposed entries count as zero, so a structurally one-sided but numerically negligible
 /// entry still passes; any pair that differs beyond `tolerance * max(|a|, |b|, 1)` fails.
-fn csr_is_symmetric_within(matrix: &CsrMatrix, tolerance: f64) -> bool {
+pub(crate) fn csr_is_symmetric_within(matrix: &CsrMatrix, tolerance: f64) -> bool {
     let rows = matrix.rows();
     if rows != matrix.columns() {
         return false;
@@ -3890,7 +3829,7 @@ fn validate_components(
     validate_finite(label, values)
 }
 
-fn bind_kernels(
+pub(crate) fn bind_kernels(
     factorization: &OperatorFactorization,
     kernels: StructuredOperatorKernels,
 ) -> Result<BTreeMap<(usize, usize), BoundBundle>, FinitumError> {
@@ -4026,8 +3965,12 @@ pub(crate) fn evaluate_basis_input(
     //   output is the physical gradient vector.
     // - SymmetricGradient: vector H1(order=1) blocks; state stride equals the
     //   spatial dimension and the output is the row-major [d][d] strain.
+    // - Divergence: dimension-vector field input; state stride equals the spatial dimension and
+    //   the output is the single scalar div(u) (GX-... mixed-system divergence coupling).
     let components = match input.binding.evaluation.derivative {
-        DerivativeEvaluation::SymmetricGradient => element.dimension(),
+        DerivativeEvaluation::SymmetricGradient | DerivativeEvaluation::Divergence => {
+            element.dimension()
+        }
         DerivativeEvaluation::Gradient => 1,
         _ => vector_components(input)?,
     };
@@ -4106,6 +4049,21 @@ pub(crate) fn evaluate_basis_input(
                 }
             }
             Ok(symmetric)
+        }
+        DerivativeEvaluation::Divergence => {
+            let dimension = element.dimension();
+            let mut divergence = 0.0;
+            for basis in 0..element.basis_count() {
+                let physical = geometry.physical_gradient(
+                    element
+                        .basis_gradient(point, basis)
+                        .expect("validated element table"),
+                );
+                for axis in 0..dimension {
+                    divergence += physical[axis] * local_state[basis * components + axis];
+                }
+            }
+            Ok(vec![divergence])
         }
         _ => Err(FinitumError::UnsupportedRealization(format!(
             "unsupported basis evaluation {:?}",
@@ -4259,6 +4217,28 @@ pub(crate) fn apply_basis_adjoint(
                 }
             }
         }
+        DerivativeEvaluation::Divergence if point_output.len() == 1 => {
+            // div(v) = sum_c d(v_c)/dx_c: component c of the test basis at node `basis`
+            // contributes its physical gradient's own c-th axis, scaled by the scalar point
+            // output (GX-... mixed-system divergence coupling, the adjoint of the `Divergence`
+            // case `evaluate_basis_input` gathers).
+            for basis in 0..basis_count {
+                let gradient = geometry.physical_gradient(
+                    element
+                        .basis_gradient(point, basis)
+                        .expect("validated element table"),
+                );
+                for (component, gradient_component) in gradient.iter().enumerate().take(dimension) {
+                    let slot = basis * stride + component;
+                    if slot >= local_output.len() {
+                        return Err(FinitumError::InvalidRealization(
+                            "divergence adjoint exceeds the local output extent".into(),
+                        ));
+                    }
+                    local_output[slot] += scale * gradient_component * point_output[0];
+                }
+            }
+        }
         _ => {
             return Err(FinitumError::InvalidRealization(format!(
                 "point output with {} components does not match {derivative:?}",
@@ -4353,7 +4333,76 @@ pub(crate) fn gather_test_adjoint(
     }
 }
 
-fn execute(
+/// Execute one bound bundle's JVP (and, for a frozen-parameter contribution, its parameter-JVP)
+/// kernel at one quadrature point from already-gathered primal `inputs` and direction `values`.
+///
+/// This is the exact per-point JVP evaluation `RealizationPlan::execute_jvp`/`execute_jvp_facet`
+/// use; it is a free function (not a `RealizationPlan` method) because it touches neither
+/// `self.data.element` nor `self.data.dofs` -- `inputs`/`directions` are already resolved into
+/// [`TensorInputId`]-keyed value maps by the caller, so the same function serves any caller that
+/// can build those maps, single-field or multi-field ([`crate::system`]'s system realization
+/// reuses it directly rather than duplicating this dispatch).
+pub(crate) fn execute_jvp_values(
+    bound: &BoundBundle,
+    inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+    directions: &BTreeMap<TensorInputId, Vec<f64>>,
+) -> Result<Vec<f64>, FinitumError> {
+    let input_by_operand = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| (binding.operand, binding.input))
+        .collect::<BTreeMap<_, _>>();
+    let mut values = BTreeMap::new();
+    for binding in &bound.bundle.primal_inputs {
+        values.insert(binding.operand, inputs[&binding.input].clone());
+    }
+    for pair in &bound.bundle.jvp.independent_operands {
+        let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "JVP operand {:?} has no QFunction input binding",
+                pair.primal
+            ))
+        })?;
+        values.insert(pair.derivative, directions[input].clone());
+    }
+    let executable = &bound.executable.kernels()[bound.bundle.jvp.kernel_index];
+    let buffers = execute(executable, &values)?;
+    let mut output = operand_values(
+        executable,
+        &buffers,
+        bound.bundle.jvp.dependent_operands[0].derivative,
+    )?;
+
+    let mut parameter_values = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| (binding.operand, inputs[&binding.input].clone()))
+        .collect::<BTreeMap<_, _>>();
+    for pair in &bound.bundle.parameter.independent_operands {
+        let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "parameter-JVP operand {:?} has no QFunction input binding",
+                pair.primal
+            ))
+        })?;
+        parameter_values.insert(pair.derivative, directions[input].clone());
+    }
+    let parameter_executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+    let parameter_buffers = execute(parameter_executable, &parameter_values)?;
+    let parameter_output = operand_values(
+        parameter_executable,
+        &parameter_buffers,
+        bound.bundle.parameter.dependent_operands[0].derivative,
+    )?;
+    for (value, parameter) in output.iter_mut().zip(parameter_output) {
+        *value += parameter;
+    }
+    Ok(output)
+}
+
+pub(crate) fn execute(
     executable: &Executable,
     values: &BTreeMap<OperandId, Vec<f64>>,
 ) -> Result<Vec<Vec<f64>>, FinitumError> {
@@ -4401,7 +4450,7 @@ fn execute(
     Ok(buffers)
 }
 
-fn operand_values(
+pub(crate) fn operand_values(
     executable: &Executable,
     buffers: &[Vec<f64>],
     operand: OperandId,
@@ -4422,7 +4471,7 @@ fn operand_values(
     Ok(buffers[operand.index()][start..start + count].to_vec())
 }
 
-fn component_count(shape: &[usize]) -> Result<usize, FinitumError> {
+pub(crate) fn component_count(shape: &[usize]) -> Result<usize, FinitumError> {
     shape.iter().try_fold(1usize, |count, extent| {
         count.checked_mul(*extent).ok_or_else(|| {
             FinitumError::InvalidRealization("tensor component extent overflows usize".into())
@@ -4430,7 +4479,7 @@ fn component_count(shape: &[usize]) -> Result<usize, FinitumError> {
     })
 }
 
-fn validate_finite(operation: &str, values: &[f64]) -> Result<(), FinitumError> {
+pub(crate) fn validate_finite(operation: &str, values: &[f64]) -> Result<(), FinitumError> {
     if let Some(index) = values.iter().position(|value| !value.is_finite()) {
         Err(FinitumError::InvalidRealization(format!(
             "{operation} contains a non-finite value at index {index}"
@@ -4456,7 +4505,7 @@ pub(crate) struct CellGeometry {
 }
 
 impl CellGeometry {
-    fn new(mesh: &Mesh, cell_id: CellId) -> Result<Self, FinitumError> {
+    pub(crate) fn new(mesh: &Mesh, cell_id: CellId) -> Result<Self, FinitumError> {
         let cell = mesh.cell(cell_id).ok_or_else(|| {
             FinitumError::InvalidRealization(format!("mesh has no cell {}", cell_id.0))
         })?;
@@ -4493,7 +4542,7 @@ impl CellGeometry {
         })
     }
 
-    fn physical_point(&self, reference: &[f64]) -> Vec<f64> {
+    pub(crate) fn physical_point(&self, reference: &[f64]) -> Vec<f64> {
         (0..self.dimension)
             .map(|row| {
                 self.origin[row]
@@ -4506,7 +4555,7 @@ impl CellGeometry {
             .collect()
     }
 
-    fn physical_gradient(&self, reference: &[f64]) -> Vec<f64> {
+    pub(crate) fn physical_gradient(&self, reference: &[f64]) -> Vec<f64> {
         (0..self.dimension)
             .map(|physical_axis| {
                 (0..self.dimension)
@@ -4517,6 +4566,13 @@ impl CellGeometry {
                     .sum()
             })
             .collect()
+    }
+
+    /// Absolute Jacobian determinant of this cell's affine reference-to-physical map, i.e. the
+    /// quadrature weight scale factor `crate::system` needs for its own per-cell integration
+    /// loop (mirroring how `apply_cell` uses this field internally within this module).
+    pub(crate) fn determinant(&self) -> f64 {
+        self.determinant
     }
 }
 

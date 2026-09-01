@@ -164,6 +164,14 @@ pub enum CouplingKind {
     /// test field pairs only with component `c` of the trial field). A diagonal (self) block:
     /// `test` and `trial` must name the same field.
     GradientGradient,
+    /// `integral(sym_grad(test) : sym_grad(trial))` -- a diagonal (self) block over a
+    /// dimension-vector field, `test == trial`. Not a rescaling of [`Self::GradientGradient`]:
+    /// pointwise `2 * sym_grad(u):sym_grad(v) = grad(u):grad(v) + sum_ij d(u_i)/d(x_j) *
+    /// d(v_j)/d(x_i)`, and that second term only reduces to `div(u)*div(v)` after an
+    /// integration by parts whose boundary contribution vanishes solely for compactly
+    /// supported (or matching-Dirichlet-eliminated) `u`/`v` -- so the two coupling kinds
+    /// realize genuinely different bilinear forms on the raw (pre-elimination) action.
+    SymmetricGradientGradient,
     /// `integral(div(test_vector) * trial_scalar)`, contributed together with its exact
     /// transpose `integral(test_scalar . div(trial_vector))` into the mirrored block, so a
     /// [`MixedOperator`] built only from `DivergenceValue` and `GradientGradient` couplings is
@@ -297,6 +305,18 @@ impl MixedOperator {
                         ));
                     }
                 }
+                CouplingKind::SymmetricGradientGradient => {
+                    if coupling.test != coupling.trial
+                        || test.components != trial.components
+                        || test.components != space.mesh().dimension()
+                    {
+                        return Err(FinitumError::UnsupportedRealization(format!(
+                            "SymmetricGradientGradient requires a diagonal coupling (test == \
+                             trial) over a dimension-{}-vector field",
+                            space.mesh().dimension()
+                        )));
+                    }
+                }
                 CouplingKind::DivergenceValue => {
                     if coupling.test == coupling.trial {
                         return Err(FinitumError::UnsupportedRealization(
@@ -373,6 +393,9 @@ impl MixedOperator {
                 match coupling.kind {
                     CouplingKind::GradientGradient => {
                         self.apply_gradient_gradient(cell, coupling, input, output)?;
+                    }
+                    CouplingKind::SymmetricGradientGradient => {
+                        self.apply_symmetric_gradient_gradient(cell, coupling, input, output)?;
                     }
                     CouplingKind::DivergenceValue => {
                         self.apply_divergence_value(cell, coupling, input, output)?;
@@ -458,15 +481,9 @@ impl MixedOperator {
                 output.len()
             )));
         }
-        let homogeneous = constraints.expand_homogeneous(input)?;
-        let mut physical_output = vec![0.0; dimension];
-        self.apply_action(&homogeneous, &mut physical_output)?;
-        output.copy_from_slice(&constraints.restrict_transpose(&physical_output)?);
-        for constraint in constraints.constraints() {
-            output[constraint.target.0] =
-                constraints.direction_residual(input, constraint.target)?;
-        }
-        Ok(())
+        crate::constraint::apply_constrained_action(constraints, input, output, |input, output| {
+            self.apply_action(input, output)
+        })
     }
 
     /// Binds `constraints` (a [`ConstraintSet`] over this operator's monolithic numbering, e.g.
@@ -508,6 +525,50 @@ impl MixedOperator {
             .block(coupling.test)
             .expect("validated at construction");
         let local = local_gradient_gradient(
+            self.space.mesh(),
+            cell,
+            field.order,
+            field.components,
+            &self.quadrature,
+        )?;
+        let size = restriction.dofs.len();
+        let local_input = restriction
+            .dofs
+            .iter()
+            .map(|dof| input[block.offset + dof.0])
+            .collect::<Vec<_>>();
+        let mut local_output = vec![0.0; size];
+        for row in 0..size {
+            let mut accumulator = 0.0;
+            for column in 0..size {
+                accumulator += local[row * size + column] * local_input[column];
+            }
+            local_output[row] = coupling.scale * accumulator;
+        }
+        for (local_index, dof) in restriction.dofs.iter().enumerate() {
+            output[block.offset + dof.0] += local_output[local_index];
+        }
+        Ok(())
+    }
+
+    fn apply_symmetric_gradient_gradient(
+        &self,
+        cell: usize,
+        coupling: &BlockCoupling,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let field = self
+            .space
+            .field(coupling.test)
+            .expect("validated at construction");
+        let restriction = self.space.restriction(coupling.test, cell)?;
+        let block = self
+            .space
+            .layout()
+            .block(coupling.test)
+            .expect("validated at construction");
+        let local = local_symmetric_gradient_gradient(
             self.space.mesh(),
             cell,
             field.order,
@@ -725,7 +786,9 @@ fn mixed_operator_digest(space: &MixedSpace, couplings: &[BlockCoupling]) -> Dig
     )
 }
 
-fn solver_block_layout(layout: &BlockLayout) -> Result<methodus::BlockLayout, FinitumError> {
+pub(crate) fn solver_block_layout(
+    layout: &BlockLayout,
+) -> Result<methodus::BlockLayout, FinitumError> {
     let specifications = layout
         .blocks()
         .iter()
@@ -767,6 +830,56 @@ fn local_gradient_gradient(
                     let row = i * components + component;
                     let column = j * components + component;
                     local[row * size + column] += scale * dot;
+                }
+            }
+        }
+    }
+    Ok(local)
+}
+
+/// Local `integral(sym_grad(test) : sym_grad(trial))` matrix over one dimension-vector field's
+/// element, sharing [`local_gradient_gradient`]'s cell-quadrature-basis structure. Basis function
+/// `(node i, component ci)` is `N_i * e_ci`, whose physical symmetric gradient is `0.5 * (g_i
+/// (x) e_ci + e_ci (x) g_i)` (`g_i` the physical gradient of `N_i`, `(x)` outer product); the
+/// contraction of two such tensors reduces to the closed form used below.
+fn local_symmetric_gradient_gradient(
+    mesh: &Mesh,
+    cell: usize,
+    order: u8,
+    components: usize,
+    quadrature: &[QuadraturePoint],
+) -> Result<Vec<f64>, FinitumError> {
+    let dimension = mesh.dimension();
+    let map = AffineMap::from_cell(mesh, CellId(cell))?;
+    let basis_count = simplex_basis_count(dimension, order);
+    let size = basis_count * components;
+    let mut local = vec![0.0; size * size];
+    for point in quadrature {
+        let (_, gradients) = simplex_basis(dimension, order, &point.coordinates)?;
+        let mut physical = Vec::with_capacity(gradients.len());
+        for gradient in &gradients {
+            physical.push(map.covariant_piola(gradient)?);
+        }
+        let scale = point.weight * map.determinant();
+        let dot = |left: &[f64], right: &[f64]| -> f64 {
+            left.iter().zip(right).map(|(a, b)| a * b).sum()
+        };
+        for i in 0..basis_count {
+            for ci in 0..components {
+                for j in 0..basis_count {
+                    for cj in 0..components {
+                        // sym_grad(N_i e_ci) : sym_grad(N_j e_cj)
+                        //   = 0.5 * (delta(ci,cj) * g_i.g_j + g_i[cj] * g_j[ci])
+                        let contraction = 0.5
+                            * (if ci == cj {
+                                dot(&physical[i], &physical[j])
+                            } else {
+                                0.0
+                            } + physical[i][cj] * physical[j][ci]);
+                        let row = i * components + ci;
+                        let column = j * components + cj;
+                        local[row * size + column] += scale * contraction;
+                    }
                 }
             }
         }
