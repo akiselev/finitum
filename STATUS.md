@@ -191,7 +191,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 52 passed, 0 failed
+cargo test --locked --workspace --all-targets           # 103 passed, 0 failed (SV2-B1 head fae5675; 52 at the R3D-era transcript this block was written for)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -277,19 +277,30 @@ nonuniform sheared affine patch above remains the independent realization oracle
 
 ## Next
 
-GX-C (see `sinbad/docs/simulation-vision/GX-GENERIC-EXECUTION-PLANE.md`),
-before SV2-B Stokes:
+The GX-C program listed here previously is complete — `GX-C1/C2/C5`
+(`6e6c4a4`), `GX-C3/C4/C6` (`89eea19`), `GX-F7` executed VJPs (`0d378a0`);
+`sinbad/docs/simulation-vision/GX-CONTRACTS.md` C11.5–C11.7 is the
+authoritative record. The GX exit gate passed on 2026-08-31 (Sinbad
+`a1402f2`), and SV2-B1 with the SV2-B4 start landed at `fae5675` (P2
+elements, `mixed::MixedSpace`/`MixedOperator`, block nullspace
+representation).
 
-1. `GX-C1` `MeshProfile` (structured simplex boxes 1/2/3-D, uniform
-   refinement families, CAD-provider realizations under one trait);
-2. `GX-C2` `RegionTags` keyed by Scientia `RegionId`; constraints and
-   partitions derived from tags and discharged against `FacetTopology`;
-3. `GX-C5` provable `Symmetric` declaration, executed VJP kernels,
-   `RealizationCapability`/`RealizationReceipt` (SV2-A2);
-4. `GX-C4` exterior facet integrals (SV2-B2 pulled forward);
-5. `GX-C3`/`GX-C6` data-driven `FieldSource` inputs and Dirichlet-from-data
-   once Scientia GX-A2 property kernels exist.
+Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
 
-SV2-B production Stokes follows the GX gate; extend method topology only from
-its concrete D5 acceptance case, keeping local-kernel meaning, backend policy,
-and realization identity explicit.
+1. SV2-B4 continuation: essential-constraint/Dirichlet-elimination handling
+   for `MixedOperator` (the reason the pure-Dirichlet pressure-nullspace
+   candidate is representation-only today);
+2. exterior-facet **element assembly** — `RealizationPlan::assemble` and its
+   partial/geometry-sensitivity paths still hard-refuse facet integrals
+   (GX-C4 landed the matrix-free path only; registered as a follow-up in
+   GX-CONTRACTS C11.15 after it blocked 04-fick-diffusion's Neumann form);
+3. P2 facet traces (the trace basis is hardcoded P1) and a
+   degree-4-exact tetrahedron quadrature rule for honest 3-D P2 claims;
+4. wiring mixed/multi-order product layouts into the Scientia-form/
+   Malleus-kernel realization path (`SystemRealizationPlan` is still
+   planning-only) as the SV2-B7 Stokes acceptance case demands it;
+5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
+   under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).
+
+Extend method topology only from concrete acceptance cases, keeping
+local-kernel meaning, backend policy, and realization identity explicit.
