@@ -166,6 +166,21 @@ pub fn quadratic_simplex_node_points(mesh: &crate::Mesh) -> Vec<Vec<f64>> {
     points
 }
 
+/// One scalar DOF per mesh cell (P0/L2(order=0) piecewise-constant field).
+///
+/// Cell `c` owns exactly `DofId(c)`, matching this crate's convention (used throughout
+/// `crate::system`) that a P0 field's global vector is indexed identically to
+/// `crate::mesh::CellId`.
+pub(crate) fn cell_constant_dof_map(mesh: &crate::Mesh) -> Result<DofMap, crate::FinitumError> {
+    let dof_count = mesh.cells().len();
+    let restrictions = (0..dof_count)
+        .map(|cell| ElementRestriction {
+            dofs: vec![DofId(cell)],
+        })
+        .collect();
+    DofMap::new(dof_count, restrictions)
+}
+
 fn sorted_pair(left: usize, right: usize) -> Vec<usize> {
     if left < right {
         vec![left, right]

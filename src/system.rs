@@ -1,4 +1,6 @@
-use crate::element::{simplex_basis, simplex_basis_count, simplex_quadrature};
+use crate::element::{
+    rt0_basis_count, rt0_reference_basis, simplex_basis, simplex_basis_count, simplex_quadrature,
+};
 use crate::mesh::CellId;
 use crate::mixed::{
     BlockEssentialValue, BlockNullspaceCandidate, essential_constraints_for_blocks,
@@ -6,14 +8,17 @@ use crate::mixed::{
 };
 use crate::profile::{RegionMap, TaggedMesh};
 use crate::realization::{
-    BoundBundle, CellGeometry, PointActiveInput, PointEvaluation, apply_basis_adjoint,
-    bind_kernels, component_count, evaluate_basis_input, execute_jvp_values, execute_primal_values,
-    validate_finite,
+    BoundBundle, CellGeometry, FacetGeometry, PointActiveInput, PointEvaluation,
+    apply_basis_adjoint, bind_kernels, component_count, evaluate_basis_input, execute_jvp_values,
+    execute_primal_values, validate_finite,
 };
-use crate::space::{DofMap, quadratic_simplex_dof_map, vector_nodal_dof_map};
+use crate::space::{
+    DofMap, ElementRestriction, cell_constant_dof_map, quadratic_simplex_dof_map,
+    vector_nodal_dof_map,
+};
 use crate::{
-    BlockLayout, CompatibleDofMaps, ConstraintSet, ExactSequence, FacetTopology, FieldSource,
-    FinitumError, Mesh, PreparedElement, QuadraturePoint,
+    AffineMap, BlockLayout, CompatibleDofMaps, ConstraintSet, ExactSequence, FacetId,
+    FacetTopology, FieldSource, FinitumError, Mesh, PreparedElement, QuadraturePoint,
 };
 use methodus::{
     BlockLinearOperator, Definiteness, EvaluationContext, LinearOperator, NumericError,
@@ -21,9 +26,10 @@ use methodus::{
 };
 use scientia::scientific::ValueShape;
 use scientia::{
-    Digest, ElementFamilyRequirement, EssentialConstraintRequirement, EvaluationSite, FormSymmetry,
-    InputSourceRequirement, IntegralOperatorFactorization, NullspaceKind, OperatorStructure,
-    OperatorSystem, OperatorSystemBlock, SemanticMeasure, SymbolId, TensorInputId, TensorInputRole,
+    DerivativeEvaluation, Digest, ElementFamilyRequirement, EssentialConstraintRequirement,
+    EvaluationSite, FormSymmetry, InputSourceRequirement, IntegralOperatorFactorization,
+    NullspaceKind, OperatorStructure, OperatorSystem, OperatorSystemBlock, RegionId,
+    SemanticMeasure, SymbolId, TensorInputId, TensorInputRole, TraceMapping,
     derive_operator_structure_for_system,
 };
 use serde::Serialize;
@@ -153,11 +159,22 @@ fn validate_components(system: &OperatorSystem, layout: &BlockLayout) -> Result<
             let Some(concrete) = layout.block(space.symbol) else {
                 continue;
             };
-            let expected = match space.value_shape {
-                ValueShape::Scalar => 1,
-                ValueShape::Vector(extent) => usize::from(extent),
-                ValueShape::Tensor { rows, cols } => usize::from(rows) * usize::from(cols),
-                ValueShape::SymmetricTensor(extent) => usize::from(extent) * usize::from(extent),
+            let expected = match space.space.family {
+                // A compatible-element (Hdiv/Hcurl) space owns exactly one scalar DOF per
+                // topological entity (one facet/edge orientation flux/circulation value); the
+                // field's vector-ness lives in the Piola-mapped basis function, never in a
+                // per-component DOF split the way nodal Lagrange spaces use -- see
+                // `build_field_elements`'s Hdiv(order=0) branch.
+                scientia::scientific::SpaceFamily::HDiv
+                | scientia::scientific::SpaceFamily::HCurl => 1,
+                _ => match space.value_shape {
+                    ValueShape::Scalar => 1,
+                    ValueShape::Vector(extent) => usize::from(extent),
+                    ValueShape::Tensor { rows, cols } => usize::from(rows) * usize::from(cols),
+                    ValueShape::SymmetricTensor(extent) => {
+                        usize::from(extent) * usize::from(extent)
+                    }
+                },
             };
             if concrete.component_count != expected {
                 return Err(FinitumError::ArtifactMismatch(format!(
@@ -237,20 +254,68 @@ fn digest_plan(
 // the real bound kernels instead of hand-written local-matrix builders.
 // ---------------------------------------------------------------------------------------------
 
-/// One system field's concrete shared-quadrature Lagrange discretization.
+/// One system field's concrete discretization: either a shared-quadrature Lagrange table
+/// (H1/L2 order 1/2, and L2(order=0) piecewise-constant), or an RT0 (Hdiv(order=0))
+/// compatible-element field, which has no single reference basis table shared across cells --
+/// its physical basis is Piola-pushed per cell (see [`FieldKind::Hdiv0`]).
+#[derive(Clone, Debug)]
+enum FieldKind {
+    Lagrange(PreparedElement),
+    /// RT0 (lowest-order Raviart-Thomas): one scalar (oriented facet-flux) DOF per mesh facet,
+    /// realized through [`crate::element::rt0_reference_basis`] and
+    /// `crate::mapping::AffineMap`'s contravariant Piola map (both reused unchanged from FC8).
+    /// `orientations[cell][local_facet]` mirrors [`CompatibleDofMaps::hdiv`]'s own per-cell sign
+    /// table exactly (in fact copied from it at construction) -- needed alongside `dofs` for
+    /// every per-cell gather/scatter, since (unlike a nodal Lagrange restriction) a physical RT0
+    /// coefficient is `orientation * global_dof_value`, not the raw global value.
+    Hdiv0 {
+        orientations: Vec<Vec<i8>>,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct FieldElement {
-    element: PreparedElement,
+    kind: FieldKind,
     dofs: DofMap,
 }
 
-/// Builds one [`FieldElement`] per system field (LAGRANGE/Taylor-Hood scope only).
+/// The concrete DOF-layout component count a system field's typed requirement implies:
+/// `1` for a compatible-element (Hdiv/Hcurl) field regardless of its vector-valued
+/// `value_shape` (one scalar DOF per topological entity; the vector-ness lives in the
+/// Piola-mapped basis function -- see [`FieldKind::Hdiv0`]), otherwise the scalar/dimension-
+/// vector extent nodal Lagrange fields already use. Shared by [`validate_components`] (which
+/// runs at [`SystemRealizationPlan::new`] time, before any element is built) and
+/// [`build_field_elements`], so both apply the same rule.
+fn expected_field_components(
+    family: ElementFamilyRequirement,
+    value_shape: &ValueShape,
+    dimension: usize,
+) -> Result<usize, FinitumError> {
+    if matches!(
+        family,
+        ElementFamilyRequirement::Hdiv | ElementFamilyRequirement::Hcurl
+    ) {
+        return Ok(1);
+    }
+    match value_shape {
+        ValueShape::Scalar => Ok(1),
+        ValueShape::Vector(extent) if *extent as usize == dimension => Ok(dimension),
+        other => Err(FinitumError::UnsupportedRealization(format!(
+            "system field must be scalar or dimension-{dimension}-vector valued, got {other:?}"
+        ))),
+    }
+}
+
+/// Builds one [`FieldElement`] per system field.
 ///
-/// Every field's basis table is tabulated at the *same* shared quadrature points
+/// Every Lagrange field's basis table is tabulated at the *same* shared quadrature points
 /// (`simplex_quadrature`, mirroring `crate::mixed`'s own cross-block evaluation convention), so
 /// a quadrature-point index means the same physical point for every field -- required for
 /// [`point_inputs_system`]/[`point_directions_system`] to gather several fields' basis inputs
-/// within one integral.
+/// within one integral. An RT0 field has no such table (its physical basis is cell-specific,
+/// Piola-mapped -- see [`FieldKind::Hdiv0`]), but shares the same quadrature-point *index*
+/// convention: `point_inputs_system`/`point_directions_system` resolve `quadrature[point]`'s own
+/// reference coordinates directly rather than through a per-field table.
 ///
 /// Admits `ElementFamilyRequirement::H1` and `ElementFamilyRequirement::L2` fields of order 1 or
 /// 2, scalar or dimension-vector valued -- both realized through the *same* continuous nodal
@@ -263,14 +328,21 @@ struct FieldElement {
 /// its variational form (its weak-form usage requires no more than L2, e.g. a Taylor-Hood
 /// pressure after integration by parts removes its derivative from the momentum equation) is
 /// mathematically well realized by a strictly smoother continuous-P`k` choice, since H1 subset
-/// L2. `ElementFamilyRequirement::Hcurl`/`Hdiv`/`DiscontinuousGalerkin` are refused typed
-/// (compatible-element/DG DOF maps are the realization inventory's item 1, out of this lane's
-/// scope).
+/// L2.
+///
+/// Additionally admits `ElementFamilyRequirement::L2` order 0 (piecewise-constant P0, one DOF
+/// per cell, [`cell_constant_dof_map`]) and `ElementFamilyRequirement::Hdiv` order 0 (RT0, one
+/// oriented flux DOF per facet, reusing FC8's already-computed `compatible_dofs.hdiv` --
+/// `compatible` is `None` only when no block required a compatible element, in which case no
+/// field can legitimately reach the `Hdiv` arm below). `ElementFamilyRequirement::Hcurl`/
+/// `DiscontinuousGalerkin`, any other polynomial order, and any Hdiv order other than 0, remain
+/// refused typed.
 fn build_field_elements(
     system: &OperatorSystem,
     mesh: &Mesh,
     layout: &BlockLayout,
     quadrature: &[QuadraturePoint],
+    compatible: Option<&CompatibleDofMaps>,
 ) -> Result<BTreeMap<SymbolId, FieldElement>, FinitumError> {
     let mut fields = BTreeMap::new();
     for &symbol in &system.field_order {
@@ -298,29 +370,18 @@ fn build_field_elements(
                 "system field {symbol} has no element requirement in any block"
             ))
         })?;
-        if !matches!(
-            requirement.family,
-            ElementFamilyRequirement::H1 | ElementFamilyRequirement::L2
-        ) || !matches!(requirement.polynomial_order, 1 | 2)
-            || requirement.topological_dimension as usize != mesh.dimension()
-        {
+        if requirement.topological_dimension as usize != mesh.dimension() {
             return Err(FinitumError::UnsupportedRealization(format!(
-                "system realization admits scalar or dimension-vector Lagrange fields of order \
-                 1 or 2 (H1 or L2) in the mesh's own topological dimension only; field {symbol} \
-                 requires {requirement:?}"
+                "system field {symbol} requires topological dimension {}, mesh has dimension {}",
+                requirement.topological_dimension,
+                mesh.dimension()
             )));
         }
-        let components = match &requirement.value_shape {
-            ValueShape::Scalar => 1,
-            ValueShape::Vector(extent) if *extent as usize == mesh.dimension() => mesh.dimension(),
-            other => {
-                return Err(FinitumError::UnsupportedRealization(format!(
-                    "system field {symbol} must be scalar or dimension-{}-vector valued, got \
-                     {other:?}",
-                    mesh.dimension()
-                )));
-            }
-        };
+        let components = expected_field_components(
+            requirement.family,
+            &requirement.value_shape,
+            mesh.dimension(),
+        )?;
         let block = layout.block(symbol).ok_or_else(|| {
             FinitumError::InvalidRealization(format!(
                 "layout has no block for system field {symbol}"
@@ -333,33 +394,379 @@ fn build_field_elements(
                 block.component_count
             )));
         }
-        let order = requirement.polynomial_order;
-        let basis_count = simplex_basis_count(mesh.dimension(), order);
-        let mut basis_values = Vec::with_capacity(quadrature.len() * basis_count);
-        let mut basis_gradients =
-            Vec::with_capacity(quadrature.len() * basis_count * mesh.dimension());
-        for point in quadrature {
-            let (values, gradients) = simplex_basis(mesh.dimension(), order, &point.coordinates)?;
-            basis_values.extend(values);
-            for gradient in gradients {
-                basis_gradients.extend(gradient);
+        let field = match (requirement.family, requirement.polynomial_order) {
+            (ElementFamilyRequirement::H1 | ElementFamilyRequirement::L2, order @ (1 | 2)) => {
+                let basis_count = simplex_basis_count(mesh.dimension(), order);
+                let mut basis_values = Vec::with_capacity(quadrature.len() * basis_count);
+                let mut basis_gradients =
+                    Vec::with_capacity(quadrature.len() * basis_count * mesh.dimension());
+                for point in quadrature {
+                    let (values, gradients) =
+                        simplex_basis(mesh.dimension(), order, &point.coordinates)?;
+                    basis_values.extend(values);
+                    for gradient in gradients {
+                        basis_gradients.extend(gradient);
+                    }
+                }
+                let element = PreparedElement::new(
+                    mesh.dimension(),
+                    basis_count,
+                    quadrature.to_vec(),
+                    basis_values,
+                    basis_gradients,
+                )?;
+                let dofs = match order {
+                    1 => vector_nodal_dof_map(mesh, components)?,
+                    2 => quadratic_simplex_dof_map(mesh, components)?,
+                    _ => unreachable!("polynomial order matched above"),
+                };
+                FieldElement {
+                    kind: FieldKind::Lagrange(element),
+                    dofs,
+                }
             }
-        }
-        let element = PreparedElement::new(
-            mesh.dimension(),
-            basis_count,
-            quadrature.to_vec(),
-            basis_values,
-            basis_gradients,
-        )?;
-        let dofs = match order {
-            1 => vector_nodal_dof_map(mesh, components)?,
-            2 => quadratic_simplex_dof_map(mesh, components)?,
-            _ => unreachable!("polynomial order validated above"),
+            (ElementFamilyRequirement::L2, 0) => {
+                let dofs = cell_constant_dof_map(mesh)?;
+                let basis_values = vec![1.0; quadrature.len()];
+                let basis_gradients = vec![0.0; quadrature.len() * mesh.dimension()];
+                let element = PreparedElement::new(
+                    mesh.dimension(),
+                    1,
+                    quadrature.to_vec(),
+                    basis_values,
+                    basis_gradients,
+                )?;
+                FieldElement {
+                    kind: FieldKind::Lagrange(element),
+                    dofs,
+                }
+            }
+            (ElementFamilyRequirement::Hdiv, 0) => {
+                let compatible = compatible.ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "system field {symbol} requires Hdiv(order=0) but no compatible DOF \
+                         maps were computed by SystemRealizationPlan::new"
+                    ))
+                })?;
+                if block.entity_count != compatible.hdiv_dof_count {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "system field {symbol} has {} concrete layout entities, RT0's compatible \
+                         DOF map needs {} (one per mesh facet)",
+                        block.entity_count, compatible.hdiv_dof_count
+                    )));
+                }
+                if compatible.hdiv.len() != mesh.cells().len() {
+                    return Err(FinitumError::ArtifactMismatch(
+                        "RT0 compatible DOF map has a different cell count than the mesh".into(),
+                    ));
+                }
+                let mut dof_restrictions = Vec::with_capacity(mesh.cells().len());
+                let mut orientations = Vec::with_capacity(mesh.cells().len());
+                for restriction in &compatible.hdiv {
+                    if restriction.dofs.len() != rt0_basis_count(mesh.dimension()) {
+                        return Err(FinitumError::ArtifactMismatch(
+                            "RT0 compatible DOF map cell restriction has the wrong facet count"
+                                .into(),
+                        ));
+                    }
+                    dof_restrictions.push(ElementRestriction {
+                        dofs: restriction.dofs.clone(),
+                    });
+                    orientations.push(restriction.orientations.clone());
+                }
+                let dofs = DofMap::new(compatible.hdiv_dof_count, dof_restrictions)?;
+                FieldElement {
+                    kind: FieldKind::Hdiv0 { orientations },
+                    dofs,
+                }
+            }
+            _ => {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "system realization admits scalar or dimension-vector Lagrange fields of \
+                     order 1 or 2 (H1 or L2), piecewise-constant fields (L2(order=0)), or RT0 \
+                     fields (Hdiv(order=0)) in the mesh's own topological dimension only; field \
+                     {symbol} requires {requirement:?}"
+                )));
+            }
         };
-        fields.insert(symbol, FieldElement { element, dofs });
+        fields.insert(symbol, field);
     }
     Ok(fields)
+}
+
+// ---------------------------------------------------------------------------------------------
+// RT0 (Hdiv(order=0)) per-cell evaluation and adjoint scatter.
+//
+// Unlike a nodal Lagrange field, RT0's physical basis functions depend on the cell's own affine
+// map (contravariant Piola pushforward), so there is no single shared reference table the way
+// `crate::realization::evaluate_basis_input`/`apply_basis_adjoint` assume -- these are genuinely
+// new, RT0-specific evaluate/adjoint pairs (not a generalization of those functions), reusing
+// only `crate::element::rt0_reference_basis` (the pure reference-space math) and
+// `crate::mapping::AffineMap`'s already-landed Piola maps (FC8). Each physical coefficient is
+// `orientation[i] * local_state[i]` (the DOF map's raw stored value is unsigned; the sign lives
+// alongside it in `FieldKind::Hdiv0::orientations`, exactly [`CompatibleDofMaps::hdiv`]'s own
+// per-cell table), and both the forward evaluation and its adjoint are LINEAR in that
+// coefficient, so each adjoint below is the exact algebraic transpose of its evaluate
+// counterpart (documented per-function).
+// ---------------------------------------------------------------------------------------------
+
+/// RT0 field value at one reference point: `Piola(sum_i orientation_i * local_state_i *
+/// phi_i(reference_point))`. `local_state`/`orientations` must both have length
+/// `rt0_basis_count(affine.dimension())`.
+fn evaluate_rt0_value(
+    affine: &AffineMap,
+    orientations: &[i8],
+    reference_point: &[f64],
+    local_state: &[f64],
+) -> Result<Vec<f64>, FinitumError> {
+    let dimension = affine.dimension();
+    let (basis_values, _divergence) = rt0_reference_basis(dimension, reference_point)?;
+    if orientations.len() != basis_values.len() || local_state.len() != basis_values.len() {
+        return Err(FinitumError::InvalidRealization(format!(
+            "RT0 value evaluation needs {} oriented coefficients, got {} orientations and {} \
+             state values",
+            basis_values.len(),
+            orientations.len(),
+            local_state.len()
+        )));
+    }
+    let mut reference_value = vec![0.0; dimension];
+    for ((sign, coefficient), basis) in orientations.iter().zip(local_state).zip(&basis_values) {
+        let signed = f64::from(*sign) * coefficient;
+        for (axis, component) in basis.iter().enumerate() {
+            reference_value[axis] += signed * component;
+        }
+    }
+    affine.contravariant_piola(&reference_value)
+}
+
+/// RT0 field divergence at any point (the reference divergence is the same constant everywhere
+/// on the cell -- see [`rt0_reference_basis`]'s own doc comment): `map_hdiv_divergence(dimension
+/// * sum_i orientation_i * local_state_i)`.
+fn evaluate_rt0_divergence(
+    affine: &AffineMap,
+    orientations: &[i8],
+    local_state: &[f64],
+) -> Result<f64, FinitumError> {
+    if orientations.len() != local_state.len() {
+        return Err(FinitumError::InvalidRealization(format!(
+            "RT0 divergence evaluation needs matching orientation/state lengths, got {} and {}",
+            orientations.len(),
+            local_state.len()
+        )));
+    }
+    let dimension = affine.dimension();
+    let reference_divergence: f64 = orientations
+        .iter()
+        .zip(local_state)
+        .map(|(sign, value)| f64::from(*sign) * value)
+        .sum::<f64>()
+        * dimension as f64;
+    Ok(affine.map_hdiv_divergence(reference_divergence))
+}
+
+/// Exact transpose of [`evaluate_rt0_value`]: `d(value)/d(local_state_i) = orientation_i *
+/// Piola(phi_i(reference_point))`, contracted against `point_output` and accumulated (scaled by
+/// `scale`) into `local_output[i]`.
+fn apply_rt0_value_adjoint(
+    affine: &AffineMap,
+    orientations: &[i8],
+    reference_point: &[f64],
+    point_output: &[f64],
+    scale: f64,
+    local_output: &mut [f64],
+) -> Result<(), FinitumError> {
+    let dimension = affine.dimension();
+    if point_output.len() != dimension {
+        return Err(FinitumError::InvalidRealization(format!(
+            "RT0 value adjoint expects a {dimension}-component point output, got {}",
+            point_output.len()
+        )));
+    }
+    let (basis_values, _divergence) = rt0_reference_basis(dimension, reference_point)?;
+    if orientations.len() != basis_values.len() || local_output.len() != basis_values.len() {
+        return Err(FinitumError::InvalidRealization(
+            "RT0 value adjoint local output does not match the RT0 basis count".into(),
+        ));
+    }
+    for ((sign, basis), output) in orientations
+        .iter()
+        .zip(&basis_values)
+        .zip(local_output.iter_mut())
+    {
+        let physical_basis = affine.contravariant_piola(basis)?;
+        let dot: f64 = physical_basis
+            .iter()
+            .zip(point_output)
+            .map(|(component, value)| component * value)
+            .sum();
+        *output += scale * f64::from(*sign) * dot;
+    }
+    Ok(())
+}
+
+/// Exact transpose of [`evaluate_rt0_divergence`]: `d(value)/d(local_state_i) = orientation_i *
+/// map_hdiv_divergence(dimension)` (the same constant for every `i`), scaled by `point_output`
+/// and `scale`, accumulated into `local_output[i]`.
+fn apply_rt0_divergence_adjoint(
+    affine: &AffineMap,
+    orientations: &[i8],
+    point_output: f64,
+    scale: f64,
+    local_output: &mut [f64],
+) -> Result<(), FinitumError> {
+    if orientations.len() != local_output.len() {
+        return Err(FinitumError::InvalidRealization(
+            "RT0 divergence adjoint local output does not match the orientation count".into(),
+        ));
+    }
+    let dimension = affine.dimension();
+    let physical_basis_divergence = affine.map_hdiv_divergence(dimension as f64);
+    for (sign, output) in orientations.iter().zip(local_output.iter_mut()) {
+        *output += scale * f64::from(*sign) * physical_basis_divergence * point_output;
+    }
+    Ok(())
+}
+
+/// Dispatching gather: evaluates one basis-sourced input's value through whichever
+/// [`FieldKind`] `field` is. `reference_point` is `quadrature[point].coordinates` (the shared
+/// index convention [`build_field_elements`] documents); `cell` selects the RT0 orientation row.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_field_basis_input(
+    field: &FieldElement,
+    geometry: &CellGeometry,
+    affine: &AffineMap,
+    cell: usize,
+    point: usize,
+    reference_point: &[f64],
+    input: &scientia::QFunctionInput,
+    local_state: &[f64],
+) -> Result<Vec<f64>, FinitumError> {
+    match &field.kind {
+        FieldKind::Lagrange(element) => {
+            evaluate_basis_input(element, geometry, point, input, local_state)
+        }
+        FieldKind::Hdiv0 { orientations } => {
+            let cell_orientations = orientations.get(cell).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "RT0 field has no orientation row for cell {cell}"
+                ))
+            })?;
+            match input.binding.evaluation.derivative {
+                DerivativeEvaluation::Value => {
+                    evaluate_rt0_value(affine, cell_orientations, reference_point, local_state)
+                }
+                DerivativeEvaluation::Divergence => {
+                    evaluate_rt0_divergence(affine, cell_orientations, local_state)
+                        .map(|value| vec![value])
+                }
+                other => Err(FinitumError::UnsupportedRealization(format!(
+                    "RT0 (Hdiv(order=0)) fields support Value/Divergence basis evaluation only, \
+                     got {other:?}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Dispatching adjoint: exact transpose of [`evaluate_field_basis_input`] for a *row* (test)
+/// field's cell-integral output scatter.
+#[allow(clippy::too_many_arguments)]
+fn apply_field_basis_adjoint(
+    field: &FieldElement,
+    geometry: &CellGeometry,
+    affine: &AffineMap,
+    cell: usize,
+    point: usize,
+    reference_point: &[f64],
+    derivative: &DerivativeEvaluation,
+    point_output: &[f64],
+    scale: f64,
+    local_output: &mut [f64],
+) -> Result<(), FinitumError> {
+    match &field.kind {
+        FieldKind::Lagrange(element) => apply_basis_adjoint(
+            element,
+            geometry,
+            point,
+            derivative,
+            point_output,
+            scale,
+            local_output,
+        ),
+        FieldKind::Hdiv0 { orientations } => {
+            let cell_orientations = orientations.get(cell).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "RT0 field has no orientation row for cell {cell}"
+                ))
+            })?;
+            match derivative {
+                DerivativeEvaluation::Value => apply_rt0_value_adjoint(
+                    affine,
+                    cell_orientations,
+                    reference_point,
+                    point_output,
+                    scale,
+                    local_output,
+                ),
+                DerivativeEvaluation::Divergence if point_output.len() == 1 => {
+                    apply_rt0_divergence_adjoint(
+                        affine,
+                        cell_orientations,
+                        point_output[0],
+                        scale,
+                        local_output,
+                    )
+                }
+                other => Err(FinitumError::UnsupportedRealization(format!(
+                    "RT0 (Hdiv(order=0)) fields support Value/Divergence basis adjoints only, \
+                     got {other:?}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Adjoint of the RT0 exterior-facet normal-trace evaluation (mission item 2's narrowly-scoped
+/// `SemanticMeasure::ExteriorFacet` support -- see [`SystemRealizationPlan::
+/// bind_kernels_with_facets`]'s doc comment): scatters a single already-quadrature-integrated
+/// `point_output` scalar into the one local coefficient it multiplies.
+///
+/// Derivation: RT0's normal trace on any one of its own cell's facets is *constant* along that
+/// facet (the defining "order zero" property of the space) and equals exactly `orientation *
+/// coefficient / area(F)` (Piola pushforward preserves reference flux exactly -- see
+/// `crate::mapping::AffineMap::contravariant_piola`'s own doc comment and the FC8
+/// `darcy_hdiv_mapping_preserves_flux_and_oriented_shared_facets` test -- so the physical flux
+/// through the local facet the coefficient owns is exactly `orientation * coefficient`, spread
+/// uniformly over `area(F)`). The single-centroid-point facet rule this crate uses throughout
+/// (matching `crate::realization`'s own GX-C4 convention) therefore evaluates the integral as
+/// `area(F) * point_output * (orientation * coefficient / area(F)) = point_output * orientation *
+/// coefficient` -- the `area(F)` factor cancels exactly, so this adjoint needs neither the
+/// facet's geometry nor a quadrature scale.
+fn apply_rt0_normal_trace_adjoint(
+    orientations: &[i8],
+    local_facet: usize,
+    point_output: &[f64],
+    local_output: &mut [f64],
+) -> Result<(), FinitumError> {
+    if point_output.len() != 1 {
+        return Err(FinitumError::InvalidRealization(format!(
+            "RT0 exterior-facet normal trace output must be scalar, got {} components",
+            point_output.len()
+        )));
+    }
+    let orientation = orientations.get(local_facet).copied().ok_or_else(|| {
+        FinitumError::InvalidRealization(
+            "facet local index out of range for the RT0 restriction".into(),
+        )
+    })?;
+    let slot = local_output.get_mut(local_facet).ok_or_else(|| {
+        FinitumError::InvalidRealization(
+            "facet local index out of range for the RT0 restriction".into(),
+        )
+    })?;
+    *slot += f64::from(orientation) * point_output[0];
+    Ok(())
 }
 
 type SystemPointValueEvaluator = dyn Fn(&PointEvaluation) -> Vec<f64> + Send + Sync;
@@ -509,6 +916,7 @@ fn system_operator_digest(
     plan: &SystemRealizationPlan,
     constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
     equation_sign: &BTreeMap<usize, f64>,
+    facet_regions: &BTreeMap<RegionId, Vec<FacetId>>,
 ) -> Digest {
     #[derive(Serialize)]
     struct ConstitutiveIdentity<'a> {
@@ -524,6 +932,7 @@ fn system_operator_digest(
         plan_digest: &'a Digest,
         constitutive: Vec<ConstitutiveIdentity<'a>>,
         equation_sign: &'a BTreeMap<usize, f64>,
+        facet_regions: BTreeMap<u32, Vec<usize>>,
     }
     let payload = Payload {
         schema: "finitum-system-operator/1",
@@ -541,6 +950,10 @@ fn system_operator_digest(
             )
             .collect(),
         equation_sign,
+        facet_regions: facet_regions
+            .iter()
+            .map(|(region, facets)| (region.0, facets.iter().map(|facet| facet.0).collect()))
+            .collect(),
     };
     let bytes =
         serde_json::to_vec(&payload).expect("system operator digest payload is serializable");
@@ -584,29 +997,143 @@ impl SystemRealizationPlan {
         constitutive: Vec<SystemConstitutiveInput>,
         equation_sign: BTreeMap<String, f64>,
     ) -> Result<SystemOperator, FinitumError> {
+        self.bind_kernels_with_facets(constitutive, equation_sign, BTreeMap::new())
+    }
+
+    /// As [`Self::bind_kernels`], additionally admitting a narrowly-scoped
+    /// `SemanticMeasure::ExteriorFacet` integral (mission item 2's extension): an RT0
+    /// (Hdiv(order=0)) row field's own exterior normal trace (`EvaluationSite::ExteriorTrace`,
+    /// `DerivativeEvaluation::Value`, `TraceMapping::Normal`), with **no** `Basis`-sourced
+    /// (trial) input at all -- `13-mixed-darcy.res`'s own `darcy_law` Neumann boundary integral
+    /// is exactly this shape (`primal.inputs` is empty; the compiled expression is a
+    /// caller-independent constant). External/constitutive facet inputs, active-input facet
+    /// integrals, interior/interface/point measures, and non-RT0 facet traces remain refused
+    /// typed -- this is real, narrow machinery (RT0's own normal trace has an exact closed form,
+    /// see this module's own `apply_rt0_normal_trace_adjoint` doc comment), not a blanket facet
+    /// realization.
+    ///
+    /// `facet_regions` maps each such integral's `region` to the concrete exterior [`FacetId`]s
+    /// it integrates over -- resolved by the caller through a `RegionMap`/`RegionTags` binding
+    /// exactly as [`crate::RealizationPlan::new_with_facets`] documents (a bare [`Mesh`] carries
+    /// no region tags of its own). A region with no entry (or an empty entry) here is refused
+    /// (`FinitumError::RealizationRegionUnmapped`).
+    pub fn bind_kernels_with_facets(
+        &self,
+        constitutive: Vec<SystemConstitutiveInput>,
+        equation_sign: BTreeMap<String, f64>,
+        facet_regions: BTreeMap<RegionId, Vec<FacetId>>,
+    ) -> Result<SystemOperator, FinitumError> {
         for block in &self.system.blocks {
             for integral in &block.factorization.integrals {
-                if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
-                    return Err(FinitumError::UnsupportedRealization(format!(
-                        "system realization admits SemanticMeasure::Cell integrals only; \
-                         equation `{}` integral {} has measure {:?} (facet bindings are out of \
-                         this lane's scope)",
-                        block.equation, integral.integral_index, integral.measure
-                    )));
-                }
-                for output in &integral.primal.outputs {
-                    if output.binding.evaluation.site != EvaluationSite::Cell {
+                match &integral.measure {
+                    SemanticMeasure::Cell { .. } => {
+                        for output in &integral.primal.outputs {
+                            if output.binding.evaluation.site != EvaluationSite::Cell {
+                                return Err(FinitumError::UnsupportedRealization(format!(
+                                    "system realization realizes cell evaluation sites only; \
+                                     equation `{}` integral {} has an output at site {:?}",
+                                    block.equation,
+                                    integral.integral_index,
+                                    output.binding.evaluation.site
+                                )));
+                            }
+                        }
+                    }
+                    SemanticMeasure::ExteriorFacet { region } => {
+                        if facet_regions
+                            .get(region)
+                            .is_none_or(|facets| facets.is_empty())
+                        {
+                            return Err(FinitumError::RealizationRegionUnmapped(format!(
+                                "{region:?}"
+                            )));
+                        }
+                        if !integral.primal.inputs.is_empty() {
+                            return Err(FinitumError::UnsupportedRealization(format!(
+                                "system realization admits exterior-facet integrals with no \
+                                 primal input at all (RT0's own normal-trace closed form only); \
+                                 equation `{}` integral {} declares {} input(s)",
+                                block.equation,
+                                integral.integral_index,
+                                integral.primal.inputs.len()
+                            )));
+                        }
+                        for output in &integral.primal.outputs {
+                            let evaluation = &output.binding.evaluation;
+                            if evaluation.site != EvaluationSite::ExteriorTrace
+                                || evaluation.derivative != DerivativeEvaluation::Value
+                                || evaluation.trace_mapping != Some(TraceMapping::Normal)
+                            {
+                                return Err(FinitumError::UnsupportedRealization(format!(
+                                    "system realization admits exterior-facet integrals only for \
+                                     an Hdiv(order=0) row field's Value/ExteriorTrace/Normal \
+                                     trace; equation `{}` integral {} has evaluation {evaluation:?}",
+                                    block.equation, integral.integral_index
+                                )));
+                            }
+                        }
+                    }
+                    other => {
                         return Err(FinitumError::UnsupportedRealization(format!(
-                            "system realization realizes cell evaluation sites only; equation \
-                             `{}` integral {} has an output at site {:?}",
-                            block.equation, integral.integral_index, output.binding.evaluation.site
+                            "system realization admits SemanticMeasure::Cell integrals, or a \
+                             narrowly-scoped Hdiv(order=0) SemanticMeasure::ExteriorFacet normal \
+                             trace, only; equation `{}` integral {} has measure {other:?}",
+                            block.equation, integral.integral_index
                         )));
                     }
                 }
             }
         }
         let quadrature = simplex_quadrature(self.mesh.dimension())?;
-        let fields = build_field_elements(&self.system, &self.mesh, &self.layout, &quadrature)?;
+        let fields = build_field_elements(
+            &self.system,
+            &self.mesh,
+            &self.layout,
+            &quadrature,
+            self.compatible_dofs.as_ref(),
+        )?;
+        for block in &self.system.blocks {
+            let has_exterior_facet =
+                block.factorization.integrals.iter().any(|integral| {
+                    matches!(integral.measure, SemanticMeasure::ExteriorFacet { .. })
+                });
+            if has_exterior_facet {
+                let row_field = fields.get(&block.row).ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "equation `{}` row field {} was not realized",
+                        block.equation, block.row
+                    ))
+                })?;
+                if !matches!(row_field.kind, FieldKind::Hdiv0 { .. }) {
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "equation `{}` has an exterior-facet integral but row field {} is not \
+                         Hdiv(order=0)",
+                        block.equation, block.row
+                    )));
+                }
+            }
+        }
+        let mut facet_geometries: BTreeMap<FacetId, FacetGeometry> = BTreeMap::new();
+        if !facet_regions.is_empty() {
+            let mut referenced = BTreeSet::new();
+            for ids in facet_regions.values() {
+                referenced.extend(ids.iter().copied());
+            }
+            for facet_id in referenced {
+                let facet = self.facets.facets().get(facet_id.0).ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!("facet {} does not exist", facet_id.0))
+                })?;
+                if !facet.is_exterior() {
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "facet {} is not exterior; system realization refuses interior facet \
+                         integrals",
+                        facet_id.0
+                    )));
+                }
+                facet_geometries
+                    .insert(facet_id, FacetGeometry::compute(&self.mesh, facet.minus())?);
+            }
+        }
         let mut bindings = BTreeMap::new();
         for (index, block) in self.system.blocks.iter().enumerate() {
             bindings.insert(
@@ -681,14 +1208,22 @@ impl SystemRealizationPlan {
         validate_structure_matches_system(&self.system, &structure)?;
         let nullspace_candidates = derive_nullspace_candidates(&structure)?;
         let solver_layout = solver_block_layout(&self.layout)?;
-        let digest = system_operator_digest(self, &constitutive_by_key, &equation_sign_by_block);
+        let digest = system_operator_digest(
+            self,
+            &constitutive_by_key,
+            &equation_sign_by_block,
+            &facet_regions,
+        );
         Ok(SystemOperator {
             data: Arc::new(SystemOperatorData {
                 plan: self.clone(),
                 fields,
+                quadrature,
                 bindings,
                 constitutive: constitutive_by_key,
                 equation_sign: equation_sign_by_block,
+                facet_regions,
+                facet_geometries,
                 structure,
                 nullspace_candidates,
                 solver_layout,
@@ -703,11 +1238,22 @@ impl SystemRealizationPlan {
 struct SystemOperatorData {
     plan: SystemRealizationPlan,
     fields: BTreeMap<SymbolId, FieldElement>,
+    /// Shared quadrature table every field's basis is tabulated at (or, for an RT0 field,
+    /// evaluated at directly -- see [`build_field_elements`]'s doc comment); the per-cell
+    /// per-block integration loop indexes into this rather than any one field's own table, since
+    /// an RT0 [`FieldElement`] carries no [`PreparedElement`] of its own.
+    quadrature: Vec<QuadraturePoint>,
     bindings: BTreeMap<usize, BTreeMap<(usize, usize), BoundBundle>>,
     constitutive: BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
     /// Per-block-index equation orientation (`1.0` or `-1.0`, absent means `1.0`); see
     /// `SystemRealizationPlan::bind_kernels`'s `equation_sign` parameter.
     equation_sign: BTreeMap<usize, f64>,
+    /// Mission item 2's exterior-facet extension: caller-resolved region -> facet-id lists (see
+    /// `SystemRealizationPlan::bind_kernels_with_facets`), and their precomputed
+    /// `crate::realization::FacetGeometry` (cell + local facet index; reused from GX-C4
+    /// unchanged).
+    facet_regions: BTreeMap<RegionId, Vec<FacetId>>,
+    facet_geometries: BTreeMap<FacetId, FacetGeometry>,
     structure: OperatorStructure,
     nullspace_candidates: Vec<BlockNullspaceCandidate>,
     solver_layout: methodus::BlockLayout,
@@ -790,10 +1336,18 @@ impl SystemOperator {
         output.iter_mut().for_each(|value| *value = 0.0);
         for cell in 0..self.data.plan.mesh().cells().len() {
             let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
+            let affine = AffineMap::from_cell(self.data.plan.mesh(), CellId(cell))?;
             for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
-                self.apply_block_cell(block_index, block, cell, &geometry, input, output)?;
+                self.apply_block_cell(block_index, block, cell, &geometry, &affine, input, output)?;
             }
         }
+        // Every exterior-facet integral admitted by `bind_kernels_with_facets` has no `Basis`-
+        // sourced input at all, so its JVP contribution is exactly zero for any direction (a
+        // directional derivative of a state-independent expression) -- this is included for
+        // architectural uniformity with the cell-integral treatment (and so a future
+        // active-input facet integral, refused typed at bind time, is never silently skipped
+        // here rather than refused), not because it changes `output`.
+        self.apply_facets(output, FacetAction::Jvp)?;
         if output.iter().any(|value| !value.is_finite()) {
             return Err(FinitumError::InvalidRealization(
                 "system operator output is not finite".into(),
@@ -854,10 +1408,23 @@ impl SystemOperator {
         let mut output = vec![0.0; dimension];
         for cell in 0..self.data.plan.mesh().cells().len() {
             let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
+            let affine = AffineMap::from_cell(self.data.plan.mesh(), CellId(cell))?;
             for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
-                self.apply_block_cell_load(block_index, block, cell, &geometry, &mut output)?;
+                self.apply_block_cell_load(
+                    block_index,
+                    block,
+                    cell,
+                    &geometry,
+                    &affine,
+                    &mut output,
+                )?;
             }
         }
+        // Mission item 2's exterior-facet extension: unlike a cell integral's contribution,
+        // this is the PRIMAL evaluation itself (not a JVP), so a facet integral with genuinely
+        // nonzero data (a future extension beyond `13-mixed-darcy.res`'s own literal
+        // `Constant{0.0}`) would contribute here for real.
+        self.apply_facets(&mut output, FacetAction::Primal)?;
         for value in &mut output {
             *value = -*value;
         }
@@ -973,6 +1540,7 @@ impl SystemOperator {
         block: &OperatorSystemBlock,
         cell: usize,
         geometry: &CellGeometry,
+        affine: &AffineMap,
         direction: &[f64],
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
@@ -1009,6 +1577,11 @@ impl SystemOperator {
 
         let bindings = &self.data.bindings[&block_index];
         for integral in &block.factorization.integrals {
+            if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                // Exterior-facet integrals are processed separately by `Self::apply_facets`
+                // (mission item 2); this per-cell loop only ever handles `SemanticMeasure::Cell`.
+                continue;
+            }
             for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
                 let bound = bindings
                     .get(&(integral.integral_index, output_index))
@@ -1018,15 +1591,17 @@ impl SystemOperator {
                             block.equation, integral.integral_index
                         ))
                     })?;
-                for point in 0..row_field.element.quadrature().len() {
-                    let scale =
-                        row_field.element.quadrature()[point].weight * geometry.determinant();
+                for point in 0..self.data.quadrature.len() {
+                    let reference_point = &self.data.quadrature[point].coordinates;
+                    let scale = self.data.quadrature[point].weight * geometry.determinant();
                     let (inputs, evaluation) = point_inputs_system(
                         &self.data.fields,
                         integral,
                         cell,
                         point,
                         geometry,
+                        affine,
+                        reference_point,
                         &local_zero,
                         &self.data.constitutive,
                         block_index,
@@ -1037,16 +1612,21 @@ impl SystemOperator {
                         cell,
                         point,
                         geometry,
+                        affine,
+                        reference_point,
                         &local_direction,
                         &self.data.constitutive,
                         block_index,
                         &evaluation,
                     )?;
                     let point_output = execute_jvp_values(bound, &inputs, &directions)?;
-                    apply_basis_adjoint(
-                        &row_field.element,
+                    apply_field_basis_adjoint(
+                        row_field,
                         geometry,
+                        affine,
+                        cell,
                         point,
+                        reference_point,
                         &qoutput.binding.evaluation.derivative,
                         &point_output,
                         scale,
@@ -1078,6 +1658,7 @@ impl SystemOperator {
         block: &OperatorSystemBlock,
         cell: usize,
         geometry: &CellGeometry,
+        affine: &AffineMap,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         let layout = self.layout();
@@ -1101,6 +1682,11 @@ impl SystemOperator {
 
         let bindings = &self.data.bindings[&block_index];
         for integral in &block.factorization.integrals {
+            if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                // Exterior-facet integrals are processed separately by `Self::apply_facets`
+                // (mission item 2); this per-cell loop only ever handles `SemanticMeasure::Cell`.
+                continue;
+            }
             for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
                 let bound = bindings
                     .get(&(integral.integral_index, output_index))
@@ -1110,24 +1696,29 @@ impl SystemOperator {
                             block.equation, integral.integral_index
                         ))
                     })?;
-                for point in 0..row_field.element.quadrature().len() {
-                    let scale =
-                        row_field.element.quadrature()[point].weight * geometry.determinant();
+                for point in 0..self.data.quadrature.len() {
+                    let reference_point = &self.data.quadrature[point].coordinates;
+                    let scale = self.data.quadrature[point].weight * geometry.determinant();
                     let (inputs, _evaluation) = point_inputs_system(
                         &self.data.fields,
                         integral,
                         cell,
                         point,
                         geometry,
+                        affine,
+                        reference_point,
                         &local_zero,
                         &self.data.constitutive,
                         block_index,
                     )?;
                     let point_output = execute_primal_values(bound, &inputs)?;
-                    apply_basis_adjoint(
-                        &row_field.element,
+                    apply_field_basis_adjoint(
+                        row_field,
                         geometry,
+                        affine,
+                        cell,
                         point,
+                        reference_point,
                         &qoutput.binding.evaluation.derivative,
                         &point_output,
                         scale,
@@ -1147,6 +1738,117 @@ impl SystemOperator {
         }
         Ok(())
     }
+
+    /// Mission item 2's exterior-facet extension: iterates every block's `SemanticMeasure::
+    /// ExteriorFacet` integral over its resolved facet list, scattering each into the row
+    /// field's global DOFs. Every admitted facet integral has no primal input at all (see
+    /// `SystemRealizationPlan::bind_kernels_with_facets`'s doc comment), so `action` selects only
+    /// which of `execute_primal_values`/`execute_jvp_values` runs the (input-free) bound kernel.
+    fn apply_facets(&self, output: &mut [f64], action: FacetAction) -> Result<(), FinitumError> {
+        for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
+            for integral in &block.factorization.integrals {
+                let region = match &integral.measure {
+                    SemanticMeasure::ExteriorFacet { region } => *region,
+                    _ => continue,
+                };
+                let facet_ids = self
+                    .data
+                    .facet_regions
+                    .get(&region)
+                    .expect("validated non-empty at bind_kernels_with_facets");
+                for &facet_id in facet_ids {
+                    self.apply_block_facet(block_index, block, integral, facet_id, output, action)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_block_facet(
+        &self,
+        block_index: usize,
+        block: &OperatorSystemBlock,
+        integral: &IntegralOperatorFactorization,
+        facet_id: FacetId,
+        output: &mut [f64],
+        action: FacetAction,
+    ) -> Result<(), FinitumError> {
+        let layout = self.layout();
+        let row_field = self.data.fields.get(&block.row).ok_or_else(|| {
+            FinitumError::ArtifactMismatch(format!(
+                "equation `{}` row field {} was not realized",
+                block.equation, block.row
+            ))
+        })?;
+        let orientations = match &row_field.kind {
+            FieldKind::Hdiv0 { orientations } => orientations,
+            FieldKind::Lagrange(_) => {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "equation `{}` has an exterior-facet integral but row field {} is not \
+                     Hdiv(order=0) (should have been refused at bind_kernels_with_facets time)",
+                    block.equation, block.row
+                )));
+            }
+        };
+        let geometry = self
+            .data
+            .facet_geometries
+            .get(&facet_id)
+            .expect("facet geometry was precomputed at bind_kernels_with_facets time");
+        let cell = geometry.cell.0;
+        let cell_orientations = orientations.get(cell).ok_or_else(|| {
+            FinitumError::ArtifactMismatch(format!(
+                "RT0 field has no orientation row for cell {cell}"
+            ))
+        })?;
+        let row_block = layout
+            .block(block.row)
+            .expect("row field implies a layout block");
+        let restriction = &row_field.dofs.restrictions()[cell];
+        let mut local_output = vec![0.0; restriction.dofs.len()];
+        let bindings = &self.data.bindings[&block_index];
+        let inputs = BTreeMap::new();
+        for (output_index, _qoutput) in integral.primal.outputs.iter().enumerate() {
+            let bound = bindings
+                .get(&(integral.integral_index, output_index))
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "equation `{}` integral {} output {output_index} has no bound kernel",
+                        block.equation, integral.integral_index
+                    ))
+                })?;
+            let point_output = match action {
+                FacetAction::Primal => execute_primal_values(bound, &inputs)?,
+                FacetAction::Jvp => {
+                    let directions = BTreeMap::new();
+                    execute_jvp_values(bound, &inputs, &directions)?
+                }
+            };
+            apply_rt0_normal_trace_adjoint(
+                cell_orientations,
+                geometry.local_facet,
+                &point_output,
+                &mut local_output,
+            )?;
+        }
+        let sign = self
+            .data
+            .equation_sign
+            .get(&block_index)
+            .copied()
+            .unwrap_or(1.0);
+        for (local_index, dof) in restriction.dofs.iter().enumerate() {
+            output[row_block.offset + dof.0] += sign * local_output[local_index];
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FacetAction {
+    Primal,
+    Jvp,
 }
 
 impl LinearOperator for SystemOperator {
@@ -1329,6 +2031,8 @@ fn point_inputs_system(
     cell: usize,
     point: usize,
     geometry: &CellGeometry,
+    affine: &AffineMap,
+    reference_point: &[f64],
     local_state: &BTreeMap<SymbolId, Vec<f64>>,
     constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
     block_index: usize,
@@ -1347,7 +2051,16 @@ fn point_inputs_system(
             ))
         })?;
         let dofs = &local_state[&input.binding.symbol];
-        let values = evaluate_basis_input(&field.element, geometry, point, input, dofs)?;
+        let values = evaluate_field_basis_input(
+            field,
+            geometry,
+            affine,
+            cell,
+            point,
+            reference_point,
+            input,
+            dofs,
+        )?;
         if input.role == TensorInputRole::Active {
             active.push(PointActiveInput {
                 input: input.id,
@@ -1357,14 +2070,10 @@ fn point_inputs_system(
         }
         inputs.insert(input.id, values);
     }
-    let any_field = fields
-        .values()
-        .next()
-        .expect("a system realizes at least one field");
     let evaluation = PointEvaluation {
         time: 0.0,
         cell: CellId(cell),
-        coordinates: geometry.physical_point(&any_field.element.quadrature()[point].coordinates),
+        coordinates: geometry.physical_point(reference_point),
         active,
     };
     for input in &integral.primal.inputs {
@@ -1400,6 +2109,8 @@ fn point_directions_system(
     cell: usize,
     point: usize,
     geometry: &CellGeometry,
+    affine: &AffineMap,
+    reference_point: &[f64],
     local_direction: &BTreeMap<SymbolId, Vec<f64>>,
     constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
     block_index: usize,
@@ -1419,7 +2130,16 @@ fn point_directions_system(
             ))
         })?;
         let dofs = &local_direction[&input.binding.symbol];
-        let values = evaluate_basis_input(&field.element, geometry, point, input, dofs)?;
+        let values = evaluate_field_basis_input(
+            field,
+            geometry,
+            affine,
+            cell,
+            point,
+            reference_point,
+            input,
+            dofs,
+        )?;
         if input.role == TensorInputRole::Active {
             active.push(PointActiveInput {
                 input: input.id,
@@ -1619,4 +2339,217 @@ pub fn essential_constraints_from_system(
         }
     }
     essential_constraints_for_blocks(layout, values)
+}
+
+#[cfg(test)]
+mod rt0_tests {
+    use super::*;
+    use crate::{Cell, VertexId};
+
+    /// Two triangles sharing the diagonal of the unit square: cell A = `[0,1,2]`
+    /// `(0,0),(1,0),(0,1)` (whose reference map is the identity: `physical_point(ref) == ref`),
+    /// cell B = `[1,3,2]` `(1,0),(1,1),(0,1)`. The shared facet is the diagonal `{1,2}`
+    /// (physical midpoint `(0.5,0.5)`), which is cell A's local facet 0 (omits local vertex 0)
+    /// and cell B's local facet 1 (omits local vertex 1) -- reference coordinates for that
+    /// physical midpoint are hand-derived in each cell's own affine map (see the module's own
+    /// lane report for the derivation) rather than computed by inverting `AffineMap`, which
+    /// exposes no inverse-point method.
+    fn two_triangle_mesh() -> Mesh {
+        Mesh::new(
+            2,
+            vec![
+                vec![0.0, 0.0],
+                vec![1.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 1.0],
+            ],
+            vec![
+                Cell {
+                    vertices: vec![VertexId(0), VertexId(1), VertexId(2)],
+                },
+                Cell {
+                    vertices: vec![VertexId(1), VertexId(3), VertexId(2)],
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rt0_normal_flux_is_continuous_across_a_shared_interior_facet_using_a_single_fixed_normal() {
+        let mesh = two_triangle_mesh();
+        let facets = FacetTopology::from_mesh(&mesh).unwrap();
+        let compatible = CompatibleDofMaps::simplex(&mesh, &facets).unwrap();
+        let shared = facets.interior().next().expect("one shared interior facet");
+        assert_eq!(
+            shared.vertices,
+            vec![crate::VertexId(1), crate::VertexId(2)]
+        );
+
+        let coefficient = 3.7_f64;
+        let mut global_state = vec![0.0; compatible.hdiv_dof_count];
+        global_state[shared.id.0] = coefficient;
+
+        // Cell A: physical_point(ref) == ref (identity jacobian, origin (0,0)); the shared
+        // facet's physical midpoint (0.5, 0.5) is therefore its own reference coordinate too.
+        let affine_a = AffineMap::from_cell(&mesh, CellId(0)).unwrap();
+        let restriction_a = &compatible.hdiv[0];
+        let local_state_a: Vec<f64> = restriction_a
+            .dofs
+            .iter()
+            .map(|dof| global_state[dof.0])
+            .collect();
+        let reference_point_a = [0.5, 0.5];
+        let value_a = evaluate_rt0_value(
+            &affine_a,
+            &restriction_a.orientations,
+            &reference_point_a,
+            &local_state_a,
+        )
+        .unwrap();
+
+        // Cell B: origin (1,0), jacobian columns (0,1) and (-1,1) (local vertices 1,3,2 minus
+        // local vertex 1); solving physical_point(ref) == (0.5, 0.5) gives ref = (0.0, 0.5).
+        let affine_b = AffineMap::from_cell(&mesh, CellId(1)).unwrap();
+        let restriction_b = &compatible.hdiv[1];
+        let local_state_b: Vec<f64> = restriction_b
+            .dofs
+            .iter()
+            .map(|dof| global_state[dof.0])
+            .collect();
+        let reference_point_b = [0.0, 0.5];
+        let value_b = evaluate_rt0_value(
+            &affine_b,
+            &restriction_b.orientations,
+            &reference_point_b,
+            &local_state_b,
+        )
+        .unwrap();
+
+        // Sanity: `physical_point` really does map both reference points to the shared
+        // midpoint, confirming the hand-derived reference coordinates above.
+        assert!(
+            affine_a
+                .physical_point(&reference_point_a)
+                .unwrap()
+                .iter()
+                .zip([0.5, 0.5])
+                .all(|(actual, expected): (&f64, f64)| (actual - expected).abs() < 1e-13)
+        );
+        assert!(
+            affine_b
+                .physical_point(&reference_point_b)
+                .unwrap()
+                .iter()
+                .zip([0.5, 0.5])
+                .all(|(actual, expected): (&f64, f64)| (actual - expected).abs() < 1e-13)
+        );
+
+        // A single, fixed physical normal direction (cell A's own outward normal at the shared
+        // facet, computed independently of `evaluate_rt0_value`): the diagonal from (1,0) to
+        // (0,1) has tangent (-1,1); an outward-from-A normal pointing away from A's own
+        // remaining vertex (0,0) is (1,1)/sqrt(2).
+        let normal = [
+            1.0 / std::f64::consts::SQRT_2,
+            1.0 / std::f64::consts::SQRT_2,
+        ];
+        let flux_a: f64 = value_a.iter().zip(normal).map(|(v, n)| v * n).sum();
+        let flux_b: f64 = value_b.iter().zip(normal).map(|(v, n)| v * n).sum();
+        assert!(
+            (flux_a - flux_b).abs() < 1e-12,
+            "RT0 normal flux is not continuous across the shared facet: {flux_a} != {flux_b}"
+        );
+
+        // The magnitude itself matches the defining flux property: physical flux through the
+        // owning facet equals exactly `orientation * coefficient` (Piola preserves reference
+        // flux exactly), spread over the facet's own physical length (`sqrt(2)` here).
+        let facet_length = std::f64::consts::SQRT_2;
+        let local_index_a = restriction_a
+            .dofs
+            .iter()
+            .position(|dof| dof.0 == shared.id.0)
+            .unwrap();
+        let expected_flux =
+            f64::from(restriction_a.orientations[local_index_a]) * coefficient / facet_length;
+        assert!(
+            (flux_a - expected_flux).abs() < 1e-12,
+            "flux magnitude {flux_a} does not match the closed-form {expected_flux}"
+        );
+    }
+
+    #[test]
+    fn rt0_value_and_divergence_adjoints_are_the_exact_algebraic_transpose_of_their_evaluators() {
+        let mesh = two_triangle_mesh();
+        let facets = FacetTopology::from_mesh(&mesh).unwrap();
+        let compatible = CompatibleDofMaps::simplex(&mesh, &facets).unwrap();
+        let affine = AffineMap::from_cell(&mesh, CellId(0)).unwrap();
+        let restriction = &compatible.hdiv[0];
+        let reference_point = [0.3, 0.2];
+
+        // Value adjoint: for random `direction` (a perturbation of the local coefficients) and
+        // random `point_output` (a cotangent), `dot(evaluate(direction), point_output)` must
+        // equal `dot(direction, adjoint(point_output))` -- the standard linear-map/adjoint
+        // dot-product identity, checked directly (not merely asserted from the derivation).
+        let direction = [0.6, -1.2, 2.5];
+        let point_output = [0.9, -0.4];
+        let value = evaluate_rt0_value(
+            &affine,
+            &restriction.orientations,
+            &reference_point,
+            &direction,
+        )
+        .unwrap();
+        let lhs: f64 = value.iter().zip(point_output).map(|(v, p)| v * p).sum();
+        let mut adjoint = vec![0.0; 3];
+        apply_rt0_value_adjoint(
+            &affine,
+            &restriction.orientations,
+            &reference_point,
+            &point_output,
+            1.0,
+            &mut adjoint,
+        )
+        .unwrap();
+        let rhs: f64 = direction.iter().zip(&adjoint).map(|(d, a)| d * a).sum();
+        assert!(
+            (lhs - rhs).abs() < 1e-12,
+            "value adjoint mismatch: {lhs} != {rhs}"
+        );
+
+        // Divergence adjoint: same identity, scalar point output.
+        let divergence_point_output = -2.3_f64;
+        let divergence_value =
+            evaluate_rt0_divergence(&affine, &restriction.orientations, &direction).unwrap();
+        let divergence_lhs = divergence_value * divergence_point_output;
+        let mut divergence_adjoint = vec![0.0; 3];
+        apply_rt0_divergence_adjoint(
+            &affine,
+            &restriction.orientations,
+            divergence_point_output,
+            1.0,
+            &mut divergence_adjoint,
+        )
+        .unwrap();
+        let divergence_rhs: f64 = direction
+            .iter()
+            .zip(&divergence_adjoint)
+            .map(|(d, a)| d * a)
+            .sum();
+        assert!(
+            (divergence_lhs - divergence_rhs).abs() < 1e-12,
+            "divergence adjoint mismatch: {divergence_lhs} != {divergence_rhs}"
+        );
+    }
+
+    #[test]
+    fn rt0_normal_trace_adjoint_matches_the_orientation_times_output_closed_form() {
+        let orientations = [1_i8, -1, 1];
+        let mut local_output = vec![0.0; 3];
+        apply_rt0_normal_trace_adjoint(&orientations, 1, &[2.5], &mut local_output).unwrap();
+        assert_eq!(local_output, vec![0.0, -2.5, 0.0]);
+        assert!(
+            apply_rt0_normal_trace_adjoint(&orientations, 1, &[1.0, 2.0], &mut [0.0; 3]).is_err()
+        );
+        assert!(apply_rt0_normal_trace_adjoint(&orientations, 5, &[1.0], &mut [0.0; 3]).is_err());
+    }
 }

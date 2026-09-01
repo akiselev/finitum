@@ -4626,7 +4626,7 @@ fn reference_facet_weight(mesh_dimension: usize) -> Result<f64, FinitumError> {
 }
 
 impl FacetGeometry {
-    fn compute(mesh: &Mesh, incidence: FacetIncidence) -> Result<Self, FinitumError> {
+    pub(crate) fn compute(mesh: &Mesh, incidence: FacetIncidence) -> Result<Self, FinitumError> {
         let dimension = mesh.dimension();
         reference_facet_weight(dimension)?;
         let cell = mesh.cell(incidence.cell).ok_or_else(|| {
@@ -4723,7 +4723,7 @@ impl FacetGeometry {
     /// `PreparedElement::linear_simplex`-style scale: reference facet weight times the physical
     /// Jacobian determinant, the exact analog of `quadrature.weight * geometry.determinant` for
     /// the single-point facet rule.
-    fn scale(&self, mesh_dimension: usize) -> f64 {
+    pub(crate) fn scale(&self, mesh_dimension: usize) -> f64 {
         reference_facet_weight(mesh_dimension).expect("validated at construction")
             * self.jacobian_determinant
     }

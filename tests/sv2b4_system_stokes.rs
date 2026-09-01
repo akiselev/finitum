@@ -23,11 +23,11 @@
 //! assembly (`SystemOperator::prove_symmetry`), not assumed.
 
 use finitum::{
-    BlockCoupling, BlockLayout, Cell, ConstraintSet, CouplingKind, DofId, FieldSource, FieldSpec,
-    FinitumError, Mesh, MeshProfile, MixedOperator, MixedSpace, PointEvaluation, RegionMap,
-    RegionTagId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
-    SystemRealizationPlan, VertexId, essential_constraints_from_system, quadratic_simplex_dof_map,
-    realize, vector_nodal_dof_map,
+    BlockCoupling, BlockLayout, CompatibleDofMaps, ConstraintSet, CouplingKind, DofId,
+    FacetTopology, FieldSource, FieldSpec, Mesh, MeshProfile, MixedOperator, MixedSpace,
+    PointEvaluation, RegionMap, RegionTagId, SystemConstitutiveInput,
+    SystemEssentialConstraintRequirement, SystemRealizationPlan, essential_constraints_from_system,
+    facet_membership_from, quadratic_simplex_dof_map, realize,
 };
 use methodus::{
     EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector, OperatorSymmetry,
@@ -35,8 +35,8 @@ use methodus::{
 };
 use quantitas::UnitRegistry;
 use scientia::{
-    DerivativeEvaluation, InputSourceRequirement, OperatorSystem, RegionId, SymbolId,
-    compile_operator_system, compile_semantics,
+    DerivativeEvaluation, InputSourceRequirement, OperatorSystem, RegionId, SemanticMeasure,
+    SymbolId, compile_operator_system, compile_semantics,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -454,13 +454,20 @@ fn signed_stokes_system_matches_mixed_operator_and_minres_converges() {
     assert_close(&recovered, &right_hand_side, 1.0e-6);
 }
 
-/// `13-mixed-darcy.res` pairs an `HDiv(order=0)` flux field with an `L2(order=0)` pressure field
-/// (`@inf_sup(pair = "RT0-P0")`) -- a genuine compatible-element (Hdiv) discretization, item 1's
-/// out-of-scope DOF map, and an order (`0`) this crate's Lagrange machinery does not admit
-/// either way. `SystemRealizationPlan::bind_kernels` refuses it typed rather than silently
-/// treating it as Lagrange.
-#[test]
-fn mixed_darcy_hdiv_pairing_is_refused_typed_not_faked_as_lagrange() {
+/// `13-mixed-darcy.res` pairs an `HDiv(order=0)` flux field (`darcy_law`'s row) with an
+/// `L2(order=0)` pressure field (`mass_balance`'s row), `@inf_sup(pair = "RT0-P0")` -- the E6/
+/// Hdiv lane's own decisive-acceptance case. `flux`'s `impermeable` boundary compiles to a
+/// `SemanticMeasure::ExteriorFacet` integral on `darcy_law` with an empty `primal.inputs` list
+/// and a `Constant{0.0}` expression (Scientia's own compilation of `neumann flux = 0`, not a
+/// choice made here); `mass_balance` has no facet integral and no essential-constraint
+/// requirement at all (confirmed directly against the compiled system, not assumed).
+struct CompiledDarcy {
+    system: OperatorSystem,
+    flux: SymbolId,
+    pressure: SymbolId,
+}
+
+fn compile_darcy() -> CompiledDarcy {
     let source = fs::read_to_string(DARCY_CORPUS).expect("13-mixed-darcy.res corpus is readable");
     let compilation = compile_semantics(&source, &UnitRegistry::si_bootstrap()).unwrap();
     let system = compile_operator_system(
@@ -481,74 +488,355 @@ fn mixed_darcy_hdiv_pairing_is_refused_typed_not_faked_as_lagrange() {
         .find(|block| block.equation == "mass_balance")
         .unwrap()
         .row;
+    CompiledDarcy {
+        system,
+        flux,
+        pressure,
+    }
+}
 
-    let mesh = Mesh::new(
-        3,
-        vec![
-            vec![0.0, 0.0, 0.0],
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
+/// A structured tetrahedral unit cube (`MeshProfile::SimplexBox`, dimension 3): at
+/// `subdivisions = 2` this realizes 48 cells / 120 facets (RT0 flux dimension 120, P0 pressure
+/// dimension 48, total system dimension 168) -- small enough for the dense independent
+/// cross-check below, large enough to be a genuine multi-cell 3-D solve rather than a
+/// single-tetrahedron sanity check.
+fn darcy_box(subdivisions: usize) -> finitum::TaggedMesh {
+    realize(&MeshProfile::SimplexBox {
+        dimension: 3,
+        extent: vec![[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+        subdivisions: vec![subdivisions, subdivisions, subdivisions],
+    })
+    .unwrap()
+}
+
+/// The concrete RT0/P0 `BlockLayout` this case needs: one entity per mesh facet with exactly one
+/// component for `flux` (RT0's own DOF structure -- see `finitum::system`'s
+/// `expected_field_components`), one entity per cell with one component for `pressure` (P0).
+fn darcy_layout(
+    mesh: &Mesh,
+    facets: &FacetTopology,
+    flux: SymbolId,
+    pressure: SymbolId,
+) -> (BlockLayout, CompatibleDofMaps) {
+    let compatible = CompatibleDofMaps::simplex(mesh, facets).unwrap();
+    let layout = BlockLayout::new([
+        (flux, compatible.hdiv_dof_count, 1),
+        (pressure, mesh.cells().len(), 1),
+    ])
+    .unwrap();
+    (layout, compatible)
+}
+
+/// All six faces of the unit-cube `darcy_box` realizes, matching the case's own
+/// `select = { kind = "box_faces", faces = ["all"] }` -- every exterior facet is `impermeable`.
+fn darcy_walls_region_map(region: RegionId) -> RegionMap {
+    let mut map = RegionMap::new();
+    map.insert(
+        region,
+        [
+            RegionTagId::new("x_min"),
+            RegionTagId::new("x_max"),
+            RegionTagId::new("y_min"),
+            RegionTagId::new("y_max"),
+            RegionTagId::new("z_min"),
+            RegionTagId::new("z_max"),
         ],
-        vec![Cell {
-            vertices: vec![VertexId(0), VertexId(1), VertexId(2), VertexId(3)],
-        }],
+    );
+    map
+}
+
+/// Every non-`Basis` primal input across the compiled Darcy system, resolved generically by
+/// `InputSourceRequirement`/shape (no physics-name dispatch, mirroring `stokes_constitutive`):
+/// `ModelDefinedConstitutive` (1 component) is `mobility_inverse` (`viscosity *
+/// inverse(permeability)`, Scientia never resolves provider *values* itself), bound to a
+/// constant; `ExternalValue` with 1 component is `source_term`, `ExternalValue` with 3 components
+/// is `body_force` -- both bound to an always-zero closure (this file's decisive-acceptance test
+/// manufactures its own consistent right-hand side directly from a known solution, mirroring
+/// `signed_stokes_system_matches_mixed_operator_and_minres_converges`'s own "no forcing needed"
+/// approach, rather than needing a discretely mean-zero source function).
+const DARCY_MOBILITY_INVERSE: f64 = 2.3;
+
+fn darcy_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> {
+    let mut constitutive = Vec::new();
+    for block in &system.blocks {
+        for integral in &block.factorization.integrals {
+            for input in &integral.primal.inputs {
+                let equation = block.equation.clone();
+                let integral_index = integral.integral_index;
+                let input_id = input.id;
+                let binding = match input.source {
+                    InputSourceRequirement::Basis => continue,
+                    InputSourceRequirement::ModelDefinedConstitutive { .. } => {
+                        SystemConstitutiveInput::new(
+                            equation,
+                            integral_index,
+                            input_id,
+                            1,
+                            "mobility_inverse",
+                            move |_evaluation: &PointEvaluation| vec![DARCY_MOBILITY_INVERSE],
+                            move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
+                                vec![0.0]
+                            },
+                        )
+                    }
+                    InputSourceRequirement::ExternalValue => {
+                        let components = input.shape.iter().product::<usize>().max(1);
+                        let identity = if components == 1 {
+                            "source_term"
+                        } else {
+                            "body_force"
+                        };
+                        SystemConstitutiveInput::new(
+                            equation,
+                            integral_index,
+                            input_id,
+                            components,
+                            identity,
+                            move |_evaluation: &PointEvaluation| vec![0.0; components],
+                            move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
+                                vec![0.0; components]
+                            },
+                        )
+                    }
+                    other => panic!(
+                        "13-mixed-darcy.res declares an unexpected non-Basis input source {other:?}"
+                    ),
+                };
+                constitutive.push(binding.unwrap());
+            }
+        }
+    }
+    constitutive
+}
+
+/// Decisive acceptance (E6/Hdiv lane): drives the real `13-mixed-darcy.res` RT0-P0 system
+/// through `compile_operator_system` -> `derive_operator_structure_for_system` ->
+/// `SystemRealizationPlan::bind_kernels_with_facets` (real bound Malleus kernels, including the
+/// `darcy_law` Neumann `ExteriorFacet` integral) -> `methodus::solve_minres`, matching an
+/// independently hand-assembled dense reference.
+///
+/// The saddle-point coupling sign mirrors Stokes exactly (see this file's module doc comment):
+/// `darcy_law`'s `-integral(pressure * div(v))` term and `mass_balance`'s un-negated
+/// `+integral(q * div(flux))` term are exact negatives of the same underlying divergence
+/// coupling, confirmed empirically below by `prove_symmetry`, not assumed -- `equation_sign =
+/// {"mass_balance": -1.0}` restores genuine symmetry exactly as `{"incompressibility": -1.0}`
+/// did for Stokes.
+#[test]
+fn mixed_darcy_rt0_p0_system_realizes_and_minres_converges_matching_an_independent_dense_reference()
+{
+    let compiled = compile_darcy();
+    let mesh = darcy_box(2);
+    let facets = FacetTopology::from_mesh(&mesh.mesh).unwrap();
+    let (layout, compatible) = darcy_layout(&mesh.mesh, &facets, compiled.flux, compiled.pressure);
+    assert_eq!(compatible.hdiv.len(), mesh.mesh.cells().len());
+    let plan =
+        SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
+    assert!(
+        plan.compatible_dofs().is_some(),
+        "an Hdiv field must trigger FC8 compatible-DOF-map computation at SystemRealizationPlan::new"
+    );
+
+    let region = compiled
+        .system
+        .blocks
+        .iter()
+        .find(|block| block.equation == "darcy_law")
+        .unwrap()
+        .factorization
+        .integrals
+        .iter()
+        .find_map(|integral| match integral.measure {
+            SemanticMeasure::ExteriorFacet { region } => Some(region),
+            _ => None,
+        })
+        .expect("darcy_law declares an exterior-facet Neumann boundary integral");
+    let region_map = darcy_walls_region_map(region);
+    let facet_regions = facet_membership_from(&mesh, &region_map, [region]).unwrap();
+    assert_eq!(
+        facet_regions[&region].len(),
+        facets.exterior().count(),
+        "every exterior facet of the unit cube is `impermeable`"
+    );
+
+    let constitutive = darcy_constitutive(&compiled.system);
+    let equation_sign = BTreeMap::from([("mass_balance".to_string(), -1.0)]);
+    let operator = plan
+        .bind_kernels_with_facets(constitutive, equation_sign, facet_regions)
+        .unwrap();
+    let dimension = operator.dimension();
+    assert_eq!(
+        dimension,
+        compatible.hdiv_dof_count + mesh.mesh.cells().len()
+    );
+
+    let structure = operator.structure();
+    assert!(structure.saddle_point);
+    assert_eq!(structure.nullspace_candidates.len(), 1);
+    assert_eq!(structure.nullspace_candidates[0].field, compiled.pressure);
+
+    // Symmetry is not assumed: it is proven by assembly, and the proof is cached.
+    assert_eq!(operator.symmetry(), OperatorSymmetry::Unknown);
+    assert_eq!(
+        operator.prove_symmetry(1.0e-9).unwrap(),
+        OperatorSymmetry::Symmetric
+    );
+    assert_eq!(operator.symmetry(), OperatorSymmetry::Symmetric);
+
+    // No essential constraints at all for this case (confirmed above by the compiled system's
+    // empty `requirements.essential_constraints`, not assumed): both boundary conditions
+    // (`impermeable` on flux, none declared on pressure) are natural/weak.
+    let reduced = operator
+        .reduced(ConstraintSet::new(dimension, Vec::new()).unwrap())
+        .unwrap();
+    assert_eq!(reduced.symmetry(), OperatorSymmetry::Symmetric);
+
+    // A genuine finding, characterized rather than assumed: Scientia's structural nullspace
+    // heuristic (item 9) declares a `Constant` candidate on `pressure` for every block whose
+    // boundary conditions are all natural -- true for the *textbook* mixed-Darcy weak form
+    // (where a Neumann/impermeable condition contributes a pressure-dependent boundary term that
+    // exactly cancels the divergence coupling's own boundary flux). But `13-mixed-darcy.res`'s
+    // own compiled `darcy_law` Neumann integral (mission item 2's own facet extension) is a
+    // literal, input-independent `Constant{0.0}` (confirmed directly from the compiled
+    // `IntegralOperatorFactorization`, not assumed) -- it contributes nothing, so it does *not*
+    // cancel the boundary term the divergence coupling contributes on its own. Probing the
+    // realized (equation_sign-corrected) operator at the candidate's own constant-pressure mode
+    // confirms this precisely: the residual is *exactly* zero at every interior facet (both
+    // orientations of a shared facet cancel algebraically -- independent proof that this lane's
+    // RT0 orientation/divergence machinery is realized correctly) and *nonzero* at every exterior
+    // facet (the boundary term that should cancel it is the literal-zero Neumann integral). The
+    // discrete operator this literal corpus compiles to is therefore genuinely full rank (no
+    // constant-pressure nullspace, unlike the continuum problem or Scientia's own structural
+    // heuristic) -- confirmed below by a plain (unbordered) dense solve succeeding, not assumed.
+    let candidates = operator.nullspace_candidates();
+    assert_eq!(candidates.len(), 1);
+    let mode = candidates[0].resolve(operator.layout()).unwrap();
+    let flux_block = operator.layout().block(compiled.flux).unwrap();
+    let mut nullspace_probe = vec![0.0; dimension];
+    reduced
+        .apply(
+            &EvaluationContext::default(),
+            mode.vector(),
+            &mut nullspace_probe,
+        )
+        .unwrap();
+    let interior_residual: f64 = facets
+        .interior()
+        .map(|facet| nullspace_probe[flux_block.offset + facet.id.0].abs())
+        .sum();
+    let exterior_residual: f64 = facets
+        .exterior()
+        .map(|facet| nullspace_probe[flux_block.offset + facet.id.0].abs())
+        .sum();
+    assert!(
+        interior_residual < 1.0e-10,
+        "every interior facet's orientation-cancellation must hold exactly; got {interior_residual}"
+    );
+    assert!(
+        exterior_residual > 1.0e-6,
+        "the literal Constant{{0.0}} Neumann term should leave a genuine boundary residual \
+         against the naive constant-pressure mode; got {exterior_residual}"
+    );
+    assert!(
+        !mode.verify_in_kernel(&reduced, 1.0e-8).unwrap(),
+        "the naive constant-pressure mode is NOT exactly in this literal corpus's kernel (see \
+         the finding documented above) -- it should not silently verify"
+    );
+
+    // Known solution (no zero-mean gauge needed: the operator is genuinely nonsingular for this
+    // corpus, established above).
+    let pressure_block = operator.layout().block(compiled.pressure).unwrap();
+    let x_true = pseudo_random_vector(dimension, 130978);
+
+    let mut right_hand_side = vec![0.0; dimension];
+    reduced
+        .apply(&EvaluationContext::default(), &x_true, &mut right_hand_side)
+        .unwrap();
+
+    let config = MinresConfig {
+        max_iterations: 4 * dimension,
+        absolute_tolerance: 1.0e-12,
+        relative_tolerance: 1.0e-10,
+    };
+    let report = solve_minres(
+        &reduced,
+        None,
+        None,
+        &EvaluationContext::reproducible(),
+        &right_hand_side,
+        &vec![0.0; dimension],
+        &config,
     )
     .unwrap();
-    // Entity/component counts only need to satisfy `validate_components`'s shape check (this
-    // realization never reaches `build_field_elements`'s DOF-map construction); the vertex-major
-    // node map used here is not claimed to be a real RT0/P0 DOF map.
-    let layout = BlockLayout::new([
-        (
-            flux,
-            vector_nodal_dof_map(&mesh, 3).unwrap().dof_count() / 3,
-            3,
-        ),
-        (pressure, mesh.vertices().len(), 1),
-    ])
-    .unwrap();
-    let plan = SystemRealizationPlan::new(system, mesh.clone(), layout).unwrap();
+    assert!(
+        report.converged,
+        "minres did not converge on the RT0-P0 Darcy system"
+    );
+    println!(
+        "mixed-darcy RT0-P0: dimension {dimension}, minres converged in {} iterations",
+        report.trace.len()
+    );
+    assert_close(&report.solution, &x_true, 1.0e-6);
 
-    // `darcy_law` also carries a Neumann (`ExteriorFacet`) boundary integral, so the full
-    // two-equation system is refused by the facet-measure check (item 5) before ever reaching
-    // the element-family check; either refusal is a genuine, typed "not this lane's scope"
-    // rather than a fake Lagrange realization, so only the error *kind* is asserted here.
-    let error = plan.bind_kernels(Vec::new(), BTreeMap::new()).unwrap_err();
-    assert!(
-        matches!(error, FinitumError::UnsupportedRealization(_)),
-        "expected a typed UnsupportedRealization refusal, got: {error:?}"
+    // Independent cross-check: assemble the reduced operator by unit-column probing of
+    // `methodus::LinearOperator::apply` (not `SystemOperator::assemble`'s own CSR path) into a
+    // plain dense matrix (no gauge-fixing border needed -- the operator is genuinely nonsingular
+    // for this corpus, established above) and solve with the from-scratch dense Gaussian
+    // elimination shared with the Stokes decisive-acceptance test above (no shared code with
+    // `methodus`'s own CG/MINRES/GMRES implementations). `gaussian_eliminate_solve` itself
+    // asserts every pivot is non-negligible, so a singular `dense` would fail loudly here rather
+    // than silently, independently confirming the full-rank finding above.
+    let mut dense = vec![vec![0.0; dimension]; dimension];
+    let mut probe = vec![0.0; dimension];
+    for column in 0..dimension {
+        probe[column] = 1.0;
+        let mut output = vec![0.0; dimension];
+        reduced
+            .apply(&EvaluationContext::default(), &probe, &mut output)
+            .unwrap();
+        for row in 0..dimension {
+            dense[row][column] = output[row];
+        }
+        probe[column] = 0.0;
+    }
+    let dense_solution = gaussian_eliminate_solve(dense, right_hand_side.clone());
+    assert_close(&dense_solution, &report.solution, 1.0e-6);
+
+    let mut recovered = vec![0.0; dimension];
+    reduced
+        .apply(
+            &EvaluationContext::default(),
+            &report.solution,
+            &mut recovered,
+        )
+        .unwrap();
+    assert_close(&recovered, &right_hand_side, 1.0e-6);
+
+    // Solution-level evidence, reported honestly (no zero-mean pressure is expected or asserted
+    // here, per the full-rank finding documented above -- unlike the Stokes decisive-acceptance
+    // test, this system has no pressure gauge freedom to report against).
+    let pressure_mean = report.solution
+        [pressure_block.offset..pressure_block.offset + pressure_block.extent]
+        .iter()
+        .sum::<f64>()
+        / pressure_block.extent as f64;
+    let flux_norm = report.solution[flux_block.offset..flux_block.offset + flux_block.extent]
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    println!(
+        "mixed-darcy RT0-P0: pressure mean = {pressure_mean:e}, flux solution norm = {flux_norm:e}"
     );
 
-    // Isolate the Hdiv/L2(order=0) element-family refusal specifically: `mass_balance` alone has
-    // no facet integral (`impermeable` is attached only to `darcy_law`), so this reaches
-    // `build_field_elements`'s admitted-family check.
-    let source = fs::read_to_string(DARCY_CORPUS).unwrap();
-    let compilation = compile_semantics(&source, &UnitRegistry::si_bootstrap()).unwrap();
-    let mass_balance_system =
-        compile_operator_system(&compilation.semantic, "MixedDarcy", &["mass_balance"]).unwrap();
-    let mass_balance_layout = BlockLayout::new([
-        (
-            flux,
-            vector_nodal_dof_map(&mesh, 3).unwrap().dof_count() / 3,
-            3,
-        ),
-        (pressure, mesh.vertices().len(), 1),
-    ])
-    .unwrap();
-    let mass_balance_plan =
-        SystemRealizationPlan::new(mass_balance_system, mesh, mass_balance_layout).unwrap();
-    let element_error = mass_balance_plan
-        .bind_kernels(Vec::new(), BTreeMap::new())
-        .unwrap_err();
-    assert!(
-        matches!(element_error, FinitumError::UnsupportedRealization(_)),
-        "expected a typed UnsupportedRealization refusal, got: {element_error:?}"
-    );
-    let element_message = element_error.to_string();
-    assert!(
-        element_message.contains("H1") || element_message.contains("L2"),
-        "expected the refusal to name the admitted Lagrange families, got: {element_message}"
-    );
+    // `SystemOperator::load_vector`/`ReducedSystemOperator::load_vector` (E6-sysload) exercise
+    // the RT0 row field's PRIMAL path (`apply_block_cell_load`'s new field-kind dispatch) and the
+    // narrowly-scoped facet PRIMAL path (`apply_facets`), not just the JVP-based `apply_action`
+    // path this test's solve otherwise exercises: with every constitutive input bound to zero,
+    // both must be exactly zero.
+    let load = operator.load_vector().unwrap();
+    assert!(load.iter().all(|&value| value == 0.0));
+    let reduced_load = reduced.load_vector().unwrap();
+    assert!(reduced_load.iter().all(|&value| value == 0.0));
 }
 
 /// From-scratch dense Gaussian elimination with partial pivoting for a general square system --

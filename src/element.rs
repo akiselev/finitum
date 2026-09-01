@@ -322,6 +322,65 @@ pub fn simplex_basis(
     }
 }
 
+/// Number of RT0 (lowest-order Raviart-Thomas) facet-based basis functions on a `dimension`-
+/// simplex: exactly one per facet, i.e. `dimension + 1`.
+pub(crate) fn rt0_basis_count(dimension: usize) -> usize {
+    dimension + 1
+}
+
+/// RT0 reference-simplex basis: one facet-based vector basis function per local facet (the
+/// facet obtained by omitting local vertex `i`, matching `crate::topology`'s "omitted vertex"
+/// facet convention exactly -- the same convention [`crate::topology::CompatibleDofMaps::hdiv`]
+/// uses to build its per-cell restrictions/orientations), evaluated at one reference point.
+///
+/// Uses the standard construction `phi_i(x) = x - p_i`, where `p_i` is reference vertex `i`
+/// (`p_0` is the origin, `p_k` is the `k`-th standard basis vector for `k = 1..=dimension`).
+/// This satisfies `integral_{F_i} phi_i . n_i = 1` for the reference simplex's own outward
+/// normal at facet `i`, and zero flux through every other facet -- verified directly (not
+/// merely asserted) by this module's own tests. The reference divergence `div(phi_i) =
+/// dimension` is the same constant for every `i` (RT0's basis functions differ only in which
+/// vertex is subtracted, and `d/dx_k(x_k - p_i,k) = 1` regardless of `p_i`), so it is returned
+/// once rather than per basis function.
+///
+/// Returns `(values, divergence)`: `values[i]` is `phi_i(point)` (length `dimension`);
+/// `divergence` is the shared constant. Piola pushforward (`crate::mapping::AffineMap::
+/// contravariant_piola`/`map_hdiv_divergence`) maps these to physical space; per-cell DOF
+/// orientation correction is the caller's responsibility (this function is purely reference-
+/// space, mesh- and cell-independent).
+pub(crate) fn rt0_reference_basis(
+    dimension: usize,
+    point: &[f64],
+) -> Result<(Vec<Vec<f64>>, f64), FinitumError> {
+    if !(2..=3).contains(&dimension) {
+        return Err(FinitumError::InvalidDimension(dimension));
+    }
+    if point.len() != dimension || point.iter().any(|value| !value.is_finite()) {
+        return Err(FinitumError::InvalidElementShape(format!(
+            "reference point has dimension {}, expected {dimension} finite coordinates",
+            point.len()
+        )));
+    }
+    let vertex_count = dimension + 1;
+    let mut vertices = Vec::with_capacity(vertex_count);
+    vertices.push(vec![0.0; dimension]);
+    for axis in 0..dimension {
+        let mut vertex = vec![0.0; dimension];
+        vertex[axis] = 1.0;
+        vertices.push(vertex);
+    }
+    let values = vertices
+        .iter()
+        .map(|vertex| {
+            point
+                .iter()
+                .zip(vertex)
+                .map(|(coordinate, origin)| coordinate - origin)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    Ok((values, dimension as f64))
+}
+
 /// Six-point, degree-4-exact symmetric quadrature for the reference triangle `(0,0), (1,0),
 /// (0,1)` (area `1/2`), sufficient to exactly integrate a P2 mass-matrix-shaped (degree-4)
 /// integrand. Standard Dunavant/Strang-Fix constants.
@@ -397,4 +456,88 @@ fn gauss_legendre_unit_interval(count: usize) -> Vec<QuadraturePoint> {
     }
     points.sort_by(|left, right| left.coordinates[0].total_cmp(&right.coordinates[0]));
     points
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dot(left: &[f64], right: &[f64]) -> f64 {
+        left.iter().zip(right).map(|(a, b)| a * b).sum()
+    }
+
+    /// Independent reference-normal computation for the standard reference triangle
+    /// `(0,0),(1,0),(0,1)`: facet `i` is the facet opposite vertex `i`, matching this module's
+    /// own "omitted vertex" convention. Outward unit normals (unnormalized here, scaled by the
+    /// facet's own reference length) are hand-derived, not shared with `rt0_reference_basis`'s
+    /// own implementation.
+    fn triangle_facet_normal_and_length(facet: usize) -> ([f64; 2], f64) {
+        match facet {
+            0 => (
+                [
+                    1.0 / std::f64::consts::SQRT_2,
+                    1.0 / std::f64::consts::SQRT_2,
+                ],
+                std::f64::consts::SQRT_2,
+            ),
+            1 => ([-1.0, 0.0], 1.0),
+            2 => ([0.0, -1.0], 1.0),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rt0_reference_basis_reproduces_the_defining_flux_biorthogonality_on_the_triangle() {
+        // phi_i . n_i is constant along facet i (RT0's order-0 normal trace); sample at the
+        // facet's own midpoint and confirm the flux integral (constant * length) is exactly 1
+        // for the owning facet and exactly 0 for the other two, for every facet i.
+        let midpoints = [
+            [0.5, 0.5], // facet 0 (hypotenuse) midpoint
+            [0.0, 0.5], // facet 1 (x=0) midpoint
+            [0.5, 0.0], // facet 2 (y=0) midpoint
+        ];
+        for (facet, midpoint) in midpoints.iter().enumerate() {
+            let (values, divergence) = rt0_reference_basis(2, midpoint).unwrap();
+            assert_eq!(divergence, 2.0);
+            for (basis_index, basis_value) in values.iter().enumerate() {
+                let (normal, length) = triangle_facet_normal_and_length(facet);
+                let flux = dot(basis_value, &normal) * length;
+                let expected = if basis_index == facet { 1.0 } else { 0.0 };
+                assert!(
+                    (flux - expected).abs() < 1e-12,
+                    "facet {facet} basis {basis_index}: flux {flux}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rt0_reference_basis_divergence_matches_a_finite_difference_of_the_values() {
+        let point = [0.2, 0.3];
+        let h = 1e-6;
+        let (values, divergence) = rt0_reference_basis(2, &point).unwrap();
+        for basis in &values {
+            // div(phi) = d(phi_x)/dx + d(phi_y)/dy; phi_i(x,y) = (x,y) - p_i is affine, so a
+            // centered difference is exact up to floating-point roundoff.
+            let (plus_x, _) = rt0_reference_basis(2, &[point[0] + h, point[1]]).unwrap();
+            let (minus_x, _) = rt0_reference_basis(2, &[point[0] - h, point[1]]).unwrap();
+            let (plus_y, _) = rt0_reference_basis(2, &[point[0], point[1] + h]).unwrap();
+            let (minus_y, _) = rt0_reference_basis(2, &[point[0], point[1] - h]).unwrap();
+            let index = values
+                .iter()
+                .position(|candidate| candidate == basis)
+                .unwrap();
+            let d_dx = (plus_x[index][0] - minus_x[index][0]) / (2.0 * h);
+            let d_dy = (plus_y[index][1] - minus_y[index][1]) / (2.0 * h);
+            assert!((d_dx + d_dy - divergence).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn rt0_reference_basis_refuses_wrong_dimension_and_nonfinite_points() {
+        assert!(rt0_reference_basis(1, &[0.5]).is_err());
+        assert!(rt0_reference_basis(4, &[0.1, 0.1, 0.1, 0.1]).is_err());
+        assert!(rt0_reference_basis(2, &[0.1, f64::NAN]).is_err());
+        assert!(rt0_reference_basis(2, &[0.1]).is_err());
+    }
 }
