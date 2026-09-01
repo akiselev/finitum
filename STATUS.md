@@ -1,8 +1,9 @@
 # Finitum status
 
-Updated: 2026-08-31
+Updated: 2026-09-01
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
-SV2-B1 P2 elements/mixed product layouts + SV2-B4 start (block operator composition)
+SV2-B1 P2 elements/mixed product layouts + SV2-B4 (block operator composition, essential-
+constraint elimination, and content-addressed identity)
 
 ## Implemented
 
@@ -122,6 +123,22 @@ SV2-B1 P2 elements/mixed product layouts + SV2-B4 start (block operator composit
   from GX-CONTRACTS C5.4) that resolves against a `BlockLayout` into the exact unit-norm
   constant-mode vector and a `methodus::ConstantModeProjector` a downstream MINRES-family solver
   (SV2-B6) would consume; no solver algorithm is implemented here.
+- SV2-B4 continuation: essential-constraint/Dirichlet elimination for `MixedOperator`
+  (`BlockEssentialValue`/`essential_constraints_for_blocks`, block-local declarations lifted into
+  a global `ConstraintSet` via `BlockLayout` offsets, mirroring `essential_constraints_from`'s
+  DOF-indexing convention without the `TaggedMesh`/`RegionMap` wiring it has) and
+  `MixedOperator::apply_reduced_action`/`reduced` (`ReducedMixedOperator`), which mirror
+  `RealizationPlan::apply_direction`'s identity-row/zero-column treatment exactly. On the
+  existing vector-P2/scalar-P1 saddle-point fixture with Dirichlet-constrained boundary `field_a`
+  DOFs, `BlockNullspaceCandidate::verify_in_kernel` now passes against the reduced operator (the
+  unconstrained-operator demonstration is unchanged and still documents a true property), a
+  `methodus::solve_minres` solve with the resolved `ConstantModeProjector` converges and matches
+  an independently-derived dense reduced reference, and `ReducedMixedOperator` declares
+  `Symmetric` by an analytic argument (proved in its doc comment, not by assembly) whenever its
+  constraints carry no affine dependency. `MixedOperator::digest()` is now a content-addressed
+  identity over space and couplings (mirroring `RealizationPlan::digest()`), and a P2 vector
+  test / P2 *scalar* trial `DivergenceValue` coupling (SV2-B1's deferred order-generic exercise)
+  is now covered against an independently-derived reference.
 
 ## Boundary
 
@@ -269,11 +286,18 @@ nonuniform sheared affine patch above remains the independent realization oracle
 - Superseded by SV2-B1 (this milestone): `RealizationPlan` now admits H1 order 1 *or* 2 (one
   order per plan; a P2 exterior-facet integral is refused typed, since GX-C4's trace basis
   stays hardcoded P1). `SystemRealizationPlan` itself remains planning-only (no residual, JVP,
-  or operator). Genuine multi-order product layouts and block operators with off-diagonals now
-  exist as a separate, additive structural module (`mixed::MixedSpace`/`MixedOperator`, SV2-B1/
-  B4 start) that bypasses Scientia forms/Malleus kernels entirely -- they are not wired into
-  `RealizationPlan` or `SystemRealizationPlan`, and `MixedOperator` represents no forcing term
-  (its `residual`/`jacobian_vector_product` are the same linear action).
+  or operator; no `DofMap`/`ConstraintSet`/bound Malleus executables/external inputs; its own
+  `artifact_digest()` hashes only system+mesh+layout+facet *count*, not concrete content the way
+  `RealizationPlan::digest()` does). Genuine multi-order product layouts and block operators with
+  off-diagonals now exist as a separate, additive structural module (`mixed::MixedSpace`/
+  `MixedOperator`, SV2-B1/B4) that bypasses Scientia forms/Malleus kernels entirely -- they are
+  not wired into `RealizationPlan` or `SystemRealizationPlan`, and `MixedOperator` represents no
+  forcing term (its `residual`/`jacobian_vector_product` are the same linear action).
+  `MixedOperator` now supports essential-constraint elimination (`reduced`/
+  `ReducedMixedOperator`) and a content-addressed `digest()` (SV2-B4 continuation), but this is
+  still entirely structural machinery: no Scientia-form/Malleus-kernel-driven saddle-point case
+  can execute through it or through `SystemRealizationPlan` yet (see "Next" below and the SV2-B4
+  batch report's realization inventory for the precise gap list).
 
 ## Next
 
@@ -287,9 +311,10 @@ representation).
 
 Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
 
-1. SV2-B4 continuation: essential-constraint/Dirichlet-elimination handling
-   for `MixedOperator` (the reason the pure-Dirichlet pressure-nullspace
-   candidate is representation-only today);
+1. Done (SV2-B4 continuation): essential-constraint/Dirichlet-elimination handling
+   for `MixedOperator` (`reduced`/`ReducedMixedOperator`/`essential_constraints_for_blocks`) --
+   the pure-Dirichlet pressure-nullspace candidate now verifies against the reduced operator and
+   solves under MINRES with the resolved `ConstantModeProjector`;
 2. exterior-facet **element assembly** — `RealizationPlan::assemble` and its
    partial/geometry-sensitivity paths still hard-refuse facet integrals
    (GX-C4 landed the matrix-free path only; registered as a follow-up in
@@ -298,7 +323,15 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    degree-4-exact tetrahedron quadrature rule for honest 3-D P2 claims;
 4. wiring mixed/multi-order product layouts into the Scientia-form/
    Malleus-kernel realization path (`SystemRealizationPlan` is still
-   planning-only) as the SV2-B7 Stokes acceptance case demands it;
+   planning-only) as the SV2-B7 Stokes acceptance case demands it -- the SV2-B4
+   batch report carries a precise inventory of what this needs (per-block
+   `DofMap` construction beyond P1/P2 Lagrange, `bind_kernels`-equivalent
+   per-`(row, column)` executables, a monolithic multi-block apply/scatter,
+   region-tag-driven multi-field essential constraints, facet region/geometry
+   binding, external inputs per block, a content-addressed
+   `SystemRealizationPlan::digest()`, and threading Scientia's `OperatorStructure`
+   (C5.4) through to a realized operator's declared `OperatorProperties` so
+   Sinbad's C5.3 admissibility table can route a saddle-point case to MINRES);
 5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
    under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).
 

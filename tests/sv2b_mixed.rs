@@ -7,14 +7,19 @@
 //! (no named physics anywhere in this file or in `finitum::mixed`).
 
 use finitum::{
-    AffineMap, BlockCoupling, BlockLayout, BlockNullspaceCandidate, Cell, CellId, CouplingKind,
-    FieldSpec, FinitumError, Mesh, MixedOperator, MixedSpace, VertexId, simplex_basis,
+    AffineMap, BlockCoupling, BlockEssentialValue, BlockLayout, BlockNullspaceCandidate, Cell,
+    CellId, CouplingKind, FieldSpec, FinitumError, Mesh, MixedOperator, MixedSpace, VertexId,
+    essential_constraints_for_blocks, simplex_basis,
 };
-use methodus::{BlockLinearOperator, LinearOperator, check_properties_consistency};
+use methodus::{
+    BlockLinearOperator, EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector,
+    check_properties_consistency, solve_minres,
+};
 use scientia::SymbolId;
 
 const FIELD_A: SymbolId = SymbolId(0);
 const FIELD_B: SymbolId = SymbolId(1);
+const FIELD_C: SymbolId = SymbolId(2);
 
 fn unit_square_mesh(subdivisions: usize) -> Mesh {
     let width = subdivisions + 1;
@@ -246,7 +251,8 @@ fn mixed_operator_refuses_malformed_couplings() {
 fn block_apply_agrees_with_an_independently_assembled_monolithic_reference() {
     let space = fixture_space(2);
     let couplings = fixture_couplings();
-    let reference = independent_reference_matrix(&space, &couplings);
+    let reference =
+        independent_reference_matrix(&space, &couplings, &independent_triangle_quadrature());
     let operator = MixedOperator::new(space, couplings).unwrap();
     let dimension = operator.dimension();
     assert_eq!(reference.len(), dimension * dimension);
@@ -390,6 +396,383 @@ fn nullspace_candidate_refuses_unknown_or_non_scalar_blocks_and_bad_tolerances()
     ));
 }
 
+/// SV2-B4: Dirichlet elimination of the boundary `field_a` degrees of freedom completes the
+/// honest demonstration `pressure_like_nullspace_candidate_round_trips_and_matches_expected_structure`
+/// leaves open above -- the constant pressure mode is only in the kernel of the *reduced*
+/// system, not the raw unconstrained one. This builds that reduced system with
+/// `MixedOperator::reduced` over `finitum::essential_constraints_for_blocks` and shows
+/// `verify_in_kernel` now passes against it, and that the reduced action matches an
+/// independently-derived dense reduced reference: the same independent monolithic reference
+/// `block_apply_agrees_with_an_independently_assembled_monolithic_reference` uses, with the
+/// identity-row/zero-column elimination transform applied directly in this test -- not through
+/// any code path shared with `MixedOperator::apply_reduced_action`.
+#[test]
+fn dirichlet_elimination_makes_the_pressure_nullspace_candidate_verify_against_the_reduced_operator()
+ {
+    let space = fixture_space(3);
+    let couplings = fixture_couplings();
+    let reference =
+        independent_reference_matrix(&space, &couplings, &independent_triangle_quadrature());
+    let layout: BlockLayout = space.layout().clone();
+    let boundary_a = boundary_field_a_dofs(&space);
+    let field_a = layout.block(FIELD_A).unwrap();
+    let components = space.field(FIELD_A).unwrap().components;
+    let operator = MixedOperator::new(space, couplings).unwrap();
+    let dimension = operator.dimension();
+    assert_eq!(reference.len(), dimension * dimension);
+
+    let constrained_dofs = boundary_a
+        .iter()
+        .enumerate()
+        .filter(|(_, constrained)| **constrained)
+        .map(|(local, _)| field_a.offset + local)
+        .collect::<Vec<_>>();
+    assert!(
+        !constrained_dofs.is_empty(),
+        "fixture must have at least one boundary field_a dof"
+    );
+    let constraints = essential_constraints_for_blocks(
+        &layout,
+        boundary_a
+            .iter()
+            .enumerate()
+            .filter(|(_, constrained)| **constrained)
+            .map(|(local, _)| BlockEssentialValue {
+                block: FIELD_A,
+                entity: local / components,
+                component: local % components,
+                value: 0.0,
+            }),
+    )
+    .unwrap();
+
+    let dense_reduced_reference = eliminate_dense(&reference, dimension, &constrained_dofs);
+
+    let reduced = operator.reduced(constraints).unwrap();
+    for seed in 0..5u64 {
+        let input = pseudo_random_vector(dimension, seed + 200);
+        let mut actual = vec![0.0; dimension];
+        reduced
+            .apply(&EvaluationContext::default(), &input, &mut actual)
+            .unwrap();
+        let expected = dense_matvec(&dense_reduced_reference, dimension, &input);
+        assert_close(&actual, &expected, 5.0e-11);
+    }
+
+    assert_eq!(reduced.symmetry(), methodus::OperatorSymmetry::Symmetric);
+    check_properties_consistency(&reduced).unwrap();
+
+    let candidate = BlockNullspaceCandidate::constant(FIELD_B, "field_a carries no Dirichlet data");
+    let mode = candidate.resolve(&layout).unwrap();
+    assert!(
+        mode.verify_in_kernel(&reduced, 1.0e-9).unwrap(),
+        "the constant pressure mode should now verify in the kernel of the reduced operator"
+    );
+}
+
+/// SV2-B4 acceptance (b): a `methodus::solve_minres` solve over `MixedOperator::reduced`'s
+/// output, using the resolved `ConstantModeProjector`, converges on the reduced saddle-point
+/// system and matches an independently-derived dense reduced reference (the same elimination
+/// transform as the test above, applied to a right-hand side generated from a known solution).
+#[test]
+fn minres_converges_on_the_reduced_saddle_point_system_and_matches_a_dense_reduced_reference() {
+    let space = fixture_space(3);
+    let couplings = fixture_couplings();
+    let reference =
+        independent_reference_matrix(&space, &couplings, &independent_triangle_quadrature());
+    let layout: BlockLayout = space.layout().clone();
+    let boundary_a = boundary_field_a_dofs(&space);
+    let field_a = layout.block(FIELD_A).unwrap();
+    let field_b = layout.block(FIELD_B).unwrap();
+    let components = space.field(FIELD_A).unwrap().components;
+    let operator = MixedOperator::new(space, couplings).unwrap();
+    let dimension = operator.dimension();
+
+    let constrained_dofs = boundary_a
+        .iter()
+        .enumerate()
+        .filter(|(_, constrained)| **constrained)
+        .map(|(local, _)| field_a.offset + local)
+        .collect::<Vec<_>>();
+    let constraints = essential_constraints_for_blocks(
+        &layout,
+        boundary_a
+            .iter()
+            .enumerate()
+            .filter(|(_, constrained)| **constrained)
+            .map(|(local, _)| BlockEssentialValue {
+                block: FIELD_A,
+                entity: local / components,
+                component: local % components,
+                value: 0.0,
+            }),
+    )
+    .unwrap();
+
+    let dense_reduced_reference = eliminate_dense(&reference, dimension, &constrained_dofs);
+
+    // A known solution respecting the homogeneous Dirichlet data and lying in the orthogonal
+    // complement of the declared constant-pressure nullspace (zero-mean on field_b), so the
+    // generated right-hand side is exactly consistent and MINRES's projected iterates converge
+    // to it rather than to some nullspace-shifted variant.
+    let mut x_true = pseudo_random_vector(dimension, 777);
+    for &t in &constrained_dofs {
+        x_true[t] = 0.0;
+    }
+    let pressure_mean = x_true[field_b.offset..field_b.offset + field_b.extent]
+        .iter()
+        .sum::<f64>()
+        / field_b.extent as f64;
+    for value in &mut x_true[field_b.offset..field_b.offset + field_b.extent] {
+        *value -= pressure_mean;
+    }
+
+    let right_hand_side = dense_matvec(&dense_reduced_reference, dimension, &x_true);
+
+    let reduced = operator.reduced(constraints).unwrap();
+    let mode = BlockNullspaceCandidate::constant(FIELD_B, "field_a carries no Dirichlet data")
+        .resolve(&layout)
+        .unwrap();
+    assert!(mode.verify_in_kernel(&reduced, 1.0e-9).unwrap());
+
+    let config = MinresConfig {
+        max_iterations: 2_000,
+        absolute_tolerance: 1.0e-12,
+        relative_tolerance: 1.0e-10,
+    };
+    let report = solve_minres(
+        &reduced,
+        None,
+        Some(mode.projector() as &dyn NullspaceProjector),
+        &EvaluationContext::default(),
+        &right_hand_side,
+        &vec![0.0; dimension],
+        &config,
+    )
+    .unwrap();
+    assert!(
+        report.converged,
+        "minres did not converge on the reduced system"
+    );
+
+    assert_close(&report.solution, &x_true, 1.0e-6);
+    let recovered = dense_matvec(&dense_reduced_reference, dimension, &report.solution);
+    assert_close(&recovered, &right_hand_side, 1.0e-6);
+}
+
+#[test]
+fn reduced_refuses_a_constraint_set_of_the_wrong_dimension() {
+    let space = fixture_space(1);
+    let couplings = fixture_couplings();
+    let operator = MixedOperator::new(space, couplings).unwrap();
+    let mismatched = essential_constraints_for_blocks(
+        &BlockLayout::new(vec![(FIELD_A, 3, 1)]).unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(matches!(
+        operator.reduced(mismatched).unwrap_err(),
+        FinitumError::InvalidRealization(_)
+    ));
+}
+
+#[test]
+fn essential_constraints_for_blocks_refuses_unknown_blocks_out_of_range_entries_and_conflicts() {
+    let space = fixture_space(1);
+    let layout: BlockLayout = space.layout().clone();
+
+    assert!(matches!(
+        essential_constraints_for_blocks(
+            &layout,
+            vec![BlockEssentialValue {
+                block: SymbolId(99),
+                entity: 0,
+                component: 0,
+                value: 0.0,
+            }],
+        )
+        .unwrap_err(),
+        FinitumError::InvalidRealization(_)
+    ));
+    let field_a = layout.block(FIELD_A).unwrap();
+    assert!(matches!(
+        essential_constraints_for_blocks(
+            &layout,
+            vec![BlockEssentialValue {
+                block: FIELD_A,
+                entity: field_a.entity_count,
+                component: 0,
+                value: 0.0,
+            }],
+        )
+        .unwrap_err(),
+        FinitumError::InvalidRealization(_)
+    ));
+    assert!(matches!(
+        essential_constraints_for_blocks(
+            &layout,
+            vec![BlockEssentialValue {
+                block: FIELD_A,
+                entity: 0,
+                component: field_a.component_count,
+                value: 0.0,
+            }],
+        )
+        .unwrap_err(),
+        FinitumError::InvalidRealization(_)
+    ));
+    assert!(matches!(
+        essential_constraints_for_blocks(
+            &layout,
+            vec![BlockEssentialValue {
+                block: FIELD_A,
+                entity: 0,
+                component: 0,
+                value: f64::NAN,
+            }],
+        )
+        .unwrap_err(),
+        FinitumError::InvalidRealization(_)
+    ));
+    // Two declarations targeting the same degree of freedom are refused via `ConstraintSet::new`.
+    assert!(
+        essential_constraints_for_blocks(
+            &layout,
+            vec![
+                BlockEssentialValue {
+                    block: FIELD_A,
+                    entity: 0,
+                    component: 0,
+                    value: 0.0,
+                },
+                BlockEssentialValue {
+                    block: FIELD_A,
+                    entity: 0,
+                    component: 0,
+                    value: 1.0,
+                },
+            ],
+        )
+        .is_err()
+    );
+}
+
+/// SV2-B4: `MixedOperator::digest()` is content-addressed over space (mesh and field specs) and
+/// couplings, mirroring `RealizationPlan::digest()` -- unlike
+/// `krasis::block_solve::operator_identity`'s shape-only identity, it distinguishes two
+/// operators that share a block layout but differ in coupling scale or mesh refinement.
+#[test]
+fn digest_is_content_addressed_over_space_and_couplings() {
+    let operator_a = MixedOperator::new(fixture_space(2), fixture_couplings()).unwrap();
+    let operator_b = MixedOperator::new(fixture_space(2), fixture_couplings()).unwrap();
+    assert_eq!(operator_a.digest(), operator_b.digest());
+
+    let mut rescaled = fixture_couplings();
+    rescaled[0].scale = 2.0;
+    let operator_c = MixedOperator::new(fixture_space(2), rescaled).unwrap();
+    assert_ne!(operator_a.digest(), operator_c.digest());
+
+    let operator_d = MixedOperator::new(fixture_space(4), fixture_couplings()).unwrap();
+    assert_ne!(operator_a.digest(), operator_d.digest());
+}
+
+fn fixture_space_p2_scalar_trial(subdivisions: usize) -> MixedSpace {
+    MixedSpace::new(
+        unit_square_mesh(subdivisions),
+        vec![
+            FieldSpec {
+                symbol: FIELD_A,
+                order: 2,
+                components: 2,
+            },
+            FieldSpec {
+                symbol: FIELD_C,
+                order: 2,
+                components: 1,
+            },
+        ],
+    )
+    .unwrap()
+}
+
+fn fixture_couplings_p2_scalar_trial() -> Vec<BlockCoupling> {
+    vec![
+        BlockCoupling {
+            test: FIELD_A,
+            trial: FIELD_A,
+            kind: CouplingKind::GradientGradient,
+            scale: 1.0,
+        },
+        BlockCoupling {
+            test: FIELD_A,
+            trial: FIELD_C,
+            kind: CouplingKind::DivergenceValue,
+            scale: 1.0,
+        },
+    ]
+}
+
+/// SV2-B1's own deferred item: `local_divergence_value`'s test/trial order parameters are
+/// independent (order-generic), but every fixture above pairs a P2 vector test field with a P1
+/// scalar trial field. This exercises the previously-unexercised P2 vector / P2 *scalar* trial
+/// pairing against the same independently-derived monolithic reference the P2/P1 fixture uses.
+#[test]
+fn divergence_value_coupling_agrees_with_reference_for_a_p2_scalar_trial_field() {
+    let space = fixture_space_p2_scalar_trial(2);
+    let couplings = fixture_couplings_p2_scalar_trial();
+    let reference = independent_reference_matrix(
+        &space,
+        &couplings,
+        &independent_higher_order_triangle_quadrature(),
+    );
+    let operator = MixedOperator::new(space, couplings).unwrap();
+    let dimension = operator.dimension();
+    assert_eq!(reference.len(), dimension * dimension);
+
+    for seed in 0..5u64 {
+        let input = pseudo_random_vector(dimension, seed + 300);
+        let mut actual = vec![0.0; dimension];
+        operator.apply_action(&input, &mut actual).unwrap();
+        let expected = dense_matvec(&reference, dimension, &input);
+        assert_close(&actual, &expected, 5.0e-11);
+    }
+
+    let assembled = operator.assemble().unwrap();
+    let mut dense_assembled = vec![0.0; dimension * dimension];
+    for row in 0..assembled.rows() {
+        for entry in assembled.row_offsets()[row]..assembled.row_offsets()[row + 1] {
+            dense_assembled[row * dimension + assembled.column_indices()[entry]] =
+                assembled.values()[entry];
+        }
+    }
+    assert_close(&dense_assembled, &reference, 5.0e-11);
+    assert_eq!(operator.symmetry(), methodus::OperatorSymmetry::Symmetric);
+    check_properties_consistency(&operator).unwrap();
+
+    let block_layout = operator.block_layout();
+    assert_eq!(block_layout.blocks().len(), 2);
+    assert_eq!(block_layout.dimension(), dimension);
+}
+
+/// Applies the identity-row/zero-column Dirichlet elimination transform directly to a dense
+/// matrix: row `t` becomes the identity row, column `t` is zeroed everywhere else. This is the
+/// dense-matrix definition of what `MixedOperator::apply_reduced_action` computes matrix-free,
+/// derived independently in this test rather than by calling into `finitum::mixed`.
+fn eliminate_dense(matrix: &[f64], dimension: usize, constrained: &[usize]) -> Vec<f64> {
+    let mut eliminated = matrix.to_vec();
+    for &t in constrained {
+        for column in 0..dimension {
+            eliminated[t * dimension + column] = if column == t { 1.0 } else { 0.0 };
+        }
+        for row in 0..dimension {
+            if row != t {
+                eliminated[row * dimension + t] = 0.0;
+            }
+        }
+    }
+    eliminated
+}
+
 fn boundary_field_a_dofs(space: &MixedSpace) -> Vec<bool> {
     let node_points = quadratic_simplex_node_points_for(space);
     let components = space.field(FIELD_A).unwrap().components;
@@ -441,16 +824,19 @@ fn assert_close(actual: &[f64], expected: &[f64], tolerance: f64) {
     }
 }
 
-/// Independent monolithic reference, built with this test's own 3-point degree-2 triangle
-/// quadrature and its own nested loops -- deliberately not sharing code with
-/// `finitum::mixed`'s (private) local-matrix builders, which use a different (6-point
-/// degree-4) quadrature rule. Both rules integrate these polynomial integrands (degree <= 2)
-/// exactly, so entrywise agreement to near machine precision is a genuine two-derivation check.
-fn independent_reference_matrix(space: &MixedSpace, couplings: &[BlockCoupling]) -> Vec<f64> {
+/// Independent monolithic reference, built with a caller-supplied quadrature rule and this
+/// test's own nested loops -- deliberately not sharing code with `finitum::mixed`'s (private)
+/// local-matrix builders, which use a different (6-point degree-4) quadrature rule. Callers pick
+/// a rule exact enough for their fixture's integrand degree; see
+/// [`independent_triangle_quadrature`] and [`independent_higher_order_triangle_quadrature`].
+fn independent_reference_matrix(
+    space: &MixedSpace,
+    couplings: &[BlockCoupling],
+    quadrature: &[(f64, f64, f64)],
+) -> Vec<f64> {
     let dimension = space.layout().extent();
     let mesh_dimension = space.mesh().dimension();
     let mut matrix = vec![0.0; dimension * dimension];
-    let quadrature = independent_triangle_quadrature();
     for cell in 0..space.mesh().cells().len() {
         let map = AffineMap::from_cell(space.mesh(), CellId(cell)).unwrap();
         for coupling in couplings {
@@ -460,7 +846,7 @@ fn independent_reference_matrix(space: &MixedSpace, couplings: &[BlockCoupling])
                     let block = space.layout().block(coupling.test).unwrap();
                     let restriction = &space.dof_map(coupling.test).unwrap().restrictions()[cell];
                     let basis_count = restriction.dofs.len() / field.components;
-                    for &(x, y, weight) in &quadrature {
+                    for &(x, y, weight) in quadrature {
                         let (_, gradients) =
                             simplex_basis(mesh_dimension, field.order, &[x, y]).unwrap();
                         let physical = gradients
@@ -496,7 +882,7 @@ fn independent_reference_matrix(space: &MixedSpace, couplings: &[BlockCoupling])
                         &space.dof_map(coupling.trial).unwrap().restrictions()[cell];
                     let test_basis_count = test_restriction.dofs.len() / test_field.components;
                     let trial_basis_count = trial_restriction.dofs.len();
-                    for &(x, y, weight) in &quadrature {
+                    for &(x, y, weight) in quadrature {
                         let (_, test_gradients) =
                             simplex_basis(mesh_dimension, test_field.order, &[x, y]).unwrap();
                         let (trial_values, _) =
@@ -546,4 +932,32 @@ fn independent_triangle_quadrature() -> Vec<(f64, f64, f64)> {
         .into_iter()
         .map(|(x, y)| (x, y, AREA / 3.0))
         .collect()
+}
+
+/// A 9-point triangle quadrature built by a Duffy (collapsed-square) transform of 3-point
+/// Gauss-Legendre in each direction (`x = s * (1 - t)`, `y = t`, Jacobian `1 - t`) -- a
+/// fundamentally different construction from both [`independent_triangle_quadrature`]'s
+/// symmetric barycentric rule and `finitum::element`'s own 6-point Dunavant-style symmetric
+/// rule. Exact well beyond the degree-3 integrand a P2-vector/P2-scalar `DivergenceValue`
+/// coupling produces (`div(P2) * P2` has total degree `1 + 2 = 3`), needed because
+/// [`independent_triangle_quadrature`] is calibrated only for the degree-2 integrands the
+/// crate's other fixtures produce.
+fn independent_higher_order_triangle_quadrature() -> Vec<(f64, f64, f64)> {
+    // 3-point Gauss-Legendre nodes/weights on [-1, 1], mapped to [0, 1].
+    let root = (3.0_f64 / 5.0).sqrt();
+    let nodes_1d = [(-root, 5.0 / 9.0), (0.0, 8.0 / 9.0), (root, 5.0 / 9.0)];
+    let mut points = Vec::with_capacity(9);
+    for (gs, ws) in nodes_1d {
+        let s = (gs + 1.0) / 2.0;
+        let weight_s = ws / 2.0;
+        for (gt, wt) in nodes_1d {
+            let t = (gt + 1.0) / 2.0;
+            let weight_t = wt / 2.0;
+            let x = s * (1.0 - t);
+            let y = t;
+            let weight = weight_s * weight_t * (1.0 - t);
+            points.push((x, y, weight));
+        }
+    }
+    points
 }

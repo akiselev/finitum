@@ -34,9 +34,41 @@ dependencies = [
 name = "cadabra-brep"
 version = "0.1.0"
 dependencies = [
+ "cadabra-geometry",
+ "cadabra-math",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "cadabra-geometry"
+version = "0.1.0"
+dependencies = [
+ "cadabra-math",
+ "cadabra-number",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "cadabra-math"
+version = "0.1.0"
+dependencies = [
+ "cadabra-number",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "cadabra-number"
+version = "0.1.0"
+dependencies = [
+ "resolvent",
+ "serde",
  "thiserror",
 ]
 

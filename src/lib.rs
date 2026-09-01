@@ -40,8 +40,9 @@ pub use method::{
     ParticleRealization, RadialPairPolynomial,
 };
 pub use mixed::{
-    BlockCoupling, BlockNullspaceCandidate, BlockNullspaceMode, CouplingKind, FieldSpec,
-    MixedOperator, MixedSpace, NullspaceModeKind,
+    BlockCoupling, BlockEssentialValue, BlockNullspaceCandidate, BlockNullspaceMode, CouplingKind,
+    FieldSpec, MixedOperator, MixedSpace, NullspaceModeKind, ReducedMixedOperator,
+    essential_constraints_for_blocks,
 };
 pub use optimized::{
     AcceleratorLayout, CellBatchLayout, ElementAssemblyOperator, PartialAssemblyOperator,

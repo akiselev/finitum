@@ -22,10 +22,12 @@ use crate::block::BlockLayout;
 use crate::element::{simplex_basis, simplex_basis_count, simplex_quadrature};
 use crate::mapping::AffineMap;
 use crate::mesh::{CellId, Mesh};
-use crate::space::{DofMap, quadratic_simplex_dof_map, vector_nodal_dof_map};
-use crate::{FinitumError, QuadraturePoint};
-use methodus::{ConstantModeProjector, CsrMatrix, EvaluationContext, LinearOperator};
-use scientia::SymbolId;
+use crate::space::{DofId, DofMap, quadratic_simplex_dof_map, vector_nodal_dof_map};
+use crate::{AffineConstraint, ConstraintSet, FinitumError, QuadraturePoint};
+use methodus::{
+    BlockLinearOperator, ConstantModeProjector, CsrMatrix, EvaluationContext, LinearOperator,
+};
+use scientia::{Digest, SymbolId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -155,7 +157,8 @@ impl MixedSpace {
 /// A generic structural bilinear pairing between two blocks of a [`MixedSpace`], evaluated at a
 /// shared quadrature rule. No named physics: these are textbook bilinear-form shapes, reused
 /// wherever a scientific model needs them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CouplingKind {
     /// `integral(grad(test) . grad(trial))`, decoupled across components (component `c` of the
     /// test field pairs only with component `c` of the trial field). A diagonal (self) block:
@@ -170,12 +173,74 @@ pub enum CouplingKind {
 }
 
 /// One declared coupling contribution to a [`MixedOperator`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct BlockCoupling {
     pub test: SymbolId,
     pub trial: SymbolId,
     pub kind: CouplingKind,
     pub scale: f64,
+}
+
+/// One essential (Dirichlet) value on one field's block-local degree of freedom: `entity` is a
+/// node index in the field's own numbering (the same convention [`BlockLayout::gather`] and
+/// [`BlockLayout::scatter_add`] use for their `entities` argument), `component` is a zero-based
+/// component index (`< field.components`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockEssentialValue {
+    pub block: SymbolId,
+    pub entity: usize,
+    pub component: usize,
+    pub value: f64,
+}
+
+/// Builds a global [`ConstraintSet`] of Fixed (no-dependency) essential constraints from
+/// block-local declarations, lifting each `(block, entity, component)` into `layout`'s
+/// monolithic degree-of-freedom numbering via each block's `offset` and the same
+/// `entity * component_count + component` convention [`BlockLayout::gather`]/
+/// [`BlockLayout::scatter_add`] use. Mirrors [`crate::essential_constraints_from`]'s
+/// DOF-indexing convention at the block level; unlike it, this function has no region-tag or
+/// mesh dependency, since [`MixedSpace`] carries no `TaggedMesh` wiring today (see the SV2-B4
+/// realization inventory). Refuses an unknown block, an out-of-range entity or component, a
+/// non-finite value, or -- via [`ConstraintSet::new`] -- two declarations targeting the same
+/// degree of freedom.
+pub fn essential_constraints_for_blocks(
+    layout: &BlockLayout,
+    values: impl IntoIterator<Item = BlockEssentialValue>,
+) -> Result<ConstraintSet, FinitumError> {
+    let mut constraints = Vec::new();
+    for value in values {
+        let block = layout.block(value.block).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "essential value names block {} which is absent from the layout",
+                value.block
+            ))
+        })?;
+        if value.entity >= block.entity_count {
+            return Err(FinitumError::InvalidRealization(format!(
+                "essential value entity {} is outside block {}'s {} entities",
+                value.entity, value.block, block.entity_count
+            )));
+        }
+        if value.component >= block.component_count {
+            return Err(FinitumError::InvalidRealization(format!(
+                "essential value component {} is outside block {}'s {} components",
+                value.component, value.block, block.component_count
+            )));
+        }
+        if !value.value.is_finite() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "essential value for block {} entity {} component {} is not finite",
+                value.block, value.entity, value.component
+            )));
+        }
+        let target = DofId(block.offset + value.entity * block.component_count + value.component);
+        constraints.push(AffineConstraint {
+            target,
+            dependencies: Vec::new(),
+            offset: value.value,
+        });
+    }
+    ConstraintSet::new(layout.extent(), constraints)
 }
 
 /// Block-and-coupling-operator composition over one [`MixedSpace`], into a single monolithic
@@ -193,6 +258,7 @@ pub struct MixedOperator {
     couplings: Vec<BlockCoupling>,
     quadrature: Arc<Vec<QuadraturePoint>>,
     solver_layout: Arc<methodus::BlockLayout>,
+    digest: Digest,
 }
 
 impl MixedOperator {
@@ -251,11 +317,13 @@ impl MixedOperator {
         }
         let quadrature = simplex_quadrature(space.mesh().dimension())?;
         let solver_layout = solver_block_layout(space.layout())?;
+        let digest = mixed_operator_digest(&space, &couplings);
         Ok(Self {
             space: Arc::new(space),
             couplings,
             quadrature: Arc::new(quadrature),
             solver_layout: Arc::new(solver_layout),
+            digest,
         })
     }
 
@@ -269,6 +337,18 @@ impl MixedOperator {
 
     pub fn dimension(&self) -> usize {
         self.space.layout().extent()
+    }
+
+    /// Content-addressed identity of this operator's declared structure -- its space (mesh and
+    /// field specs) and couplings -- mirroring `RealizationPlan::digest()`'s content-addressing
+    /// (GX-D1 91dfd25 recorded this as a proposed follow-up so a `krasis::BlockLinearCheckpoint`
+    /// can be bound to a `MixedOperator`'s exact numerical identity rather than only its shape:
+    /// `krasis::block_solve::operator_identity` cannot distinguish two `MixedOperator`s that
+    /// share a block layout but differ in their coupling scales, since it hashes only `rows`,
+    /// `columns`, declared `OperatorProperties`, and `block_layout()`). Computed once at
+    /// construction.
+    pub fn digest(&self) -> &Digest {
+        &self.digest
     }
 
     /// Matrix-free monolithic action `output = A * input`, composed cell-by-cell from every
@@ -345,6 +425,69 @@ impl MixedOperator {
         }
         CsrMatrix::from_triplets(dimension, dimension, entries)
             .map_err(|error| FinitumError::Assembly(error.to_string()))
+    }
+
+    /// Essential-constraint-eliminated ("reduced") matrix-free action, mirroring
+    /// `RealizationPlan::apply_direction`'s identity-row/zero-column treatment exactly, over a
+    /// caller-supplied [`ConstraintSet`] instead of a per-realization one. Vectors stay the full
+    /// [`Self::dimension`] length: a constrained degree of freedom's column contribution is
+    /// removed by zeroing it in the input before [`Self::apply_action`] runs
+    /// (`constraints.expand_homogeneous`), and its row becomes an identity row
+    /// (`output[t] = input[t]`, via `constraints.direction_residual`) rather than the raw
+    /// structural residual [`Self::apply_action`] alone would leave there -- the same
+    /// `pressure_like_nullspace_candidate...` fixture that shows a boundary `field_a` row is
+    /// genuinely nonzero against the unconstrained action shows it vanish here once that row is
+    /// declared constrained (SV2-B4).
+    pub fn apply_reduced_action(
+        &self,
+        constraints: &ConstraintSet,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let dimension = self.dimension();
+        if constraints.dof_count() != dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "essential constraint set has {} degrees of freedom, mixed operator has \
+                 {dimension}",
+                constraints.dof_count()
+            )));
+        }
+        if output.len() != dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "mixed operator reduced action expects output length {dimension}, got {}",
+                output.len()
+            )));
+        }
+        let homogeneous = constraints.expand_homogeneous(input)?;
+        let mut physical_output = vec![0.0; dimension];
+        self.apply_action(&homogeneous, &mut physical_output)?;
+        output.copy_from_slice(&constraints.restrict_transpose(&physical_output)?);
+        for constraint in constraints.constraints() {
+            output[constraint.target.0] =
+                constraints.direction_residual(input, constraint.target)?;
+        }
+        Ok(())
+    }
+
+    /// Binds `constraints` (a [`ConstraintSet`] over this operator's monolithic numbering, e.g.
+    /// built by [`essential_constraints_for_blocks`]) into a [`ReducedMixedOperator`]: the
+    /// essential-constraint-eliminated linear operator a MINRES-family solver actually consumes.
+    /// Refuses a constraint set whose `dof_count()` does not match [`Self::dimension`].
+    pub fn reduced(
+        &self,
+        constraints: ConstraintSet,
+    ) -> Result<ReducedMixedOperator, FinitumError> {
+        if constraints.dof_count() != self.dimension() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "essential constraint set has {} degrees of freedom, mixed operator has {}",
+                constraints.dof_count(),
+                self.dimension()
+            )));
+        }
+        Ok(ReducedMixedOperator {
+            operator: self.clone(),
+            constraints,
+        })
     }
 
     fn apply_gradient_gradient(
@@ -489,6 +632,97 @@ impl methodus::BlockLinearOperator for MixedOperator {
     fn block_layout(&self) -> &methodus::BlockLayout {
         &self.solver_layout
     }
+}
+
+/// A [`MixedOperator`] with essential (Dirichlet) constraints eliminated through
+/// [`MixedOperator::apply_reduced_action`] -- SV2-B4's completion of the representation-only
+/// [`BlockNullspaceCandidate`] machinery into an operator a MINRES-family solver can actually
+/// run against.
+///
+/// Declared [`methodus::OperatorSymmetry::Symmetric`] whenever `constraints` carries no affine
+/// dependency (the only kind [`essential_constraints_for_blocks`] produces): for a Fixed-only
+/// constraint set, row `t` of the reduced action is the identity row `output[t] = input[t]`
+/// (independent of every other index), and the homogeneous expansion zeroes column `t`'s
+/// contribution to every other row before [`MixedOperator::apply_action`] runs -- so the reduced
+/// matrix is block-diagonal between the identity on constrained indices and the free/free
+/// submatrix of the already-symmetric unconstrained action, and is therefore symmetric whenever
+/// that submatrix is (which it is here, `MixedOperator`'s own symmetry being unconditional by
+/// construction). This is an analytic consequence of the elimination, not a proof by assembly,
+/// so no separate `prove_symmetry`-style cache is needed the way `RealizationPlan` needs one for
+/// its more general FC6 kernels. An affine dependency constraint (not producible by
+/// [`essential_constraints_for_blocks`] today) would instead replace a target row with a
+/// genuinely asymmetric constraint residual, matching `RealizationPlan`'s own convention, so
+/// `symmetry()` reports `Nonsymmetric` in that case.
+#[derive(Clone, Debug)]
+pub struct ReducedMixedOperator {
+    operator: MixedOperator,
+    constraints: ConstraintSet,
+}
+
+impl ReducedMixedOperator {
+    pub fn operator(&self) -> &MixedOperator {
+        &self.operator
+    }
+
+    pub fn constraints(&self) -> &ConstraintSet {
+        &self.constraints
+    }
+}
+
+impl LinearOperator for ReducedMixedOperator {
+    fn rows(&self) -> usize {
+        self.operator.dimension()
+    }
+
+    fn columns(&self) -> usize {
+        self.operator.dimension()
+    }
+
+    fn symmetry(&self) -> methodus::OperatorSymmetry {
+        if self.constraints.has_affine_dependencies() {
+            methodus::OperatorSymmetry::Nonsymmetric
+        } else {
+            methodus::OperatorSymmetry::Symmetric
+        }
+    }
+
+    fn apply(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), methodus::NumericError> {
+        self.operator
+            .apply_reduced_action(&self.constraints, input, output)
+            .map_err(|error| methodus::NumericError::Operator {
+                message: error.to_string(),
+            })
+    }
+}
+
+impl BlockLinearOperator for ReducedMixedOperator {
+    fn block_layout(&self) -> &methodus::BlockLayout {
+        self.operator.block_layout()
+    }
+}
+
+fn mixed_operator_digest(space: &MixedSpace, couplings: &[BlockCoupling]) -> Digest {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        schema: &'static str,
+        mesh: &'a Mesh,
+        fields: &'a [FieldSpec],
+        couplings: &'a [BlockCoupling],
+    }
+    let payload = Payload {
+        schema: "finitum-mixed-operator/1",
+        mesh: space.mesh(),
+        fields: space.fields(),
+        couplings,
+    };
+    Digest::blake3(
+        &serde_json::to_vec(&payload).expect("mixed operator digest payload is serializable"),
+    )
 }
 
 fn solver_block_layout(layout: &BlockLayout) -> Result<methodus::BlockLayout, FinitumError> {
