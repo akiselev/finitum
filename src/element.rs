@@ -52,6 +52,45 @@ impl PreparedElement {
         )
     }
 
+    /// P2 nodal simplex basis (vertex nodes plus edge-midpoint nodes) with a quadrature rule
+    /// exact for the mass-matrix-shaped degree-4 integrand in dimension one and two; dimension
+    /// three uses a degree-2-exact rule (see `tetrahedron_degree2_quadrature`), a documented
+    /// reference-grade limit matching this crate's existing honesty about quadrature accuracy.
+    ///
+    /// Basis ordering is `(d+1)` vertex nodes in cell-local vertex order, followed by
+    /// `(d+1)*d/2` edge nodes in the nested `(left, right)` pair order used throughout this
+    /// crate for canonical edge enumeration (see `crate::topology` and
+    /// [`crate::space::quadratic_simplex_dof_map`], which must agree with this ordering for the
+    /// DOF map's local restriction to line up with these basis functions).
+    pub fn quadratic_simplex(dimension: usize) -> Result<Self, FinitumError> {
+        if !(1..=3).contains(&dimension) {
+            return Err(FinitumError::InvalidDimension(dimension));
+        }
+        let basis_count = (dimension + 1) * (dimension + 2) / 2;
+        let quadrature = match dimension {
+            1 => gauss_legendre_unit_interval(3),
+            2 => triangle_degree4_quadrature(),
+            3 => tetrahedron_degree2_quadrature(),
+            _ => unreachable!("dimension was checked"),
+        };
+        let mut basis_values = Vec::with_capacity(quadrature.len() * basis_count);
+        let mut basis_gradients = Vec::with_capacity(quadrature.len() * basis_count * dimension);
+        for point in &quadrature {
+            let (values, gradients) = simplex_basis(dimension, 2, &point.coordinates)?;
+            basis_values.extend(values);
+            for gradient in gradients {
+                basis_gradients.extend(gradient);
+            }
+        }
+        Self::new(
+            dimension,
+            basis_count,
+            quadrature,
+            basis_values,
+            basis_gradients,
+        )
+    }
+
     /// Nodal Lagrange segment of the requested order with Gauss-Legendre quadrature.
     ///
     /// The interpolation nodes are equispaced. This is a deterministic reference table, not a
@@ -181,6 +220,145 @@ impl PreparedElement {
         let start = (point * self.basis_count + basis) * self.dimension;
         Some(&self.basis_gradients[start..start + self.dimension])
     }
+}
+
+/// Number of P1 (`order == 1`) or P2 (`order == 2`) Lagrange simplex basis functions in
+/// `dimension`. Returns `0` for any other order; callers validate order before calling this.
+pub(crate) fn simplex_basis_count(dimension: usize, order: u8) -> usize {
+    match order {
+        1 => dimension + 1,
+        2 => (dimension + 1) * (dimension + 2) / 2,
+        _ => 0,
+    }
+}
+
+/// The shared quadrature rule `crate::mixed` evaluates every field's basis at, regardless of
+/// that field's own order -- richest-available-for-`dimension` (see
+/// [`PreparedElement::quadratic_simplex`]'s per-dimension rule selection), since a lower-order
+/// polynomial is trivially integrated exactly by a higher-degree rule.
+pub(crate) fn simplex_quadrature(dimension: usize) -> Result<Vec<QuadraturePoint>, FinitumError> {
+    match dimension {
+        1 => Ok(gauss_legendre_unit_interval(3)),
+        2 => Ok(triangle_degree4_quadrature()),
+        3 => Ok(tetrahedron_degree2_quadrature()),
+        _ => Err(FinitumError::InvalidDimension(dimension)),
+    }
+}
+
+/// P1 or P2 Lagrange simplex basis values and reference gradients at one explicit reference
+/// point, independent of any precomputed quadrature table.
+///
+/// Barycentric convention matches [`PreparedElement::linear_simplex`]: `lambda[0] = 1 -
+/// sum(point)`, `lambda[k] = point[k - 1]` for `k = 1..=dimension`, so `grad(lambda[0])` is `-1`
+/// on every axis and `grad(lambda[k])` is the unit vector on axis `k - 1`. Order 2 appends edge
+/// nodes `(left, right)` with `left < right` in nested-loop order after the `dimension + 1`
+/// vertex nodes, using the standard quadratic simplex formulas `N_i = lambda_i (2 lambda_i - 1)`
+/// and `N_{ij} = 4 lambda_i lambda_j`.
+///
+/// This is the single source of truth for simplex Lagrange basis math shared by
+/// [`PreparedElement::quadratic_simplex`]'s own quadrature tabulation and by
+/// `crate::mixed`'s cross-block coupling evaluation, which evaluates one field's basis at
+/// another field's shared quadrature points. Exposed publicly for point evaluation/
+/// post-processing and for testing basis identities (partition of unity, Kronecker-delta
+/// nodality, gradient consistency) at points beyond a [`PreparedElement`]'s own tabulated
+/// quadrature.
+pub fn simplex_basis(
+    dimension: usize,
+    order: u8,
+    point: &[f64],
+) -> Result<(Vec<f64>, Vec<Vec<f64>>), FinitumError> {
+    if !(1..=3).contains(&dimension) {
+        return Err(FinitumError::InvalidDimension(dimension));
+    }
+    if point.len() != dimension || point.iter().any(|value| !value.is_finite()) {
+        return Err(FinitumError::InvalidElementShape(format!(
+            "reference point has dimension {}, expected {dimension} finite coordinates",
+            point.len()
+        )));
+    }
+    let vertex_count = dimension + 1;
+    let mut lambda = Vec::with_capacity(vertex_count);
+    lambda.push(1.0 - point.iter().sum::<f64>());
+    lambda.extend_from_slice(point);
+    let mut grad_lambda = Vec::with_capacity(vertex_count);
+    grad_lambda.push(vec![-1.0; dimension]);
+    for axis in 0..dimension {
+        let mut gradient = vec![0.0; dimension];
+        gradient[axis] = 1.0;
+        grad_lambda.push(gradient);
+    }
+    match order {
+        1 => Ok((lambda, grad_lambda)),
+        2 => {
+            let mut values = Vec::with_capacity(vertex_count + vertex_count * dimension / 2);
+            let mut gradients = Vec::with_capacity(values.capacity());
+            for i in 0..vertex_count {
+                values.push(lambda[i] * (2.0 * lambda[i] - 1.0));
+                gradients.push(
+                    grad_lambda[i]
+                        .iter()
+                        .map(|component| (4.0 * lambda[i] - 1.0) * component)
+                        .collect(),
+                );
+            }
+            for left in 0..vertex_count {
+                for right in left + 1..vertex_count {
+                    values.push(4.0 * lambda[left] * lambda[right]);
+                    gradients.push(
+                        (0..dimension)
+                            .map(|axis| {
+                                4.0 * (lambda[right] * grad_lambda[left][axis]
+                                    + lambda[left] * grad_lambda[right][axis])
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            Ok((values, gradients))
+        }
+        _ => Err(FinitumError::InvalidElementShape(format!(
+            "simplex Lagrange basis order must be 1 or 2, got {order}"
+        ))),
+    }
+}
+
+/// Six-point, degree-4-exact symmetric quadrature for the reference triangle `(0,0), (1,0),
+/// (0,1)` (area `1/2`), sufficient to exactly integrate a P2 mass-matrix-shaped (degree-4)
+/// integrand. Standard Dunavant/Strang-Fix constants.
+fn triangle_degree4_quadrature() -> Vec<QuadraturePoint> {
+    const AREA: f64 = 0.5;
+    let groups = [
+        (0.445948490915965_f64, 0.223381589678011_f64),
+        (0.091576213509771_f64, 0.109951743655322_f64),
+    ];
+    let mut points = Vec::with_capacity(6);
+    for (a, weight_fraction) in groups {
+        let b = 1.0 - 2.0 * a;
+        for coordinates in [[a, b], [b, a], [a, a]] {
+            points.push(QuadraturePoint {
+                coordinates: coordinates.to_vec(),
+                weight: weight_fraction * AREA,
+            });
+        }
+    }
+    points
+}
+
+/// Four-point, degree-2-exact symmetric quadrature for the reference tetrahedron `(0,0,0),
+/// (1,0,0), (0,1,0), (0,0,1)` (volume `1/6`). This under-integrates a P2 mass-matrix-shaped
+/// (degree-4) integrand; it is a documented reference-grade limit, matching this crate's existing
+/// honesty about quadrature accuracy (compare the P1 barycenter rule).
+fn tetrahedron_degree2_quadrature() -> Vec<QuadraturePoint> {
+    const VOLUME: f64 = 1.0 / 6.0;
+    let a = (5.0 + 3.0 * 5.0_f64.sqrt()) / 20.0;
+    let b = (5.0 - 5.0_f64.sqrt()) / 20.0;
+    [[a, b, b], [b, a, b], [b, b, a], [b, b, b]]
+        .into_iter()
+        .map(|coordinates| QuadraturePoint {
+            coordinates: coordinates.to_vec(),
+            weight: 0.25 * VOLUME,
+        })
+        .collect()
 }
 
 fn gauss_legendre_unit_interval(count: usize) -> Vec<QuadraturePoint> {

@@ -11,6 +11,7 @@ mod error;
 mod mapping;
 mod mesh;
 mod method;
+mod mixed;
 mod optimized;
 mod profile;
 mod realization;
@@ -28,7 +29,7 @@ pub use cad_geometry::{
 };
 pub use condensation::{CondensedLocalSystem, static_condense};
 pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
-pub use element::{PreparedElement, QuadraturePoint};
+pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::FinitumError;
 pub use mapping::AffineMap;
@@ -37,6 +38,10 @@ pub use method::{
     BoundaryIntegralRealization, DiscreteOperator, FiniteDifferenceRealization, FiniteVolumeFace,
     FiniteVolumeRealization, MethodRealization, NetworkDaeRealization, ParticlePair,
     ParticleRealization, RadialPairPolynomial,
+};
+pub use mixed::{
+    BlockCoupling, BlockNullspaceCandidate, BlockNullspaceMode, CouplingKind, FieldSpec,
+    MixedOperator, MixedSpace, NullspaceModeKind,
 };
 pub use optimized::{
     AcceleratorLayout, CellBatchLayout, ElementAssemblyOperator, PartialAssemblyOperator,
@@ -54,7 +59,10 @@ pub use realization::{
     RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
     RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from,
 };
-pub use space::{DofId, DofMap, ElementRestriction, vector_nodal_dof_map};
+pub use space::{
+    DofId, DofMap, ElementRestriction, quadratic_simplex_dof_map, quadratic_simplex_node_points,
+    vector_nodal_dof_map,
+};
 pub use system::SystemRealizationPlan;
 pub use topology::{
     CompatibleDofMaps, ExactSequence, FacetId, FacetIncidence, FacetTopology, MeshFacet,

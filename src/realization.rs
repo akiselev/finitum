@@ -3568,29 +3568,71 @@ fn validate_discretization(
     for requirement in &requirements.elements {
         let admitted_shape = match &requirement.value_shape {
             ValueShape::Scalar => true,
-            // Vector H1(order=1) with one component per spatial axis is the
-            // SV2-A production slice: vertex-major component blocks execute
+            // Vector H1 with one component per spatial axis is the SV2-A/SV2-B1 production
+            // slice: vertex-major (P1) or vertex-then-edge-major (P2) component blocks execute
             // through the same generated kernels.
             ValueShape::Vector(components) => *components as usize == mesh.dimension(),
             _ => false,
         };
         if requirement.topological_dimension as usize != mesh.dimension()
             || requirement.family != ElementFamilyRequirement::H1
-            || requirement.polynomial_order != 1
+            || !matches!(requirement.polynomial_order, 1 | 2)
             || !admitted_shape
         {
             return Err(FinitumError::UnsupportedRealization(format!(
-                "realization supports scalar or dimension-vector H1(order=1) cell elements, got {requirement:?}"
+                "realization supports scalar or dimension-vector H1(order=1|2) cell elements, got {requirement:?}"
             )));
         }
     }
-    if element.basis_count() != mesh.dimension() + 1 {
+    // A single `RealizationPlan` binds one `PreparedElement`/`DofMap` pair, so every admitted
+    // element requirement must agree on one polynomial order (SV2-B1: P1 and P2 are each
+    // supported, but not mixed within one plan -- a genuine mixed-order product space is
+    // `crate::mixed::MixedSpace`, not this single-field plan).
+    let polynomial_order = requirements
+        .elements
+        .first()
+        .map(|first| first.polynomial_order)
+        .unwrap_or(1);
+    if requirements
+        .elements
+        .iter()
+        .any(|requirement| requirement.polynomial_order != polynomial_order)
+    {
+        return Err(FinitumError::UnsupportedRealization(
+            "realization requires every admitted element requirement to share one polynomial \
+             order; a mixed-order product space is realized through `mixed::MixedSpace` instead"
+                .into(),
+        ));
+    }
+    let expected_basis_count = match polynomial_order {
+        1 => mesh.dimension() + 1,
+        2 => (mesh.dimension() + 1) * (mesh.dimension() + 2) / 2,
+        other => {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "realization supports H1(order=1|2) cell elements, got order {other}"
+            )));
+        }
+    };
+    if element.basis_count() != expected_basis_count {
         return Err(FinitumError::InvalidRealization(format!(
-            "P1 simplex in dimension {} requires {} basis functions, got {}",
+            "P{polynomial_order} simplex in dimension {} requires {expected_basis_count} basis \
+             functions, got {}",
             mesh.dimension(),
-            mesh.dimension() + 1,
             element.basis_count()
         )));
+    }
+    if polynomial_order != 1
+        && factorization
+            .integrals
+            .iter()
+            .any(|integral| matches!(integral.measure, SemanticMeasure::ExteriorFacet { .. }))
+    {
+        return Err(FinitumError::UnsupportedRealization(
+            "GX-C4 exterior facet trace evaluation is realized with a hardcoded P1 trace basis; \
+             a P2 (or higher) realization with a facet integral is refused rather than silently \
+             using the wrong trace basis"
+                .into(),
+        ));
     }
     // Vector blocks widen each restriction to `components` DOFs per node
     // while the basis table stays scalar; the widest requirement wins.

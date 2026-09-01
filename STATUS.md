@@ -1,7 +1,8 @@
 # Finitum status
 
-Updated: 2026-08-30
-Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity
+Updated: 2026-08-31
+Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
+SV2-B1 P2 elements/mixed product layouts + SV2-B4 start (block operator composition)
 
 ## Implemented
 
@@ -94,6 +95,33 @@ Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 el
   Missing, extra, or extent-mismatched external direction tables are refused;
   dynamic callbacks are refused because they cannot declare an exact design
   derivative. Reflected cells are refused.
+- GX-C1/C2/C3/C4/C5/C6 and GX-F7 landed (`6e6c4a4`, `89eea19`, `0d378a0`) but were never folded
+  into this list by their landing commits: `MeshProfile`/`RegionTags`/`FieldSource`, exterior
+  facet integrals, an executed `Symmetric` proof, and executed VJP kernels. This entry only
+  records that they exist; their exact behavior is authoritative in
+  `sinbad/docs/simulation-vision/GX-CONTRACTS.md` C11.5-C11.7, not re-audited here.
+- P2 simplex elements (`PreparedElement::quadratic_simplex`, 1-3-D; vertex-then-edge-major DOF
+  maps `quadratic_simplex_dof_map`/`quadratic_simplex_node_points`) alongside P1, sharing every
+  existing generated-kernel execution path in `RealizationPlan` unchanged (SV2-B1): basis
+  evaluation, gather/scatter, JVP, and assembly are element-basis-count-generic already, so the
+  only `RealizationPlan` change was admitting `polynomial_order == 2` (with the matching P2 basis
+  count) in `validate_discretization`, and refusing a P2 exterior-facet integral typed (the
+  facet trace basis stays hardcoded P1).
+- an executable product-space layout (`mixed::MixedSpace`) of per-field blocks with independent
+  polynomial order (1 or 2) and component count (scalar or dimension-vector), each with its own
+  DOF map, laid out end-to-end by the existing `BlockLayout` (SV2-B1); and a block/coupling
+  operator composition (`mixed::MixedOperator`, SV2-B4 start) applying a diagonal
+  `GradientGradient` block and an off-diagonal `DivergenceValue` coupling (contributed together
+  with its exact transpose, so the composed action is symmetric by construction) into one
+  monolithic matrix-free action, implementing Methodus `LinearOperator` and `BlockLinearOperator`
+  directly. This is generic structural machinery bypassing Scientia forms and Malleus kernels
+  entirely (its own quadrature/basis evaluation, shared across differently-ordered fields); it
+  names no physics.
+- a typed, representation-only block-nullspace declaration (`mixed::BlockNullspaceCandidate`,
+  `NullspaceModeKind::Constant`, mirroring Scientia's structural `NullspaceCandidate::Constant`
+  from GX-CONTRACTS C5.4) that resolves against a `BlockLayout` into the exact unit-norm
+  constant-mode vector and a `methodus::ConstantModeProjector` a downstream MINRES-family solver
+  (SV2-B6) would consume; no solver algorithm is implemented here.
 
 ## Boundary
 
@@ -229,17 +257,23 @@ nonuniform sheared affine patch above remains the independent realization oracle
   `BoundaryPartitionRequirement` is never used to select DOFs; validation
   checks only non-emptiness parity, so the boundary-partition assumption is
   not discharged.
-- Every non-basis input enters as a Rust closure; `DynamicExternalInput`
-  identity is a caller-invented string and the direction callback is trusted.
-- Dirichlet only, as explicit DOF rows; every non-cell measure is refused,
-  so there is no Neumann/Robin/traction path. `FacetTopology` exists but is
-  not wired into `RealizationPlan`.
-- H1 order 1 only; one active basis field. Malleus VJP kernels are validated
-  and bound but never executed; `MatrixFreeOperator` never declares
-  `Symmetric`, so consumers hard-code `AssumeSymmetric`.
-- `SystemRealizationPlan` is planning-only (no residual, JVP, or operator);
-  no P2 elements, no multi-order restrictions, no block operator with
-  off-diagonals.
+- Superseded by GX-C1-C6/GX-F7 (landed after this audit, `6e6c4a4`/`89eea19`/`0d378a0`; see
+  `sinbad/docs/simulation-vision/GX-CONTRACTS.md` C11.5-C11.7 for the authoritative record, not
+  re-verified by this entry): non-basis inputs may now be a `FieldSource` (constant/nodal/sampled
+  today; table/kernel from GX-C3) rather than only a trusted closure; `FacetTopology` is wired
+  into `RealizationPlan` for exterior facet integrals; and `MatrixFreeOperator` can declare
+  `Symmetric` from an explicit proof, and Malleus VJP kernels execute through
+  `RealizationPlan::vector_jacobian_product`.
+- Dirichlet only, as explicit DOF rows; every non-cell measure other than `ExteriorFacet` is
+  refused, so there is still no Neumann/Robin/traction path beyond GX-C4's exterior facet data.
+- Superseded by SV2-B1 (this milestone): `RealizationPlan` now admits H1 order 1 *or* 2 (one
+  order per plan; a P2 exterior-facet integral is refused typed, since GX-C4's trace basis
+  stays hardcoded P1). `SystemRealizationPlan` itself remains planning-only (no residual, JVP,
+  or operator). Genuine multi-order product layouts and block operators with off-diagonals now
+  exist as a separate, additive structural module (`mixed::MixedSpace`/`MixedOperator`, SV2-B1/
+  B4 start) that bypasses Scientia forms/Malleus kernels entirely -- they are not wired into
+  `RealizationPlan` or `SystemRealizationPlan`, and `MixedOperator` represents no forcing term
+  (its `residual`/`jacobian_vector_product` are the same linear action).
 
 ## Next
 

@@ -456,7 +456,10 @@ impl ExactSequence {
     }
 }
 
-fn mesh_edges(mesh: &Mesh) -> Vec<Vec<usize>> {
+/// Deterministic, canonically sorted list of a simplex mesh's unique undirected edges (vertex
+/// pairs). Reused by [`crate::space::quadratic_simplex_dof_map`] so P2 edge-node numbering
+/// agrees with the edge identities [`CompatibleDofMaps`] and [`ExactSequence`] already use.
+pub(crate) fn mesh_edges(mesh: &Mesh) -> Vec<Vec<usize>> {
     let mut edges = BTreeMap::new();
     for cell in mesh.cells() {
         for left in 0..cell.vertices.len() {
