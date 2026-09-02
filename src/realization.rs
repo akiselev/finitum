@@ -5,7 +5,10 @@ use malleus::{
     AccessMode, BufferBinding, Executable, ExecutableModule, Interpreter, OperandId,
     validate_module,
 };
-use methodus::{CsrMatrix, EvaluationContext, LinearOperator, NumericError, OperatorSymmetry};
+use methodus::{
+    CsrMatrix, EvaluationContext, LinearOperator, NumericError, OperatorSymmetry,
+    TransposableOperator,
+};
 use scientia::scientific::ValueShape;
 use scientia::{
     DerivativeEvaluation, Digest, ElementFamilyRequirement, EvaluationSite, FormRequirements,
@@ -23,7 +26,7 @@ use crate::profile::{
 };
 use crate::{
     CellId, ConstraintSet, DofMap, FacetId, FacetIncidence, FacetTopology, FinitumError, Mesh,
-    PreparedElement,
+    PreparedElement, simplex_basis,
 };
 
 pub const REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-realization-plan/2";
@@ -35,6 +38,81 @@ pub struct ExternalInput {
     pub input: TensorInputId,
     component_count: usize,
     values: Vec<f64>,
+}
+
+/// SV1-C3: the caller-owned design space a stored external input's quadrature-point table is a
+/// linear function of. Entries are entity-major with the input's component count per entity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoefficientLayout {
+    /// One entry per `(cell, quadrature point)`: the stored table itself, in its own order.
+    QuadraturePoint,
+    /// One entry per mesh cell: a piecewise-constant coefficient.
+    Cell,
+    /// One entry per mesh vertex, interpolated inside each cell with the P1 barycentric basis
+    /// at the quadrature points: a nodal design field, independent of the plan's own element
+    /// order.
+    Vertex,
+}
+
+impl CoefficientLayout {
+    /// Length of a design vector under this layout for `component_count` components per entry.
+    pub fn dimension(
+        self,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        component_count: usize,
+    ) -> Result<usize, FinitumError> {
+        let entities = match self {
+            CoefficientLayout::QuadraturePoint => mesh.cells().len() * element.quadrature().len(),
+            CoefficientLayout::Cell => mesh.cells().len(),
+            CoefficientLayout::Vertex => mesh.vertices().len(),
+        };
+        entities.checked_mul(component_count).ok_or_else(|| {
+            FinitumError::InvalidRealization("coefficient design extent overflows usize".into())
+        })
+    }
+
+    /// The design entries (entity index, weight) whose linear combination is the coefficient's
+    /// value at quadrature point `point` of `cell`.
+    fn weights(
+        self,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        cell: usize,
+        point: usize,
+    ) -> Result<Vec<(usize, f64)>, FinitumError> {
+        match self {
+            CoefficientLayout::QuadraturePoint => {
+                Ok(vec![(cell * element.quadrature().len() + point, 1.0)])
+            }
+            CoefficientLayout::Cell => Ok(vec![(cell, 1.0)]),
+            CoefficientLayout::Vertex => {
+                let (values, _) = simplex_basis(
+                    mesh.dimension(),
+                    1,
+                    &element.quadrature()[point].coordinates,
+                )?;
+                Ok(mesh.cells()[cell]
+                    .vertices
+                    .iter()
+                    .zip(values)
+                    .map(|(vertex, weight)| (vertex.0, weight))
+                    .collect())
+            }
+        }
+    }
+}
+
+/// SV1-C3: one stored external input of a cell integral, viewed as a distributed coefficient
+/// over a caller-owned design space (`layout`). The residual's derivatives with respect to
+/// that design vector are [`RealizationPlan::coefficient_jacobian_vector_product`] and its
+/// exact transpose [`RealizationPlan::coefficient_vector_jacobian_product`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistributedCoefficient {
+    pub integral_index: usize,
+    pub input: TensorInputId,
+    pub layout: CoefficientLayout,
 }
 
 /// One basis-backed active input evaluated at a quadrature point.
@@ -187,6 +265,55 @@ impl ExternalInput {
                     )));
                 }
                 values.extend(sampled);
+            }
+        }
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    /// SV1-C3: own the quadrature-point values a caller-owned distributed coefficient `design`
+    /// induces under `layout` (see [`CoefficientLayout`]), in the same deterministic
+    /// cell/quadrature/component order as [`Self::sampled`]. The map from `design` to the
+    /// stored table is linear; [`RealizationPlan::coefficient_jacobian_vector_product`] and
+    /// [`RealizationPlan::coefficient_vector_jacobian_product`] differentiate through exactly
+    /// this map, so a plan bound with this input and a design vector `p` is the realization
+    /// `R(u; p)` those products are the derivatives of.
+    pub fn from_coefficient(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        layout: CoefficientLayout,
+        design: &[f64],
+    ) -> Result<Self, FinitumError> {
+        if component_count == 0 {
+            return Err(FinitumError::InvalidRealization(
+                "coefficient component count must be non-zero".into(),
+            ));
+        }
+        let expected = layout.dimension(mesh, element, component_count)?;
+        if design.len() != expected {
+            return Err(FinitumError::InvalidRealization(format!(
+                "coefficient design vector has length {}, layout {layout:?} expects {expected}",
+                design.len()
+            )));
+        }
+        validate_finite("coefficient design vector", design)?;
+        let point_count = element.quadrature().len();
+        let mut values = Vec::with_capacity(mesh.cells().len() * point_count * component_count);
+        for cell in 0..mesh.cells().len() {
+            for point in 0..point_count {
+                let weights = layout.weights(mesh, element, cell, point)?;
+                for component in 0..component_count {
+                    values.push(
+                        weights
+                            .iter()
+                            .map(|(entity, weight)| {
+                                weight * design[entity * component_count + component]
+                            })
+                            .sum(),
+                    );
+                }
             }
         }
         Self::new(integral_index, input, component_count, values)
@@ -802,6 +929,12 @@ pub enum DerivativeProduct {
     /// [`RealizationPlan::vector_jacobian_product`]: the exact transpose action of the state
     /// JVP at rate direction zero, executing the bound Malleus VJP kernels (GX-F7).
     Vjp,
+    /// [`RealizationPlan::coefficient_jacobian_vector_product`]: the residual's directional
+    /// derivative with respect to a stored distributed coefficient (SV1-C3).
+    CoefficientJvp,
+    /// [`RealizationPlan::coefficient_vector_jacobian_product`]: its exact transpose,
+    /// accumulated into the caller-owned coefficient space (SV1-C3).
+    CoefficientVjp,
 }
 
 /// Source-artifact provenance for one [`RealizationCapability`].
@@ -1097,6 +1230,24 @@ impl RealizationPlan {
         if !self.data.constraints.has_affine_dependencies() {
             derivative_products.push(DerivativeProduct::Vjp);
         }
+        // SV1-C3: a distributed coefficient is a stored external input of a cell integral; the
+        // coefficient products exist exactly when such an input exists (the JVP unconditionally,
+        // the VJP under the same affine-dependency rule as `Vjp`).
+        let has_stored_cell_input = self.data.factorization.integrals.iter().any(|integral| {
+            matches!(integral.measure, SemanticMeasure::Cell { .. })
+                && integral.primal.inputs.iter().any(|input| {
+                    matches!(
+                        self.data.external.get(&(integral.integral_index, input.id)),
+                        Some(ExternalBinding::Stored(_))
+                    )
+                })
+        });
+        if has_stored_cell_input {
+            derivative_products.push(DerivativeProduct::CoefficientJvp);
+            if !self.data.constraints.has_affine_dependencies() {
+                derivative_products.push(DerivativeProduct::CoefficientVjp);
+            }
+        }
         let symmetry = self.matrix_free().symmetry();
         let receipt = RealizationReceipt {
             source_requirements_digest: self.data.requirements.artifact_digest.clone(),
@@ -1263,8 +1414,36 @@ impl RealizationPlan {
         adjoint: &[f64],
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
+        self.vector_jacobian_product_shifted(time, state, state_rate, adjoint, 0.0, output)
+    }
+
+    /// SV1-C1: the exact transpose of the *shifted* Jacobian action
+    /// `x -> jacobian_vector_product(x, rate_shift * x)`, i.e. of `dR/du + rate_shift * dR/du_t`
+    /// -- the linearization an implicit time integrator (BDF: `rate_shift = alpha / dt`) or a
+    /// steady Newton step (`rate_shift = 0`) solves with. `rate_shift = 0` is exactly
+    /// [`Self::vector_jacobian_product`].
+    ///
+    /// The rate half of the transpose reuses the state half's machinery: a `TimeDerivative`
+    /// active input is gathered through the same value basis as a `Value` input (see
+    /// `evaluate_basis_input`), so its cotangent is scattered through that same basis scaled
+    /// by `rate_shift`; a dynamic external input's chain rule through a time-derivative active
+    /// input is probed exactly as its state chain rule is, and scaled the same way.
+    pub fn vector_jacobian_product_shifted(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        rate_shift: f64,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
         self.validate_time_action(time, state, state_rate, output)?;
         self.validate_action(adjoint, output)?;
+        if !rate_shift.is_finite() {
+            return Err(FinitumError::InvalidRealization(
+                "rate shift must be finite".into(),
+            ));
+        }
         if self.data.constraints.has_affine_dependencies() {
             return Err(FinitumError::UnsupportedRealization(
                 "vector_jacobian_product refuses affine dependency constraints; their exact \
@@ -1292,6 +1471,7 @@ impl RealizationPlan {
             &physical_state,
             &physical_rate,
             &physical_adjoint,
+            rate_shift,
             &mut physical_output,
         )?;
         self.apply_facets_transpose(
@@ -1299,6 +1479,7 @@ impl RealizationPlan {
             &physical_state,
             &physical_rate,
             &physical_adjoint,
+            rate_shift,
             &mut physical_output,
         )?;
         output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
@@ -1309,6 +1490,306 @@ impl RealizationPlan {
             output[constraint.target.0] += adjoint[constraint.target.0];
         }
         validate_finite("stateful VJP", output)
+    }
+
+    /// SV1-C1: the Jacobian `J = dR/du + rate_shift * dR/du_t` of this realization at one
+    /// linearization point, as a Methodus operator whose primal action is
+    /// [`Self::jacobian_vector_product`] with rate direction `rate_shift * x` and whose
+    /// transpose action ([`TransposableOperator`]) is
+    /// [`Self::vector_jacobian_product_shifted`] -- the operator pair an adjoint solve at a
+    /// converged state (or inside an implicit time step) consumes.
+    pub fn linearize(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<LinearizedOperator, FinitumError> {
+        let probe = vec![0.0; self.dimension()];
+        self.validate_time_action(time, state, state_rate, &probe)?;
+        if !rate_shift.is_finite() {
+            return Err(FinitumError::InvalidRealization(
+                "rate shift must be finite".into(),
+            ));
+        }
+        Ok(LinearizedOperator {
+            plan: self.clone(),
+            time,
+            state: state.to_vec(),
+            state_rate: state_rate.to_vec(),
+            rate_shift,
+        })
+    }
+
+    /// Length of the design vector `coefficient` ranges over (SV1-C3).
+    pub fn coefficient_dimension(
+        &self,
+        coefficient: &DistributedCoefficient,
+    ) -> Result<usize, FinitumError> {
+        let (_, stored) = self.coefficient_binding(coefficient)?;
+        coefficient
+            .layout
+            .dimension(&self.data.mesh, &self.data.element, stored.component_count)
+    }
+
+    /// SV1-C3: `dR/dp * direction` at a fixed state -- the residual's directional derivative
+    /// with respect to the design vector of `coefficient`, executing each integral output's
+    /// bound frozen-input (parameter) Malleus JVP kernel with the direction routed to the
+    /// coefficient's input only. Constraint rows carry zero coefficient derivative, because
+    /// essential values are frozen inputs of the realization.
+    pub fn coefficient_jacobian_vector_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        coefficient: &DistributedCoefficient,
+        direction: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.validate_time_action(time, state, state_rate, output)?;
+        let (integral, stored) = self.coefficient_binding(coefficient)?;
+        let components = stored.component_count;
+        let expected = self.coefficient_dimension(coefficient)?;
+        if direction.len() != expected {
+            return Err(FinitumError::InvalidRealization(format!(
+                "coefficient direction has length {}, expected {expected}",
+                direction.len()
+            )));
+        }
+        validate_finite("coefficient direction", direction)?;
+        let physical_state = self.data.constraints.expand(state)?;
+        let physical_rate = self.data.constraints.expand_homogeneous(state_rate)?;
+        let mut physical_output = vec![0.0; self.dimension()];
+        for cell_index in 0..self.data.dofs.restrictions().len() {
+            let restriction = &self.data.dofs.restrictions()[cell_index];
+            let geometry = &self.data.geometries[cell_index];
+            let local_state = restriction
+                .dofs
+                .iter()
+                .map(|dof| physical_state[dof.0])
+                .collect::<Vec<_>>();
+            let local_rate = restriction
+                .dofs
+                .iter()
+                .map(|dof| physical_rate[dof.0])
+                .collect::<Vec<_>>();
+            let mut local_output = vec![0.0; restriction.dofs.len()];
+            for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
+                let scale = point.weight * geometry.determinant;
+                let weights = coefficient.layout.weights(
+                    &self.data.mesh,
+                    &self.data.element,
+                    cell_index,
+                    point_index,
+                )?;
+                let point_direction = (0..components)
+                    .map(|component| {
+                        weights
+                            .iter()
+                            .map(|(entity, weight)| {
+                                weight * direction[entity * components + component]
+                            })
+                            .sum::<f64>()
+                    })
+                    .collect::<Vec<_>>();
+                let (inputs, _) = self.point_inputs(
+                    integral,
+                    cell_index,
+                    point_index,
+                    geometry,
+                    time,
+                    &local_state,
+                    &local_rate,
+                )?;
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+                    let Some(point_output) = execute_parameter_jvp_values(
+                        bound,
+                        &inputs,
+                        coefficient.input,
+                        &point_direction,
+                    )?
+                    else {
+                        continue;
+                    };
+                    apply_basis_adjoint(
+                        &self.data.element,
+                        geometry,
+                        point_index,
+                        &qoutput.binding.evaluation.derivative,
+                        &point_output,
+                        scale,
+                        &mut local_output,
+                    )?;
+                }
+            }
+            for (local, dof) in restriction.dofs.iter().enumerate() {
+                physical_output[dof.0] += local_output[local];
+            }
+        }
+        output.copy_from_slice(&self.data.constraints.restrict_transpose(&physical_output)?);
+        for constraint in self.data.constraints.constraints() {
+            output[constraint.target.0] = 0.0;
+        }
+        validate_finite("coefficient JVP", output)
+    }
+
+    /// SV1-C3: `(dR/dp)^T * adjoint` -- the exact transpose of
+    /// [`Self::coefficient_jacobian_vector_product`], accumulating each quadrature point's
+    /// parameter cotangent (the bound parameter kernel's exact point-local Jacobian contracted
+    /// against the test-side adjoint seed, as GX-F7's VJP already computes for dynamic inputs)
+    /// into the caller-owned design space through the transpose of the layout's interpolation.
+    /// Affine dependency constraints refuse exactly as [`Self::vector_jacobian_product`] does.
+    pub fn coefficient_vector_jacobian_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        coefficient: &DistributedCoefficient,
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let probe = vec![0.0; self.dimension()];
+        self.validate_time_action(time, state, state_rate, &probe)?;
+        self.validate_action(adjoint, &probe)?;
+        if self.data.constraints.has_affine_dependencies() {
+            return Err(FinitumError::UnsupportedRealization(
+                "coefficient_vector_jacobian_product refuses affine dependency constraints; \
+                 their exact transpose is not yet implemented (SV1-C2)"
+                    .into(),
+            ));
+        }
+        let (integral, stored) = self.coefficient_binding(coefficient)?;
+        let components = stored.component_count;
+        let expected = self.coefficient_dimension(coefficient)?;
+        if output.len() != expected {
+            return Err(FinitumError::InvalidRealization(format!(
+                "coefficient VJP output has length {}, expected {expected}",
+                output.len()
+            )));
+        }
+        let physical_state = self.data.constraints.expand(state)?;
+        let physical_rate = self.data.constraints.expand_homogeneous(state_rate)?;
+        // Constraint rows carry no coefficient derivative (see the JVP), so their adjoint
+        // entries are masked out before the homogeneous expansion, mirroring
+        // `vector_jacobian_product_shifted`.
+        let mut restricted_adjoint = adjoint.to_vec();
+        for constraint in self.data.constraints.constraints() {
+            restricted_adjoint[constraint.target.0] = 0.0;
+        }
+        let physical_adjoint = self
+            .data
+            .constraints
+            .expand_homogeneous(&restricted_adjoint)?;
+        output.fill(0.0);
+        for cell_index in 0..self.data.dofs.restrictions().len() {
+            let restriction = &self.data.dofs.restrictions()[cell_index];
+            let geometry = &self.data.geometries[cell_index];
+            let local_state = restriction
+                .dofs
+                .iter()
+                .map(|dof| physical_state[dof.0])
+                .collect::<Vec<_>>();
+            let local_rate = restriction
+                .dofs
+                .iter()
+                .map(|dof| physical_rate[dof.0])
+                .collect::<Vec<_>>();
+            let local_adjoint = restriction
+                .dofs
+                .iter()
+                .map(|dof| physical_adjoint[dof.0])
+                .collect::<Vec<_>>();
+            for (point_index, point) in self.data.element.quadrature().iter().enumerate() {
+                let scale = point.weight * geometry.determinant;
+                let weights = coefficient.layout.weights(
+                    &self.data.mesh,
+                    &self.data.element,
+                    cell_index,
+                    point_index,
+                )?;
+                let (inputs, _) = self.point_inputs(
+                    integral,
+                    cell_index,
+                    point_index,
+                    geometry,
+                    time,
+                    &local_state,
+                    &local_rate,
+                )?;
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = &self.data.bundles[&(integral.integral_index, output_index)];
+                    let output_components = component_count(&qoutput.shape)?;
+                    let seed = gather_test_adjoint(
+                        &self.data.element,
+                        geometry,
+                        point_index,
+                        &qoutput.binding.evaluation.derivative,
+                        output_components,
+                        &local_adjoint,
+                    )?;
+                    let cotangents = self.point_parameter_cotangents(bound, &inputs, &seed)?;
+                    let Some(cotangent) = cotangents.get(&coefficient.input) else {
+                        continue;
+                    };
+                    if cotangent.len() != components {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "coefficient cotangent has {} components, expected {components}",
+                            cotangent.len()
+                        )));
+                    }
+                    for (entity, weight) in &weights {
+                        for component in 0..components {
+                            output[entity * components + component] +=
+                                scale * weight * cotangent[component];
+                        }
+                    }
+                }
+            }
+        }
+        validate_finite("coefficient VJP", output)
+    }
+
+    /// Resolves `coefficient` to its cell integral and stored binding, refusing a dynamic
+    /// binding (its values are not a design vector), a facet integral (facet tables are
+    /// sampled per facet, not per cell quadrature point), or an unknown key.
+    fn coefficient_binding(
+        &self,
+        coefficient: &DistributedCoefficient,
+    ) -> Result<(&IntegralOperatorFactorization, &ExternalInput), FinitumError> {
+        let key = (coefficient.integral_index, coefficient.input);
+        let integral = self
+            .data
+            .factorization
+            .integrals
+            .iter()
+            .find(|integral| integral.integral_index == coefficient.integral_index)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "distributed coefficient names absent integral {}",
+                    coefficient.integral_index
+                ))
+            })?;
+        if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "distributed coefficients are realized on cell integrals only; integral {} has \
+                 measure {:?}",
+                coefficient.integral_index, integral.measure
+            )));
+        }
+        match self.data.external.get(&key) {
+            Some(ExternalBinding::Stored(stored)) => Ok((integral, stored)),
+            Some(ExternalBinding::Dynamic(_)) => {
+                Err(FinitumError::UnsupportedRealization(format!(
+                    "external input {key:?} is a dynamic binding, not a stored distributed \
+                     coefficient"
+                )))
+            }
+            None => Err(FinitumError::MissingExternalInput {
+                integral: key.0,
+                input: key.1,
+            }),
+        }
     }
 
     /// Return the zero-active-state JVP realization for this globally linear FC6 plan.
@@ -2601,14 +3082,18 @@ impl RealizationPlan {
         state: &[f64],
         state_rate: &[f64],
         adjoint: &[f64],
+        rate_shift: f64,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         for cell_index in 0..self.data.dofs.restrictions().len() {
-            self.apply_cell_transpose(cell_index, time, state, state_rate, adjoint, output)?;
+            self.apply_cell_transpose(
+                cell_index, time, state, state_rate, adjoint, rate_shift, output,
+            )?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_cell_transpose(
         &self,
         cell_index: usize,
@@ -2616,6 +3101,7 @@ impl RealizationPlan {
         state: &[f64],
         state_rate: &[f64],
         adjoint: &[f64],
+        rate_shift: f64,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         let restriction = &self.data.dofs.restrictions()[cell_index];
@@ -2651,7 +3137,7 @@ impl RealizationPlan {
                     &local_state,
                     &local_rate,
                 )?;
-                let active_inputs = active_state_inputs(integral);
+                let active_inputs = active_probe_inputs(integral, rate_shift);
                 for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
                     let bound = &self.data.bundles[&(integral.integral_index, output_index)];
                     let output_components = component_count(&qoutput.shape)?;
@@ -2672,6 +3158,7 @@ impl RealizationPlan {
                             point_index,
                             geometry,
                             scale,
+                            rate_shift,
                             &evaluation,
                             &active_inputs,
                             &parameter_cotangents,
@@ -2682,11 +3169,13 @@ impl RealizationPlan {
                     for input in &integral.primal.inputs {
                         if input.source != InputSourceRequirement::Basis
                             || input.role != TensorInputRole::Active
-                            || input.binding.evaluation.derivative
-                                == DerivativeEvaluation::TimeDerivative
                         {
                             continue;
                         }
+                        let Some((derivative, factor)) = transpose_scatter_shape(input, rate_shift)
+                        else {
+                            continue;
+                        };
                         let Some(cotangent) = cotangents.get(&input.id) else {
                             continue;
                         };
@@ -2694,9 +3183,9 @@ impl RealizationPlan {
                             &self.data.element,
                             geometry,
                             point_index,
-                            &input.binding.evaluation.derivative,
+                            &derivative,
                             cotangent,
-                            scale,
+                            factor * scale,
                             &mut local_output,
                         )?;
                     }
@@ -2716,6 +3205,7 @@ impl RealizationPlan {
         state: &[f64],
         state_rate: &[f64],
         adjoint: &[f64],
+        rate_shift: f64,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         for integral in &self.data.factorization.integrals {
@@ -2737,6 +3227,7 @@ impl RealizationPlan {
                     state,
                     state_rate,
                     adjoint,
+                    rate_shift,
                     output,
                 )?;
             }
@@ -2754,6 +3245,7 @@ impl RealizationPlan {
         state: &[f64],
         state_rate: &[f64],
         adjoint: &[f64],
+        rate_shift: f64,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         let geometry = self
@@ -2789,7 +3281,7 @@ impl RealizationPlan {
             &local_state,
             &local_rate,
         )?;
-        let active_inputs = active_state_inputs(integral);
+        let active_inputs = active_probe_inputs(integral, rate_shift);
         for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
             let bound = &self.data.bundles[&(integral.integral_index, output_index)];
             let output_components = component_count(&qoutput.shape)?;
@@ -2802,6 +3294,7 @@ impl RealizationPlan {
                     integral,
                     &basis_values,
                     scale,
+                    rate_shift,
                     &evaluation,
                     &active_inputs,
                     &parameter_cotangents,
@@ -2812,14 +3305,21 @@ impl RealizationPlan {
             for input in &integral.primal.inputs {
                 if input.source != InputSourceRequirement::Basis
                     || input.role != TensorInputRole::Active
-                    || input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative
                 {
                     continue;
                 }
+                let Some((_, factor)) = transpose_scatter_shape(input, rate_shift) else {
+                    continue;
+                };
                 let Some(cotangent) = cotangents.get(&input.id) else {
                     continue;
                 };
-                apply_trace_basis_adjoint(&basis_values, cotangent, scale, &mut local_output)?;
+                apply_trace_basis_adjoint(
+                    &basis_values,
+                    cotangent,
+                    factor * scale,
+                    &mut local_output,
+                )?;
             }
         }
         for (local, dof) in restriction.dofs.iter().enumerate() {
@@ -2835,6 +3335,7 @@ impl RealizationPlan {
         integral: &IntegralOperatorFactorization,
         basis_values: &[f64],
         scale: f64,
+        rate_shift: f64,
         evaluation: &PointEvaluation,
         active_inputs: &[&QFunctionInput],
         parameter_cotangents: &BTreeMap<TensorInputId, Vec<f64>>,
@@ -2853,10 +3354,10 @@ impl RealizationPlan {
                     ))
                 })?;
             if input.source == InputSourceRequirement::Basis {
-                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                let Some((_, factor)) = transpose_scatter_shape(input, rate_shift) else {
                     continue;
-                }
-                apply_trace_basis_adjoint(basis_values, grad, scale, local_output)?;
+                };
+                apply_trace_basis_adjoint(basis_values, grad, factor * scale, local_output)?;
                 continue;
             }
             let binding = self
@@ -3051,6 +3552,7 @@ impl RealizationPlan {
         point: usize,
         geometry: &CellGeometry,
         scale: f64,
+        rate_shift: f64,
         evaluation: &PointEvaluation,
         active_inputs: &[&QFunctionInput],
         parameter_cotangents: &BTreeMap<TensorInputId, Vec<f64>>,
@@ -3069,16 +3571,16 @@ impl RealizationPlan {
                     ))
                 })?;
             if input.source == InputSourceRequirement::Basis {
-                if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
+                let Some((derivative, factor)) = transpose_scatter_shape(input, rate_shift) else {
                     continue;
-                }
+                };
                 apply_basis_adjoint(
                     &self.data.element,
                     geometry,
                     point,
-                    &input.binding.evaluation.derivative,
+                    &derivative,
                     grad,
-                    scale,
+                    factor * scale,
                     local_output,
                 )?;
                 continue;
@@ -3129,11 +3631,15 @@ impl RealizationPlan {
     }
 }
 
-/// Every active, basis-sourced, non-time-derivative input of one integral: the exact probe basis
-/// for a dynamic external input's chain rule back into `state_direction`'s gather space (rate
-/// direction is fixed at zero for [`RealizationPlan::vector_jacobian_product`], so
-/// time-derivative-kind active inputs never contribute and are excluded).
-fn active_state_inputs(integral: &IntegralOperatorFactorization) -> Vec<&QFunctionInput> {
+/// Every active, basis-sourced input of one integral whose cotangent the shifted transpose
+/// scatters: the exact probe basis for a dynamic external input's chain rule back into the
+/// gather space. A time-derivative-kind active input participates only under a nonzero
+/// `rate_shift` (at `rate_shift = 0`, [`RealizationPlan::vector_jacobian_product`]'s domain,
+/// the rate direction is fixed at zero, so such inputs never contribute and are excluded).
+fn active_probe_inputs(
+    integral: &IntegralOperatorFactorization,
+    rate_shift: f64,
+) -> Vec<&QFunctionInput> {
     integral
         .primal
         .inputs
@@ -3141,9 +3647,27 @@ fn active_state_inputs(integral: &IntegralOperatorFactorization) -> Vec<&QFuncti
         .filter(|input| {
             input.source == InputSourceRequirement::Basis
                 && input.role == TensorInputRole::Active
-                && input.binding.evaluation.derivative != DerivativeEvaluation::TimeDerivative
+                && transpose_scatter_shape(input, rate_shift).is_some()
         })
         .collect()
+}
+
+/// How a basis-sourced input's cotangent is scattered by the shifted transpose: the basis
+/// evaluation to scatter through and the scalar factor to apply. A `TimeDerivative` input is
+/// gathered through the value basis of the rate vector (see `evaluate_basis_input`), so its
+/// transpose scatters through the `Value` basis scaled by `rate_shift`, and is absent entirely
+/// when `rate_shift == 0`. Every other evaluation scatters through its own basis with factor
+/// one.
+fn transpose_scatter_shape(
+    input: &QFunctionInput,
+    rate_shift: f64,
+) -> Option<(DerivativeEvaluation, f64)> {
+    match input.binding.evaluation.derivative {
+        DerivativeEvaluation::TimeDerivative => {
+            (rate_shift != 0.0).then_some((DerivativeEvaluation::Value, rate_shift))
+        }
+        other => Some((other, 1.0)),
+    }
 }
 
 /// Build a synthetic direction [`PointEvaluation`] that is zero everywhere except a single unit
@@ -3336,6 +3860,141 @@ impl LinearOperator for AssembledOperator {
         output: &mut [f64],
     ) -> Result<(), NumericError> {
         self.matrix.apply(context, input, output)
+    }
+}
+
+impl TransposableOperator for AssembledOperator {
+    /// SV1-C1: the canonical CSR transpose action, without materializing
+    /// [`Self::transpose`]'s matrix.
+    fn apply_transpose(
+        &self,
+        context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        self.matrix.apply_transpose(context, input, output)
+    }
+}
+
+impl TransposableOperator for MatrixFreeOperator {
+    /// SV1-C1: the exact transpose of [`LinearOperator::apply`] at the same zero linearization
+    /// point, executing the bound Malleus VJP kernels through
+    /// [`RealizationPlan::vector_jacobian_product`]. Affine dependency constraints refuse
+    /// exactly as that method does (SV1-C2).
+    fn apply_transpose(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        let zero = vec![0.0; self.plan.dimension()];
+        self.plan
+            .vector_jacobian_product(0.0, &zero, &zero, input, output)
+            .map_err(numeric_error)
+    }
+}
+
+/// SV1-C1: the Jacobian `J = dR/du + rate_shift * dR/du_t` of one [`RealizationPlan`] at a
+/// fixed linearization point `(time, state, state_rate)`, as a Methodus operator pair: the
+/// primal action executes the bound JVP kernels
+/// ([`RealizationPlan::jacobian_vector_product`] with rate direction `rate_shift * x`) and the
+/// transpose action executes the bound VJP kernels
+/// ([`RealizationPlan::vector_jacobian_product_shifted`]). `rate_shift = 0` is the steady
+/// (Newton / adjoint-at-converged-state) Jacobian; a BDF step's Jacobian is `rate_shift =
+/// alpha / dt`. Constructed by [`RealizationPlan::linearize`].
+///
+/// Symmetry is declared `Nonsymmetric` under affine dependency constraints (their rows replace
+/// the operator's rows) and `Unknown` otherwise: a nonlinear form's Jacobian at a nonzero state
+/// is not certified by the zero-state proof [`RealizationPlan::prove_symmetry`] records, so
+/// nothing is claimed. Adjoint consumers use [`methodus::TransposeOperator::explicit`].
+#[derive(Clone, Debug)]
+pub struct LinearizedOperator {
+    plan: RealizationPlan,
+    time: f64,
+    state: Vec<f64>,
+    state_rate: Vec<f64>,
+    rate_shift: f64,
+}
+
+impl LinearizedOperator {
+    pub fn plan(&self) -> &RealizationPlan {
+        &self.plan
+    }
+
+    pub fn time(&self) -> f64 {
+        self.time
+    }
+
+    pub fn state(&self) -> &[f64] {
+        &self.state
+    }
+
+    pub fn state_rate(&self) -> &[f64] {
+        &self.state_rate
+    }
+
+    pub fn rate_shift(&self) -> f64 {
+        self.rate_shift
+    }
+}
+
+impl LinearOperator for LinearizedOperator {
+    fn rows(&self) -> usize {
+        self.plan.dimension()
+    }
+
+    fn columns(&self) -> usize {
+        self.plan.dimension()
+    }
+
+    fn symmetry(&self) -> OperatorSymmetry {
+        if self.plan.data.constraints.has_affine_dependencies() {
+            OperatorSymmetry::Nonsymmetric
+        } else {
+            OperatorSymmetry::Unknown
+        }
+    }
+
+    fn apply(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        let rate_direction = input
+            .iter()
+            .map(|value| self.rate_shift * value)
+            .collect::<Vec<_>>();
+        self.plan
+            .jacobian_vector_product(
+                self.time,
+                &self.state,
+                &self.state_rate,
+                input,
+                &rate_direction,
+                output,
+            )
+            .map_err(numeric_error)
+    }
+}
+
+impl TransposableOperator for LinearizedOperator {
+    fn apply_transpose(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        self.plan
+            .vector_jacobian_product_shifted(
+                self.time,
+                &self.state,
+                &self.state_rate,
+                input,
+                self.rate_shift,
+                output,
+            )
+            .map_err(numeric_error)
     }
 }
 
@@ -4375,6 +5034,72 @@ pub(crate) fn execute_jvp_values(
         *value += parameter;
     }
     Ok(output)
+}
+
+/// SV1-C3: execute one bound bundle's frozen-input (parameter) JVP kernel with `direction`
+/// routed to `hot_input` only and every other frozen operand's direction zero -- the exact
+/// point-local `d(output)/d(hot_input) * direction`. Returns `None` when `hot_input` is not an
+/// operand of this output's kernels at all (the output does not depend on it); refuses typed
+/// when the kernel reads the input but its parameter program carries no tangent for it.
+fn execute_parameter_jvp_values(
+    bound: &BoundBundle,
+    inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+    hot_input: TensorInputId,
+    direction: &[f64],
+) -> Result<Option<Vec<f64>>, FinitumError> {
+    let input_by_operand = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| (binding.operand, binding.input))
+        .collect::<BTreeMap<_, _>>();
+    if !input_by_operand.values().any(|input| *input == hot_input) {
+        return Ok(None);
+    }
+    let mut values = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| (binding.operand, inputs[&binding.input].clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut routed = false;
+    for pair in &bound.bundle.parameter.independent_operands {
+        let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "parameter-JVP operand {:?} has no QFunction input binding",
+                pair.primal
+            ))
+        })?;
+        if input == hot_input {
+            if direction.len() != inputs[&input].len() {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "coefficient direction has {} components, input {:?} has {}",
+                    direction.len(),
+                    input,
+                    inputs[&input].len()
+                )));
+            }
+            values.insert(pair.derivative, direction.to_vec());
+            routed = true;
+        } else {
+            values.insert(pair.derivative, vec![0.0; inputs[&input].len()]);
+        }
+    }
+    if !routed {
+        return Err(FinitumError::RealizationTangentUnavailable(format!(
+            "kernel output ({}, {}) reads input {hot_input:?} but its parameter program \
+             carries no tangent for it",
+            bound.bundle.integral_index, bound.bundle.output_index
+        )));
+    }
+    let executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+    let buffers = execute(executable, &values)?;
+    operand_values(
+        executable,
+        &buffers,
+        bound.bundle.parameter.dependent_operands[0].derivative,
+    )
+    .map(Some)
 }
 
 /// Execute one bound bundle's PRIMAL kernel against already-gathered point `inputs`, returning

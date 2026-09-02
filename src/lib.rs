@@ -54,9 +54,10 @@ pub use profile::{
     essential_constraints_from_selected, facet_membership_from, realize, refine_uniform,
 };
 pub use realization::{
-    AssembledOperator, CapabilityElement, ConstraintKind, DerivativeProduct, DynamicExternalInput,
-    ExternalInput, ExternalSensitivityInput, GeometryParameterSensitivity, MatrixFreeOperator,
-    PointActiveInput, PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
+    AssembledOperator, CapabilityElement, CoefficientLayout, ConstraintKind, DerivativeProduct,
+    DistributedCoefficient, DynamicExternalInput, ExternalInput, ExternalSensitivityInput,
+    GeometryParameterSensitivity, LinearizedOperator, MatrixFreeOperator, PointActiveInput,
+    PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
     RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
     RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from,
 };

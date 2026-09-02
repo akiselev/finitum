@@ -5,6 +5,7 @@ Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 el
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
 (Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and
 H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpus systems solve)
++ W7/E7 SV1-C1/C3 global transpose operators and distributed-coefficient VJPs
 
 ## Implemented
 
@@ -165,6 +166,40 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   makes the discrete system genuinely full rank, so the structural constant-pressure nullspace
   candidate correctly does not verify against the realized operator.
 
+- SV1-C1/C3 (W7/E7): the global transpose as a Methodus operator pair and distributed-
+  coefficient derivative products, all executing the bound Malleus VJP/parameter kernels
+  point-locally (no assembly):
+  - `RealizationPlan::linearize(time, state, rate, rate_shift)` -> `LinearizedOperator`, the
+    Jacobian `dR/du + rate_shift * dR/du_t` at a fixed linearization point implementing
+    `methodus::LinearOperator` (JVP with rate direction `rate_shift * x`) and
+    `methodus::TransposableOperator` (`vector_jacobian_product_shifted`, the new rate-shifted
+    generalization of GX-F7's VJP: a `TimeDerivative` active input's cotangent scatters through
+    the value basis scaled by the shift, dynamic-input chain rules through `dt(u)` are probed
+    the same way). `rate_shift = 0` is byte-identical to `vector_jacobian_product`.
+  - `MatrixFreeOperator` and `AssembledOperator` implement `TransposableOperator` (VJP at zero
+    state; CSR transposed traversal), so `methodus::TransposeOperator::explicit` and the
+    adjoint solve (SV1-D1) consume every realized operator without a symmetry declaration.
+  - `DistributedCoefficient { integral_index, input, layout: CoefficientLayout::{Vertex, Cell,
+    QuadraturePoint} }` views one stored external input of a cell integral as a caller-owned
+    design vector; `ExternalInput::from_coefficient` builds the stored table from that vector,
+    `coefficient_jacobian_vector_product` is `dR/dp * d` (parameter kernel with the direction
+    routed to that input only) and `coefficient_vector_jacobian_product` its exact transpose
+    accumulated through the layout's interpolation transpose. Constraint rows carry zero
+    coefficient derivative. Capability reports `DerivativeProduct::{CoefficientJvp,
+    CoefficientVjp}` exactly when a stored cell input exists (the VJP under the affine-
+    dependency rule GX-F7 already applies).
+  - Evidence (`tests/sv1_c1_transpose.rs`, 7 tests): adjoint identities to `1e-12` relative on
+    Poisson (nodal `k`) and on a transient nonlinear fixture at a nonzero state with rate
+    shifts 0 and 3.7 (the shifted forward action also matches centered differences of the
+    residual); matrix-free/assembled/materialized transposes agree to `1e-12`; coefficient
+    JVP/VJP transposes for all three layouts to `1e-12`; coefficient JVP against centered
+    differences of rebuilt realizations; and the adjoint objective gradient `dJ/dk =
+    -lambda^T dR/dk` (adjoint solved by GMRES through the explicit transpose) against centered
+    differences of the fully rebuilt solve with tightening error over two step sizes.
+  - Not landed: transposes of affine dependency constraints, condensation, and transfer
+    (SV1-C2, refused typed as before); coefficient products on facet integrals and for dynamic
+    bindings (refused typed); mesh-coordinate JVP/VJP (SV1-C4).
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -233,7 +268,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 103 passed, 0 failed (SV2-B1 head fae5675; 52 at the R3D-era transcript this block was written for)
+cargo test --locked --workspace --all-targets           # 129 passed, 0 failed across 20 binaries (W7 SV1-C1/C3; 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
