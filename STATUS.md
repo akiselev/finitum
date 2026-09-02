@@ -355,6 +355,18 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    shape-only `artifact_digest` remains), Hcurl realization, and interior-facet/DG measures;
 5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
    under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).
+6. SC composition (design `sinbad/ARCHITECTURE.md` §8, §12; nothing landed).
+   Prerequisite batch P: a state-dependent `SystemOperator` residual/JVP with the
+   GX-A3 tangents (today the system path is linear — residual is `A·state`, no VJP)
+   so transient nonlinear systems such as 08 can execute. SC-W1: `BlockLayout`,
+   `RegionMap`, and `SystemEssentialConstraintRequirement` re-keyed to Scientia's
+   system-level ids (same `u32` width), public per-(row, column) block actions and
+   transposes, a per-instance receipt chain in `SystemRealizationPlan`, and
+   quadrature-point evaluation of a producer instance's output kernel for
+   `BoundChain::Composed`. SC-W2: `Interface`/`InteriorFacet` measure realization
+   (refused today), `InterfaceRealization` (facet pairing, trace DOF maps,
+   orientation), and `ConnectionRealizationPlan` with the elimination path first;
+   multiplier/Nitsche and transfer beyond the 1-D `NonmatchingTransfer` in SC-W3.
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.
