@@ -66,8 +66,9 @@ pub use space::{
     vector_nodal_dof_map,
 };
 pub use system::{
-    ReducedSystemOperator, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
-    SystemOperator, SystemRealizationPlan, essential_constraints_from_system,
+    LinearizedSystemOperator, ReducedSystemOperator, SystemConstitutiveInput,
+    SystemEssentialConstraintRequirement, SystemOperator, SystemRealizationPlan,
+    essential_constraints_from_system, system_constitutive_from_sources,
 };
 pub use topology::{
     CompatibleDofMaps, ExactSequence, FacetId, FacetIncidence, FacetTopology, MeshFacet,

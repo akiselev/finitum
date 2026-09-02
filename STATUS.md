@@ -6,6 +6,7 @@ SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realizati
 (Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and
 H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpus systems solve)
 + W7/E7 SV1-C1/C3 global transpose operators and distributed-coefficient VJPs
++ W7/P state-dependent `SystemOperator` residual/JVP/VJP with GX-A3 chain-rule tangents
 
 ## Implemented
 
@@ -200,6 +201,45 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     (SV1-C2, refused typed as before); coefficient products on facet integrals and for dynamic
     bindings (refused typed); mesh-coordinate JVP/VJP (SV1-C4).
 
+- Batch P (W7; ARCHITECTURE.md §12 P item 2): the system realization is state-dependent.
+  `SystemOperator::residual(t, u, u_t)`, `jacobian_vector_product(t, u, u_t, du, du_t)`,
+  `vector_jacobian_product[_shifted]`, and `linearize` evaluate every block's bound PRIMAL/JVP/
+  VJP kernels at the actual linearization point (basis inputs gathered from the state, or from
+  the rate for `TimeDerivative` inputs; constitutive closures see the point's actual active
+  values and time), with the chain rule through every closure's exact `direction` composed by
+  the generated parameter-JVP kernel (forward) and inverted by unit-perturbation probing
+  (transpose), so cross-field property tangents (`ka = ka(b)` inside the `a` equation) land in
+  the off-diagonal blocks without any expression rewriting. The `LinearOperator` view
+  (`apply_action`) and `load_vector` are now defined as the JVP and `-R` at the zero point and
+  are numerically unchanged (E6 Stokes/Darcy tests pass as before). `ReducedSystemOperator`
+  gains the essential-constraint-eliminated `residual`/`jacobian_vector_product`/`vector_
+  jacobian_product[_shifted]`/`linearize` (constraint rows mirror `RealizationPlan` row for
+  row) and implements Methodus `DaeOperator`, `NonlinearOperator` (steady view at `t = 0`,
+  `u_t = 0`), and `TransposableOperator`; `SystemOperator` implements `TransposableOperator`;
+  `LinearizedSystemOperator` (physical or reduced) implements `LinearOperator +
+  TransposableOperator + BlockLinearOperator`. `jacobian_properties` claims the zero-point
+  properties only for a structurally linear, non-transient system; otherwise `Unknown` plus
+  the block partition. `BlockNonlinearOperator` is deliberately not implemented on
+  `ReducedSystemOperator` (its `block_layout` would clash with `BlockLinearOperator`'s at every
+  call site); Krasis's `CoupledSystemOperator` owns that view.
+  `system_constitutive_from_sources(system, model, sources)` is the GX-A3 resolution for the
+  system path, mirroring `external_inputs_from` rule for rule (kernel/table with exactly one
+  active-field input -> exact tangent/slope closure, coordinate-only/constant/sampled ->
+  zero direction, nodal refused, missing tangent -> `RealizationTangentUnavailable`), looking
+  the field's value up by its active input's `TensorInputId` (`PointEvaluation::input_values`)
+  so several fields sharing an evaluation kind stay distinct.
+  Evidence (`tests/w7_p_system_state_dependent.rs`, 7 tests, on a hermetic two-field
+  transient nonlinear system with cross-field property tangents, a state-dependent capacity,
+  and a product term): centered residual differences match the JVP; JVP/VJP exact transposes
+  to `1e-12` at a nonzero state for rate shifts 0 and 2.5 (physical and reduced); the zero-point
+  view and load vector equal the stateful actions at zero bit-for-bit; Methodus `verify_dae_jvp`
+  passes on the reduced `DaeOperator`; three Methodus BDF1 steps advance the reduced transient
+  system with Dirichlet rows held; kernel-sourced properties reproduce the closure operator's
+  residual/JVP/VJP to `1e-12`; a kernel without a tangent is refused typed.
+  Not landed: exterior-facet integrals with active inputs in the system path (still refused at
+  bind time), interior-facet/interface measures (SC-W1 item below), affine-dependency
+  transposes (SV1-C2).
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -268,7 +308,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 129 passed, 0 failed across 20 binaries (W7 SV1-C1/C3; 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 136 passed, 0 failed across 21 binaries (W7 SV1-C1/C3 + P; 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models

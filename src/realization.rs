@@ -140,6 +140,15 @@ impl PointEvaluation {
             .find(|input| input.derivative == derivative)
             .map(|input| input.values.as_slice())
     }
+
+    /// Return the active binding of one QFunction input by identity -- unambiguous where several
+    /// fields of a multi-field system share an evaluation kind (Batch P).
+    pub fn input_values(&self, input: TensorInputId) -> Option<&[f64]> {
+        self.active
+            .iter()
+            .find(|candidate| candidate.input == input)
+            .map(|candidate| candidate.values.as_slice())
+    }
 }
 
 type PointValueEvaluator = dyn Fn(&PointEvaluation) -> Vec<f64> + Send + Sync;
@@ -1728,7 +1737,7 @@ impl RealizationPlan {
                         output_components,
                         &local_adjoint,
                     )?;
-                    let cotangents = self.point_parameter_cotangents(bound, &inputs, &seed)?;
+                    let cotangents = point_parameter_cotangents(bound, &inputs, &seed)?;
                     let Some(cotangent) = cotangents.get(&coefficient.input) else {
                         continue;
                     };
@@ -3149,10 +3158,10 @@ impl RealizationPlan {
                         output_components,
                         &local_adjoint,
                     )?;
-                    let mut cotangents = self.execute_vjp_values(bound, &inputs, seed.clone())?;
+                    let mut cotangents = execute_vjp_values(bound, &inputs, seed.clone())?;
                     if !bound.bundle.parameter.independent_operands.is_empty() {
                         let parameter_cotangents =
-                            self.point_parameter_cotangents(bound, &inputs, &seed)?;
+                            point_parameter_cotangents(bound, &inputs, &seed)?;
                         self.accumulate_parameter_cotangents(
                             integral,
                             point_index,
@@ -3286,10 +3295,9 @@ impl RealizationPlan {
             let bound = &self.data.bundles[&(integral.integral_index, output_index)];
             let output_components = component_count(&qoutput.shape)?;
             let seed = gather_trace_test_adjoint(&basis_values, output_components, &local_adjoint)?;
-            let mut cotangents = self.execute_vjp_values(bound, &inputs, seed.clone())?;
+            let mut cotangents = execute_vjp_values(bound, &inputs, seed.clone())?;
             if !bound.bundle.parameter.independent_operands.is_empty() {
-                let parameter_cotangents =
-                    self.point_parameter_cotangents(bound, &inputs, &seed)?;
+                let parameter_cotangents = point_parameter_cotangents(bound, &inputs, &seed)?;
                 self.accumulate_parameter_cotangents_facet(
                     integral,
                     &basis_values,
@@ -3404,139 +3412,140 @@ impl RealizationPlan {
         }
         Ok(())
     }
+}
 
-    /// Execute one integral output's bound VJP kernel: feed `seed` into the kernel's cotangent
-    /// seed operand and read back one cotangent per active input operand, summing contributions
-    /// when the same [`TensorInputId`] is read through more than one kernel operand access.
-    fn execute_vjp_values(
-        &self,
-        bound: &BoundBundle,
-        inputs: &BTreeMap<TensorInputId, Vec<f64>>,
-        seed: Vec<f64>,
-    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
-        let input_by_operand = bound
-            .bundle
-            .primal_inputs
-            .iter()
-            .map(|binding| (binding.operand, binding.input))
-            .collect::<BTreeMap<_, _>>();
-        let mut values = BTreeMap::new();
-        for binding in &bound.bundle.primal_inputs {
-            values.insert(binding.operand, inputs[&binding.input].clone());
-        }
-        values.insert(bound.bundle.vjp.dependent_operands[0].derivative, seed);
-        let executable = &bound.executable.kernels()[bound.bundle.vjp.kernel_index];
-        let buffers = execute(executable, &values)?;
-        let mut cotangents: BTreeMap<TensorInputId, Vec<f64>> = BTreeMap::new();
-        for pair in &bound.bundle.vjp.independent_operands {
-            let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
-                FinitumError::InvalidRealization(format!(
-                    "VJP operand {:?} has no QFunction input binding",
-                    pair.primal
-                ))
-            })?;
-            let contribution = operand_values(executable, &buffers, pair.derivative)?;
-            match cotangents.get_mut(&input) {
-                Some(existing) => {
-                    if existing.len() != contribution.len() {
-                        return Err(FinitumError::InvalidRealization(
-                            "VJP cotangent has inconsistent extents across accesses".into(),
-                        ));
-                    }
-                    for (total, value) in existing.iter_mut().zip(&contribution) {
-                        *total += value;
-                    }
-                }
-                None => {
-                    cotangents.insert(input, contribution);
-                }
-            }
-        }
-        Ok(cotangents)
+/// Execute one integral output's bound VJP kernel: feed `seed` into the kernel's cotangent
+/// seed operand and read back one cotangent per active input operand, summing contributions
+/// when the same [`TensorInputId`] is read through more than one kernel operand access. A free
+/// function (like [`execute_jvp_values`]) so the single-field and system realizations share it.
+pub(crate) fn execute_vjp_values(
+    bound: &BoundBundle,
+    inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+    seed: Vec<f64>,
+) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
+    let input_by_operand = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| (binding.operand, binding.input))
+        .collect::<BTreeMap<_, _>>();
+    let mut values = BTreeMap::new();
+    for binding in &bound.bundle.primal_inputs {
+        values.insert(binding.operand, inputs[&binding.input].clone());
     }
-
-    /// Extract the exact point-local Jacobian of the bound "parameter" (frozen-input) JVP
-    /// kernel with respect to every one of its independent (non-active) operands, by probing it
-    /// with unit direction columns -- exact because that kernel is Malleus's own linear tangent
-    /// map -- then contract each column against `seed` to produce one cotangent per parameter
-    /// input, summed across repeated accesses of the same [`TensorInputId`].
-    fn point_parameter_cotangents(
-        &self,
-        bound: &BoundBundle,
-        inputs: &BTreeMap<TensorInputId, Vec<f64>>,
-        seed: &[f64],
-    ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
-        let input_by_operand = bound
-            .bundle
-            .primal_inputs
-            .iter()
-            .map(|binding| (binding.operand, binding.input))
-            .collect::<BTreeMap<_, _>>();
-        let mut base_values = BTreeMap::new();
-        for binding in &bound.bundle.primal_inputs {
-            base_values.insert(binding.operand, inputs[&binding.input].clone());
-        }
-        let executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
-        let output_operand = bound.bundle.parameter.dependent_operands[0].derivative;
-        let mut grad: BTreeMap<TensorInputId, Vec<f64>> = BTreeMap::new();
-        for pair in &bound.bundle.parameter.independent_operands {
-            let component_count = base_values
-                .get(&pair.primal)
-                .map(|values| values.len())
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(format!(
-                        "parameter-JVP operand {:?} has no base value binding",
-                        pair.primal
-                    ))
-                })?;
-            let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
-                FinitumError::InvalidRealization(format!(
-                    "parameter-JVP operand {:?} has no QFunction input binding",
-                    pair.primal
-                ))
-            })?;
-            let mut cotangent = vec![0.0; component_count];
-            for component in 0..component_count {
-                let mut probe_values = base_values.clone();
-                for other in &bound.bundle.parameter.independent_operands {
-                    let length = base_values[&other.primal].len();
-                    probe_values.insert(other.derivative, vec![0.0; length]);
-                }
-                let mut direction = vec![0.0; component_count];
-                direction[component] = 1.0;
-                probe_values.insert(pair.derivative, direction);
-                let buffers = execute(executable, &probe_values)?;
-                let column = operand_values(executable, &buffers, output_operand)?;
-                if column.len() != seed.len() {
+    values.insert(bound.bundle.vjp.dependent_operands[0].derivative, seed);
+    let executable = &bound.executable.kernels()[bound.bundle.vjp.kernel_index];
+    let buffers = execute(executable, &values)?;
+    let mut cotangents: BTreeMap<TensorInputId, Vec<f64>> = BTreeMap::new();
+    for pair in &bound.bundle.vjp.independent_operands {
+        let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "VJP operand {:?} has no QFunction input binding",
+                pair.primal
+            ))
+        })?;
+        let contribution = operand_values(executable, &buffers, pair.derivative)?;
+        match cotangents.get_mut(&input) {
+            Some(existing) => {
+                if existing.len() != contribution.len() {
                     return Err(FinitumError::InvalidRealization(
-                        "parameter-JVP output extent does not match the VJP seed".into(),
+                        "VJP cotangent has inconsistent extents across accesses".into(),
                     ));
                 }
-                cotangent[component] = column
-                    .iter()
-                    .zip(seed)
-                    .map(|(value, seed)| value * seed)
-                    .sum();
+                for (total, value) in existing.iter_mut().zip(&contribution) {
+                    *total += value;
+                }
             }
-            match grad.get_mut(&input) {
-                Some(existing) => {
-                    if existing.len() != cotangent.len() {
-                        return Err(FinitumError::InvalidRealization(
-                            "parameter cotangent has inconsistent extents across accesses".into(),
-                        ));
-                    }
-                    for (total, value) in existing.iter_mut().zip(&cotangent) {
-                        *total += value;
-                    }
-                }
-                None => {
-                    grad.insert(input, cotangent);
-                }
+            None => {
+                cotangents.insert(input, contribution);
             }
         }
-        Ok(grad)
     }
+    Ok(cotangents)
+}
 
+/// Extract the exact point-local Jacobian of the bound "parameter" (frozen-input) JVP
+/// kernel with respect to every one of its independent (non-active) operands, by probing it
+/// with unit direction columns -- exact because that kernel is Malleus's own linear tangent
+/// map -- then contract each column against `seed` to produce one cotangent per parameter
+/// input, summed across repeated accesses of the same [`TensorInputId`].
+pub(crate) fn point_parameter_cotangents(
+    bound: &BoundBundle,
+    inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+    seed: &[f64],
+) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
+    let input_by_operand = bound
+        .bundle
+        .primal_inputs
+        .iter()
+        .map(|binding| (binding.operand, binding.input))
+        .collect::<BTreeMap<_, _>>();
+    let mut base_values = BTreeMap::new();
+    for binding in &bound.bundle.primal_inputs {
+        base_values.insert(binding.operand, inputs[&binding.input].clone());
+    }
+    let executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+    let output_operand = bound.bundle.parameter.dependent_operands[0].derivative;
+    let mut grad: BTreeMap<TensorInputId, Vec<f64>> = BTreeMap::new();
+    for pair in &bound.bundle.parameter.independent_operands {
+        let component_count = base_values
+            .get(&pair.primal)
+            .map(|values| values.len())
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "parameter-JVP operand {:?} has no base value binding",
+                    pair.primal
+                ))
+            })?;
+        let input = input_by_operand.get(&pair.primal).copied().ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "parameter-JVP operand {:?} has no QFunction input binding",
+                pair.primal
+            ))
+        })?;
+        let mut cotangent = vec![0.0; component_count];
+        for component in 0..component_count {
+            let mut probe_values = base_values.clone();
+            for other in &bound.bundle.parameter.independent_operands {
+                let length = base_values[&other.primal].len();
+                probe_values.insert(other.derivative, vec![0.0; length]);
+            }
+            let mut direction = vec![0.0; component_count];
+            direction[component] = 1.0;
+            probe_values.insert(pair.derivative, direction);
+            let buffers = execute(executable, &probe_values)?;
+            let column = operand_values(executable, &buffers, output_operand)?;
+            if column.len() != seed.len() {
+                return Err(FinitumError::InvalidRealization(
+                    "parameter-JVP output extent does not match the VJP seed".into(),
+                ));
+            }
+            cotangent[component] = column
+                .iter()
+                .zip(seed)
+                .map(|(value, seed)| value * seed)
+                .sum();
+        }
+        match grad.get_mut(&input) {
+            Some(existing) => {
+                if existing.len() != cotangent.len() {
+                    return Err(FinitumError::InvalidRealization(
+                        "parameter cotangent has inconsistent extents across accesses".into(),
+                    ));
+                }
+                for (total, value) in existing.iter_mut().zip(&cotangent) {
+                    *total += value;
+                }
+            }
+            None => {
+                grad.insert(input, cotangent);
+            }
+        }
+    }
+    Ok(grad)
+}
+
+impl RealizationPlan {
     /// Route each parameter cotangent to its exact destination: a passive basis-sourced input
     /// (state-dependent but not part of the active JVP/VJP contract) is scattered directly
     /// through its own trial-side basis, like an active input; a stored external input is a dead
@@ -3636,7 +3645,7 @@ impl RealizationPlan {
 /// gather space. A time-derivative-kind active input participates only under a nonzero
 /// `rate_shift` (at `rate_shift = 0`, [`RealizationPlan::vector_jacobian_product`]'s domain,
 /// the rate direction is fixed at zero, so such inputs never contribute and are excluded).
-fn active_probe_inputs(
+pub(crate) fn active_probe_inputs(
     integral: &IntegralOperatorFactorization,
     rate_shift: f64,
 ) -> Vec<&QFunctionInput> {
@@ -3658,7 +3667,7 @@ fn active_probe_inputs(
 /// transpose scatters through the `Value` basis scaled by `rate_shift`, and is absent entirely
 /// when `rate_shift == 0`. Every other evaluation scatters through its own basis with factor
 /// one.
-fn transpose_scatter_shape(
+pub(crate) fn transpose_scatter_shape(
     input: &QFunctionInput,
     rate_shift: f64,
 ) -> Option<(DerivativeEvaluation, f64)> {
@@ -3673,7 +3682,7 @@ fn transpose_scatter_shape(
 /// Build a synthetic direction [`PointEvaluation`] that is zero everywhere except a single unit
 /// component of `hot_input`, for probing a [`DynamicExternalInput`]'s trusted `direction`
 /// closure at the real (unperturbed) `evaluation`.
-fn probe_direction_evaluation(
+pub(crate) fn probe_direction_evaluation(
     evaluation: &PointEvaluation,
     active_inputs: &[&QFunctionInput],
     hot_input: TensorInputId,
