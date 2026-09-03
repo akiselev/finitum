@@ -71,6 +71,22 @@ impl AffineMap {
             .collect())
     }
 
+    /// Inverse of [`Self::physical_point`]: the reference coordinates of a physical point,
+    /// `J^{-1} (x - origin)` (exact for the affine simplex map).
+    pub fn reference_point(&self, physical: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        self.vector_extent(physical)?;
+        Ok((0..self.dimension)
+            .map(|row| {
+                (0..self.dimension)
+                    .map(|column| {
+                        self.inverse[row * self.dimension + column]
+                            * (physical[column] - self.origin[column])
+                    })
+                    .sum::<f64>()
+            })
+            .collect())
+    }
+
     /// H1 gradient / H(curl) covariant Piola map: `J^{-T} value`.
     pub fn covariant_piola(&self, reference: &[f64]) -> Result<Vec<f64>, FinitumError> {
         self.vector_extent(reference)?;

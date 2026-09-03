@@ -9,6 +9,7 @@ mod element;
 mod embedded;
 mod error;
 mod infsup;
+mod interface;
 mod mapping;
 mod mesh;
 mod method;
@@ -37,6 +38,11 @@ pub use error::FinitumError;
 pub use infsup::{
     INF_SUP_DIMENSION_CAP, INF_SUP_REPORT_SCHEMA, InfSupConfig, InfSupEstimate, InfSupInstability,
     InfSupNorm, InfSupPairing, InfSupVerdict, estimate_inf_sup, require_inf_sup_stable,
+};
+pub use interface::{
+    INTERFACE_REALIZATION_SCHEMA, InterfaceKernel, InterfaceMeasure, InterfaceOperand,
+    InterfaceOperator, InterfaceSpace, InterfaceSwapKernelReceipt, InterfaceSwapReceipt,
+    TraceEvaluation, TraceFieldSpec,
 };
 pub use mapping::AffineMap;
 pub use mesh::{Cell, CellId, Mesh, VertexId};

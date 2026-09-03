@@ -384,7 +384,7 @@ pub(crate) fn rt0_reference_basis(
 /// Six-point, degree-4-exact symmetric quadrature for the reference triangle `(0,0), (1,0),
 /// (0,1)` (area `1/2`), sufficient to exactly integrate a P2 mass-matrix-shaped (degree-4)
 /// integrand. Standard Dunavant/Strang-Fix constants.
-fn triangle_degree4_quadrature() -> Vec<QuadraturePoint> {
+pub(crate) fn triangle_degree4_quadrature() -> Vec<QuadraturePoint> {
     const AREA: f64 = 0.5;
     let groups = [
         (0.445948490915965_f64, 0.223381589678011_f64),
@@ -420,7 +420,7 @@ fn tetrahedron_degree2_quadrature() -> Vec<QuadraturePoint> {
         .collect()
 }
 
-fn gauss_legendre_unit_interval(count: usize) -> Vec<QuadraturePoint> {
+pub(crate) fn gauss_legendre_unit_interval(count: usize) -> Vec<QuadraturePoint> {
     let mut points = Vec::with_capacity(count);
     let half = count.div_ceil(2);
     for root in 0..half {

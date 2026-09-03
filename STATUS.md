@@ -9,6 +9,7 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7/P state-dependent `SystemOperator` residual/JVP/VJP with GX-A3 chain-rule tangents
 + W7/package 3 runtime inf-sup checker for realized mixed pairs
 + W7/SC-W1 (Finitum) system-level ids keying `BlockLayout` and public per-block actions/transposes
++ W7/SC-W1 (Finitum) / SV2-B2 interface-measure realization binding Malleus facet-pair kernels
 
 ## Implemented
 
@@ -322,6 +323,58 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     of one model in one group) waits on Scientia's `OperatorSystem/2`; `RegionMap`/
     `SystemEssentialConstraintRequirement` stay `RegionId`/`SymbolId`-keyed.
 
+- SC-W1 Finitum side, item 3 / SV2-B2 (`src/interface.rs`): interface and interior-facet
+  measure realization over shared facets, binding Malleus **facet-pair kernels** through their
+  roles (Malleus `9862a08`: `FacetPairKernel`, `FacetOperandRole::{Cell{side, partner},
+  Facet{parity}}`, `FACET_NORMAL_CONVENTION = "minus_to_plus"`).
+  - `InterfaceSpace` (fields as `TraceFieldSpec { symbol, order 0|1|2, components,
+    continuous }` over a `BlockLayout` -- its own via `new`, or an existing `SystemOperator`
+    layout via `over_layout` so cell and interface actions add on one vector; cell-owned DG P0/P1
+    DOF maps are new, continuous P1/P2 reuse the nodal maps), `InterfaceMeasure` (`interior`:
+    every interior facet with the canonical first incidence as minus; `between(minus_cells)`:
+    the interface of a cell set, oriented outward from it; `from_pairs`; `flipped`),
+    `InterfaceKernel` (a validated Malleus facet-pair kernel plus one `InterfaceOperand` per
+    operand: `Trace{field, side, Value|Gradient}` must carry `Cell{side}` and be readable,
+    `Normal` must be `Facet{Odd}`, `Coordinates`/`FacetMeasure`/`Constant` must be
+    `Facet{Even}`, `Residual{field, side, evaluation}` must be `Cell{side}` and writable, and
+    shapes are checked against the field's components and the mesh dimension), and
+    `InterfaceOperator` (residual / JVP / VJP at a state, the zero-state `apply_action`,
+    CSR `assemble`, Methodus `LinearOperator + TransposableOperator`, content-addressed
+    `digest`). Facet quadrature is 3-point Gauss on segments and the degree-4 rule on
+    triangles, mapped into both cells' reference coordinates through the exact affine inverse
+    (`AffineMap::reference_point`, new); the normal is the minus cell's outward normal, i.e.
+    Malleus's minus-to-plus convention, and the plus cell is checked to lie on its far side.
+    JVP/VJP execute `differentiate_facet_pair` products over every `Trace` input and every
+    `Residual` output, so the pair is an exact transpose by construction.
+  - `InterfaceOperator::swap_symmetry_receipt(state, tolerance)` executes Malleus's own
+    `check_facet_swap_symmetry` at every facet with the *realized* traces, certifying that the
+    global action does not depend on Finitum's minus/plus choice; a kernel with a partnerless
+    (one-sided) cell operand is refused typed by the receipt, since Malleus cannot exchange
+    its sides. Trace classes recorded here (Malleus deliberately records none): `Value` and
+    `Gradient` traces of Lagrange fields on affine simplex facets; `Normal` and `Tangential`
+    (Piola) trace mappings and `FacetL2` (a facet-native unknown) are not realized.
+  - Evidence (`tests/w7_sc_w1_interface.rs`, 5 tests, hand-written Malleus kernels): a P0
+    jump-penalty kernel over every interior facet of a 3x3 square assembles to the hand-built
+    facet-length-weighted graph Laplacian (1e-13), annihilates constants, is symmetric, JVP/VJP
+    transpose to 1e-12, the flipped measure realizes the bit-identical operator, and the swap
+    receipt passes; a `Facet{Odd}`-normal central-flux kernel matches its closed form and is
+    flip invariant while a one-sided variant fails the receipt and changes under the flip (the
+    receipt detects exactly the orientation-dependent kernels); a two-field P1 coupling across
+    the `x = 0.5` interface of a square (`between`) assembles to `[M -M; -M M]` with the segment
+    mass matrices on the shared nodes and vanishes for equal constants, and its one-sided
+    operands make the receipt refuse typed; a gradient-average consistency kernel on a
+    discontinuous P1 field reproduces `-/+ n_x |F| / 2` for `u = x`; every binding refusal
+    (side, parity, access, count, no residual, shape, unknown field, exterior facet, repeated
+    facet, unsupported orders, `over_layout` extent) is typed.
+  - Not landed: `SystemRealizationPlan::bind_kernels` still refuses `SemanticMeasure::
+    {InteriorFacet, Interface}` -- Scientia's factorization does emit `MinusTrace`/`PlusTrace`
+    inputs for them (`jump`/`average`/`trace_minus`/`trace_plus`), so the bridge is to wrap
+    each such bound kernel as a `FacetPairKernel` with roles derived from the input sites and
+    hand it to this module; no corpus model or `.res` equation authors an interior-facet term
+    yet (only `form` fixtures do), so the bridge waits for a driving case (SC-W2's CHT
+    `ConnectionRealizationPlan`). Time-derivative traces, curved facets, and dimension 1 are
+    refused typed.
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -390,11 +443,16 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 148 passed, 0 failed across 23 binaries (W7 SC-W1 ids/block actions; 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 153 passed, 0 failed across 24 binaries (W7 SC-W1 interface; 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
 ```
+
+The W7 SC-W1 gate (153 tests) ran against Scientia `567251a`, Malleus `9862a08`, Methodus
+`bf9082f` through a symlink overlay with a clone of Scientia's committed head, because the
+Scientia working tree was mid-edit (not compiling) at the time; `-p finitum` scoping is the
+rule for every cargo invocation (a `cargo fmt --all` follows path dependencies into siblings).
 
 The realization gate includes an independent affine patch test on a nonuniform sheared mesh:
 with `k = 1`, `f = 0`, and nonzero linear Dirichlet data, both realized operators reproduce every
