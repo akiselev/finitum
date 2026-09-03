@@ -570,18 +570,23 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    shape-only `artifact_digest` remains), Hcurl realization, and interior-facet/DG measures;
 5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
    under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).
-6. SC composition (design `sinbad/ARCHITECTURE.md` §8, §12; nothing landed).
-   Prerequisite batch P: a state-dependent `SystemOperator` residual/JVP with the
-   GX-A3 tangents (today the system path is linear — residual is `A·state`, no VJP)
-   so transient nonlinear systems such as 08 can execute. SC-W1: `BlockLayout`,
-   `RegionMap`, and `SystemEssentialConstraintRequirement` re-keyed to Scientia's
-   system-level ids (same `u32` width), public per-(row, column) block actions and
-   transposes, a per-instance receipt chain in `SystemRealizationPlan`, and
-   quadrature-point evaluation of a producer instance's output kernel for
-   `BoundChain::Composed`. SC-W2: `Interface`/`InteriorFacet` measure realization
-   (refused today), `InterfaceRealization` (facet pairing, trace DOF maps,
-   orientation), and `ConnectionRealizationPlan` with the elimination path first;
-   multiplier/Nitsche and transfer beyond the 1-D `NonmatchingTransfer` in SC-W3.
+6. SC composition (design `sinbad/ARCHITECTURE.md` §8, §12). Landed by W7 (2026-09-03):
+   prerequisite batch P (`4a6fe65`, state-dependent `SystemOperator` with GX-A3 tangents);
+   SV1-C1/C3 global transposes and coefficient VJPs (`0f570c2`); the runtime inf-sup checker
+   (`9c21b67`); SC-W1 system-level ids keying `BlockLayout` plus public per-block
+   actions/transposes (`b477525`); and the SV2-B2 interface-measure realization binding Malleus
+   facet-pair kernels (`d552da2`). Still open, in order of pull:
+   - re-key `SystemOperator`'s internal field tables and admit a multi-instance
+     `SystemRealizationPlan` once Scientia's `scientia-system/1` `OriginMap` /
+     `OperatorSystem/2` land (replace `SystemIdMap::compose`'s own allocation by Scientia's);
+   - bridge Scientia's `InteriorFacet`/`Interface` factorizations (they already carry
+     `MinusTrace`/`PlusTrace` inputs) into `InterfaceKernel`s so `bind_kernels` stops refusing
+     them -- needs a driving `.res` case (SC-W2 CHT), plus `BoundChain::Composed`
+     quadrature-point evaluation of a producer instance's output kernel;
+   - SC-W2 `InterfaceRealization`/`ConnectionRealizationPlan` (elimination first) over the
+     `InterfaceMeasure::between` machinery, multiplier/Nitsche and transfer beyond 1-D in SC-W3;
+   - typed inf-sup pairing from Scientia (`InfSup { pair, constrained, multiplier }`) and an
+     H(div)-norm variant of the estimate.
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.
