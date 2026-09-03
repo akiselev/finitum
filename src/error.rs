@@ -104,4 +104,6 @@ pub enum FinitumError {
     },
     #[error("REALIZATION_TANGENT_UNAVAILABLE: {0}")]
     RealizationTangentUnavailable(String),
+    #[error("INF_SUP_UNSTABLE: {0}")]
+    InfSupUnstable(String),
 }

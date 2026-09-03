@@ -1622,6 +1622,68 @@ impl SystemOperator {
             .map_err(|error| FinitumError::Assembly(error.to_string()))
     }
 
+    /// The L2 mass (Gram) matrix `integral(phi_i phi_j)` of one realized Lagrange field
+    /// (P0, P1, or P2; a vector field is block-diagonal across its components), dense row-major
+    /// over the field's own [`BlockLayout`] block extent, integrated with the operator's shared
+    /// quadrature (degree-4 exact on triangles, degree-2 on tetrahedra -- the 3-D P2 mass is
+    /// under-integrated, the same limit `STATUS.md` records for the cell quadrature). This is
+    /// the multiplier norm [`crate::estimate_inf_sup`] takes as [`crate::InfSupNorm::Gram`];
+    /// an RT0 field is refused typed (its L2 mass needs the Piola-mapped basis, which no
+    /// multiplier field of this crate's admitted pairings uses).
+    pub fn mass_matrix(&self, field: SymbolId) -> Result<Vec<f64>, FinitumError> {
+        let element_field = self.data.fields.get(&field).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("field {field} was not realized"))
+        })?;
+        let block = self
+            .layout()
+            .block(field)
+            .expect("realized field implies a layout block");
+        let element = match &element_field.kind {
+            FieldKind::Lagrange(element) => element,
+            FieldKind::Hdiv0 { .. } => {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "mass matrix of the Hdiv(order=0) field {field} is not realized"
+                )));
+            }
+        };
+        let extent = block.extent;
+        let components = block.component_count;
+        let basis_count = element.basis_count();
+        let mut matrix = vec![0.0; extent * extent];
+        let mesh = self.data.plan.mesh();
+        for (cell, restriction) in element_field.dofs.restrictions().iter().enumerate() {
+            if restriction.dofs.len() != basis_count * components {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "field {field} cell {cell} restriction has {} DOFs, expected {}",
+                    restriction.dofs.len(),
+                    basis_count * components
+                )));
+            }
+            let geometry = CellGeometry::new(mesh, CellId(cell))?;
+            for (point, quadrature_point) in self.data.quadrature.iter().enumerate() {
+                let scale = quadrature_point.weight * geometry.determinant();
+                for i in 0..basis_count {
+                    let phi_i = element
+                        .basis_value(point, i)
+                        .expect("validated element table");
+                    for j in 0..basis_count {
+                        let phi_j = element
+                            .basis_value(point, j)
+                            .expect("validated element table");
+                        let weight = scale * phi_i * phi_j;
+                        for component in 0..components {
+                            let row = restriction.dofs[i * components + component].0;
+                            let column = restriction.dofs[j * components + component].0;
+                            matrix[row * extent + column] += weight;
+                        }
+                    }
+                }
+            }
+        }
+        validate_finite("field mass matrix", &matrix)?;
+        Ok(matrix)
+    }
+
     /// Establishes, once, whether this operator's action is self-adjoint, and records the
     /// answer for every later [`Self::symmetry`] query on this operator (and its clones) --
     /// mirroring `RealizationPlan::prove_symmetry` exactly, including its dimension cap. Only

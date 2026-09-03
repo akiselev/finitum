@@ -1,12 +1,13 @@
 # Finitum status
 
-Updated: 2026-09-01
+Updated: 2026-09-03
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
 (Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and
 H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpus systems solve)
 + W7/E7 SV1-C1/C3 global transpose operators and distributed-coefficient VJPs
 + W7/P state-dependent `SystemOperator` residual/JVP/VJP with GX-A3 chain-rule tangents
++ W7/package 3 runtime inf-sup checker for realized mixed pairs
 
 ## Implemented
 
@@ -240,6 +241,45 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   bind time), interior-facet/interface measures (SC-W1 item below), affine-dependency
   transposes (SV1-C2).
 
+- W7 package 3: runtime inf-sup (LBB) checker for realized mixed pairs (`src/infsup.rs`;
+  SV2-B4 evidence for `@inf_sup` obligations). `estimate_inf_sup(operator, layout,
+  constraints, pairing, multiplier_norm, config)` probes the linear action densely, removes
+  essential-constrained DOFs, and computes `beta_h = sqrt(lambda_min(M_Q^{-1} B A^{-1} B^T))`
+  -- the inf-sup constant in the constrained block's energy norm and a caller-chosen multiplier
+  norm (`InfSupNorm::{Euclidean, Gram}`; `SystemOperator::mass_matrix(field)` gives the L2
+  Gram of a P0/P1/P2 field) -- by dense Cholesky plus a cyclic Jacobi sweep (capped at
+  `INF_SUP_DIMENSION_CAP = 2048`). Kernel modes beyond the caller-declared legitimate kernel
+  (`declared_kernel_dimension`: one constant pressure under pure Dirichlet velocity, zero for
+  a full-rank pairing) are spurious multiplier modes and give a deterministic
+  `InfSupVerdict::Unstable(SpuriousModes)`; `require_inf_sup_stable` turns that into the typed
+  `FinitumError::InfSupUnstable` (`INF_SUP_UNSTABLE`). `InfSupPairing::from_structure` derives
+  (constrained, multiplier) from Scientia's `OperatorStructure` (the one field without a
+  diagonal block and the one diagonal-bearing field it couples to), never from a field name.
+  Refused typed: affine-dependency constraints, a non-SPD constrained block, a nonzero
+  multiplier diagonal (stabilized pairs are not judged by this constraint-only estimate), a
+  Gram of the wrong extent, RT0 mass matrices. The estimate uses only the multiplier-row
+  coupling block, so it is invariant under the `equation_sign` gauge (verified).
+  Evidence (`tests/w7_infsup.rs`, 5 tests, on corpus snapshots under `tests/fixtures/corpus/`):
+  Taylor-Hood Stokes (P2-P1) is stable with a mesh-robust constant `0.2171 / 0.2182 / 0.2180`
+  at 2x2 / 4x4 / 6x6 (L2 pressure norm, viscosity 1.7, kernel exactly the declared constant
+  mode); RT0-P0 Darcy on the 2x2x2 cube is stable with an empty kernel (the E6 full-rank
+  finding) in both norms; the same Stokes model with `H1(order=1)` velocity (P1-P1,
+  `tests/fixtures/w7_infsup/25-stokes-p1p1.res`) is refused on every mesh -- finding: on the
+  structured diagonal triangulation with wall-fixed velocity the P1-P1 pressure kernel has
+  dimension 8 (seven spurious modes) at 4x4, 6x6, and 8x8 alike, so the refusal does not rest on
+  the 2x2 count deficit alone; unsigned/signed/reduced operators give the identical
+  digest-identified record; a non-saddle structure, a same-field pairing, a wrong-extent Gram,
+  an affine constraint, and a stabilized P1-P1 `MixedOperator` are refused typed.
+  Recorded need (Scientia): `VerificationObligationKind::InfSup { pair }` carries a display
+  string only; a typed `{ pair, constrained: SymbolId, multiplier: SymbolId }` would let a case
+  bind the pairing without the structural re-derivation. Not landed: a refinement-sequence
+  trend verdict (the per-mesh record is the unit; sequences are a Sinbad campaign concern),
+  the H(div)-norm variant for RT0 (the energy norm here is the realized mass block).
+  Fixture note: `tests/sv2b4_system_stokes.rs` now compiles the corpus *snapshots* in
+  `tests/fixtures/corpus/` instead of the live `sinbad/physics/corpus` files, because the live
+  `13-mixed-darcy.res` was mid-edit on 2026-09-03 (its `impermeable` block replaced by the
+  natural closure, removing the exterior-facet integral the E6 RT0 facet path exercises).
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -308,7 +348,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 136 passed, 0 failed across 21 binaries (W7 SV1-C1/C3 + P; 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 144 passed, 0 failed across 22 binaries (W7 package 3; 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models

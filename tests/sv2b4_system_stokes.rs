@@ -39,10 +39,16 @@ use scientia::{
     SymbolId, compile_operator_system, compile_semantics,
 };
 use std::collections::BTreeMap;
-use std::fs;
 
-const STOKES_CORPUS: &str = "/projects/sinbad/sinbad/physics/corpus/25-stokes.res";
-const DARCY_CORPUS: &str = "/projects/sinbad/sinbad/physics/corpus/13-mixed-darcy.res";
+/// Snapshots of `sinbad/physics/corpus/25-stokes.res` and `13-mixed-darcy.res` as this file's
+/// E6 acceptance was landed against (`tests/fixtures/corpus/`). The live corpus is owned by the
+/// Sinbad lane and was mid-edit during W7 (2026-09-03: `13-mixed-darcy.res` lost its
+/// `impermeable` boundary block in favour of the natural closure, so the compiled `darcy_law`
+/// no longer carries the exterior-facet integral this file's RT0 facet path exercises); the
+/// snapshot keeps that path under test until the corpus edit lands and this file is re-pointed
+/// deliberately.
+const STOKES_CORPUS: &str = include_str!("fixtures/corpus/25-stokes.res");
+const DARCY_CORPUS: &str = include_str!("fixtures/corpus/13-mixed-darcy.res");
 
 /// Viscosity constant this test supplies through a [`SystemConstitutiveInput`] closure -- the
 /// corpus declares `mu` as a provider-resolved property (`dynamic_viscosity(0)`), and Scientia
@@ -62,8 +68,7 @@ struct CompiledStokes {
 }
 
 fn compile_stokes() -> CompiledStokes {
-    let source = fs::read_to_string(STOKES_CORPUS).expect("25-stokes.res corpus is readable");
-    let compilation = compile_semantics(&source, &UnitRegistry::si_bootstrap()).unwrap();
+    let compilation = compile_semantics(STOKES_CORPUS, &UnitRegistry::si_bootstrap()).unwrap();
     let system = compile_operator_system(
         &compilation.semantic,
         "StokesFlow",
@@ -468,8 +473,7 @@ struct CompiledDarcy {
 }
 
 fn compile_darcy() -> CompiledDarcy {
-    let source = fs::read_to_string(DARCY_CORPUS).expect("13-mixed-darcy.res corpus is readable");
-    let compilation = compile_semantics(&source, &UnitRegistry::si_bootstrap()).unwrap();
+    let compilation = compile_semantics(DARCY_CORPUS, &UnitRegistry::si_bootstrap()).unwrap();
     let system = compile_operator_system(
         &compilation.semantic,
         "MixedDarcy",

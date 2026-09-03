@@ -8,6 +8,7 @@ mod constraint;
 mod element;
 mod embedded;
 mod error;
+mod infsup;
 mod mapping;
 mod mesh;
 mod method;
@@ -32,6 +33,10 @@ pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::FinitumError;
+pub use infsup::{
+    INF_SUP_DIMENSION_CAP, INF_SUP_REPORT_SCHEMA, InfSupConfig, InfSupEstimate, InfSupInstability,
+    InfSupNorm, InfSupPairing, InfSupVerdict, estimate_inf_sup, require_inf_sup_stable,
+};
 pub use mapping::AffineMap;
 pub use mesh::{Cell, CellId, Mesh, VertexId};
 pub use method::{
