@@ -10,6 +10,7 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7/package 3 runtime inf-sup checker for realized mixed pairs
 + W7/SC-W1 (Finitum) system-level ids keying `BlockLayout` and public per-block actions/transposes
 + W7/SC-W1 (Finitum) / SV2-B2 interface-measure realization binding Malleus facet-pair kernels
++ W7 follow-ups: C11.8 degree-2 P1 quadrature (opt-in) and C11.22 RT0 essential normal-trace data
 
 ## Implemented
 
@@ -366,6 +367,33 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     discontinuous P1 field reproduces `-/+ n_x |F| / 2` for `u = x`; every binding refusal
     (side, parity, access, count, no residual, shape, unknown field, exterior facet, repeated
     facet, unsupported orders, `over_layout` extent) is typed.
+- W7 follow-ups from the Krasis and Sinbad lanes:
+  - C11.8 (P1 mass-matrix rank deficiency): `PreparedElement::linear_simplex_with_degree(d,
+    degree)` tabulates P1 on the smallest rule exact for `degree` -- `0 | 1` the barycenter
+    rule, `2` two-point Gauss / the three edge midpoints / the symmetric 4-point tetrahedron
+    rule (exact for the P1 mass matrix; degrees above 2 refused typed).
+    `PreparedElement::linear_simplex` deliberately keeps the barycenter rule: every authored
+    per-quadrature-point external table (R3D geometry-sensitivity directions,
+    `tests/cad_derivatives.rs`, Sinbad's derivative campaigns) is sized one point per cell,
+    and changing the default silently changed that wire size (four `cad_derivatives` tests
+    failed on `expected 36 values, got 12`), so the exact rule is opt-in per element. The
+    Scientia-system path (`SystemRealizationPlan`, what Krasis's `CoupledLeaf::reduced_system`
+    wraps) already integrates with the degree-4 triangle / degree-2 tetrahedron rules and has
+    no rank deficiency. Evidence: the `p1_mass_tests` unit test (reference mass
+    `|K|(1 + delta_ij)/((d+1)(d+2))` to 1e-15 in 1-3D; the barycenter rule's rank-one
+    `|K|/(d+1)^2` recorded; degree 3 refused).
+  - C11.22 (Sinbad lane need): `essential_constraints_from_system` admits an RT0
+    (`Hdiv(order=0)`) field: a `flux . n = g` datum (`Constant`/`Sampled` scalar at the facet
+    centroid) on a tagged exterior facet fixes the facet DOF to `orientation * g * |F| *
+    (d - 1)!` -- the RT0 reference basis carries flux `1/(d-1)!` through its own facet
+    (`1` on triangles, `1/2` on tetrahedra; `rt0_reference_basis`'s doc corrected, it claimed
+    `1` generally). Interior facets, nodal sources, and vector data are refused typed.
+    Evidence (`tests/w7_rt0_essential.rs`, 2 tests, on the Darcy snapshot): constraining every
+    wall flux to zero puts the constant pressure mode into the reduced operator's kernel
+    (the impermeable-box statement; the naturally closed system is full rank) and MINRES
+    with the projector still solves; a uniform outward `g` lifts to a flux whose total
+    divergence through the `mass_balance` block action is exactly `-g * 6` (divergence
+    theorem; this is what caught the `(d-1)!` factor).
   - Not landed: `SystemRealizationPlan::bind_kernels` still refuses `SemanticMeasure::
     {InteriorFacet, Interface}` -- Scientia's factorization does emit `MinusTrace`/`PlusTrace`
     inputs for them (`jump`/`average`/`trace_minus`/`trace_plus`), so the bridge is to wrap
@@ -443,7 +471,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 153 passed, 0 failed across 24 binaries (W7 SC-W1 interface; 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 156 passed, 0 failed across 25 binaries (W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models

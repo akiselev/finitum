@@ -3911,6 +3911,20 @@ pub fn essential_constraints_from_system(
             .block(requirement.field)
             .expect("a realized field's DOF map implies a layout block");
         let components = block.component_count;
+        if matches!(
+            operator.data.fields[&requirement.field].kind,
+            FieldKind::Hdiv0 { .. }
+        ) {
+            rt0_essential_values(
+                &facets,
+                &mesh.mesh,
+                mesh,
+                region_map,
+                requirement,
+                &mut values,
+            )?;
+            continue;
+        }
         let node_count = dof_map.dof_count() / components;
         let quadratic = node_count != vertex_count;
         let node_points = if quadratic {
@@ -4000,6 +4014,131 @@ pub fn essential_constraints_from_system(
         }
     }
     essential_constraints_for_blocks(layout, values)
+}
+
+/// GX-CONTRACTS C11.22: essential normal-trace data on an RT0 (`Hdiv(order=0)`) field. The
+/// reference basis `phi_i = x - p_i` (`rt0_reference_basis`) carries the outward flux
+/// `integral_{F_i} phi_i . n_i = d |K_ref| = 1 / (d - 1)!` through its own facet (`1` on the
+/// triangle, `1/2` on the tetrahedron), preserved by the contravariant Piola map, so a global
+/// DOF `c_F` on facet `F` is `(d - 1)!` times the flux through `F` in the canonical
+/// (sorted-vertex) facet orientation; the boundary cell's `FacetIncidence::orientation`
+/// relates that to the cell's outward normal, which on an exterior facet is the domain's
+/// outward normal. A datum `flux . n = g` (scalar, the `FieldSource` evaluated at the facet
+/// centroid) therefore fixes the DOF to `orientation * g * |F| * (d - 1)!` -- verified against
+/// the divergence theorem through the `mass_balance` block action in
+/// `tests/w7_rt0_essential.rs`. Interior facets in the region and nodal sources are refused
+/// typed (RT0 has no nodes; an interior facet has no outward normal).
+fn rt0_essential_values(
+    facets: &crate::FacetTopology,
+    mesh: &Mesh,
+    tagged: &TaggedMesh,
+    region_map: &RegionMap,
+    requirement: &SystemEssentialConstraintRequirement,
+    values: &mut Vec<BlockEssentialValue>,
+) -> Result<(), FinitumError> {
+    let tags = region_map
+        .tags(requirement.requirement.region)
+        .filter(|tags| !tags.is_empty())
+        .ok_or_else(|| {
+            FinitumError::RealizationRegionUnmapped(format!("{:?}", requirement.requirement.region))
+        })?;
+    let dimension = mesh.dimension();
+    let mut facet_ids = BTreeSet::new();
+    for tag in tags {
+        if let Some(ids) = tagged.tags.facet_regions.get(tag) {
+            facet_ids.extend(ids.iter().copied());
+        }
+    }
+    for facet_id in facet_ids {
+        let facet = facets.facets().get(facet_id.0).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("facet {} does not exist", facet_id.0))
+        })?;
+        if !facet.is_exterior() {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "essential normal-trace data on RT0 field {} names interior facet {}; only \
+                 exterior facets carry an outward normal",
+                requirement.field, facet_id.0
+            )));
+        }
+        let vertices = facet
+            .vertices
+            .iter()
+            .map(|vertex| &mesh.vertices()[vertex.0])
+            .collect::<Vec<_>>();
+        let centroid = (0..dimension)
+            .map(|axis| {
+                vertices.iter().map(|vertex| vertex[axis]).sum::<f64>() / vertices.len() as f64
+            })
+            .collect::<Vec<_>>();
+        let measure = match dimension {
+            2 => {
+                let t = [
+                    vertices[1][0] - vertices[0][0],
+                    vertices[1][1] - vertices[0][1],
+                ];
+                (t[0] * t[0] + t[1] * t[1]).sqrt()
+            }
+            3 => {
+                let t1 = (0..3)
+                    .map(|axis| vertices[1][axis] - vertices[0][axis])
+                    .collect::<Vec<_>>();
+                let t2 = (0..3)
+                    .map(|axis| vertices[2][axis] - vertices[0][axis])
+                    .collect::<Vec<_>>();
+                let cross = [
+                    t1[1] * t2[2] - t1[2] * t2[1],
+                    t1[2] * t2[0] - t1[0] * t2[2],
+                    t1[0] * t2[1] - t1[1] * t2[0],
+                ];
+                0.5 * cross.iter().map(|value| value * value).sum::<f64>().sqrt()
+            }
+            other => {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "RT0 essential normal-trace data is realized for mesh dimension 2 or 3, \
+                     got {other}"
+                )));
+            }
+        };
+        let datum = match &requirement.value {
+            FieldSource::Constant(constant) => constant.clone(),
+            FieldSource::Sampled(sampler) => sampler(&centroid),
+            FieldSource::Nodal(_) => {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "RT0 field {} has no nodes; essential normal-trace data must be a \
+                     Constant or Sampled scalar",
+                    requirement.field
+                )));
+            }
+            FieldSource::Table(_) | FieldSource::Kernel { .. } => {
+                return Err(FinitumError::UnsupportedRealization(
+                    "essential_constraints_from_system admits Constant/Nodal/Sampled field \
+                     sources only"
+                        .into(),
+                ));
+            }
+        };
+        let [g] = datum[..] else {
+            return Err(FinitumError::InvalidRealization(format!(
+                "RT0 essential normal-trace datum must be one scalar (`flux . n`), got {} \
+                 components",
+                datum.len()
+            )));
+        };
+        if !g.is_finite() {
+            return Err(FinitumError::InvalidRealization(
+                "essential value is not finite".into(),
+            ));
+        }
+        let orientation = f64::from(facet.minus().orientation);
+        let basis_flux = 1.0 / (1..dimension).product::<usize>() as f64;
+        values.push(BlockEssentialValue {
+            block: requirement.field,
+            entity: facet_id.0,
+            component: 0,
+            value: orientation * g * measure / basis_flux,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

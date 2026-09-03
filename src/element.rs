@@ -20,28 +20,65 @@ pub struct PreparedElement {
 }
 
 impl PreparedElement {
-    /// P1 simplex basis with barycenter quadrature. This rule is exact for the affine stiffness
-    /// integrand and first-degree loads in dimensions one through three.
+    /// P1 simplex basis with barycenter quadrature: exact for the affine stiffness integrand
+    /// and first-degree loads in dimensions one through three, and the rule every authored
+    /// per-quadrature-point external table (R3D geometry sensitivities, Sinbad's campaigns)
+    /// is sized against -- one point per cell. It under-integrates the P1 mass matrix to a
+    /// rank-one local block (GX-CONTRACTS C11.8); a caller realizing a mass-shaped integrand
+    /// (`dt(u)`, reaction terms) selects [`Self::linear_simplex_with_degree`]`(dimension, 2)`
+    /// instead. The Scientia-system path (`SystemRealizationPlan`) does not use this rule.
     pub fn linear_simplex(dimension: usize) -> Result<Self, FinitumError> {
+        Self::linear_simplex_with_degree(dimension, 1)
+    }
+
+    /// P1 simplex basis tabulated on the smallest rule of this crate exact for polynomial
+    /// `degree`: `0 | 1` is the barycenter rule of [`Self::linear_simplex`]; `2` is 2-point
+    /// Gauss on the segment, the three edge midpoints on the triangle, and the symmetric
+    /// 4-point rule on the tetrahedron -- exact for the P1 mass matrix and for products of two
+    /// P1 quantities (C11.8). Higher degrees are refused typed rather than silently
+    /// under-integrated (FC3's `minimum_polynomial_degree` above two is not selected for).
+    pub fn linear_simplex_with_degree(dimension: usize, degree: u16) -> Result<Self, FinitumError> {
         if !(1..=3).contains(&dimension) {
             return Err(FinitumError::InvalidDimension(dimension));
         }
         let basis_count = dimension + 1;
-        let weight = match dimension {
-            1 => 1.0,
-            2 => 0.5,
-            3 => 1.0 / 6.0,
-            _ => unreachable!("dimension was checked"),
+        let quadrature = match (degree, dimension) {
+            (0 | 1, _) => {
+                let weight = match dimension {
+                    1 => 1.0,
+                    2 => 0.5,
+                    3 => 1.0 / 6.0,
+                    _ => unreachable!("dimension was checked"),
+                };
+                vec![QuadraturePoint {
+                    coordinates: vec![1.0 / basis_count as f64; dimension],
+                    weight,
+                }]
+            }
+            (2, 1) => gauss_legendre_unit_interval(2),
+            (2, 2) => [[0.5, 0.0], [0.5, 0.5], [0.0, 0.5]]
+                .into_iter()
+                .map(|coordinates| QuadraturePoint {
+                    coordinates: coordinates.to_vec(),
+                    weight: 1.0 / 6.0,
+                })
+                .collect(),
+            (2, 3) => tetrahedron_degree2_quadrature(),
+            (degree, _) => {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "P1 simplex quadrature is realized for polynomial degree 0, 1, or 2, \
+                     got {degree}"
+                )));
+            }
         };
-        let quadrature = vec![QuadraturePoint {
-            coordinates: vec![1.0 / basis_count as f64; dimension],
-            weight,
-        }];
-        let basis_values = vec![1.0 / basis_count as f64; basis_count];
-        let mut basis_gradients = vec![0.0; basis_count * dimension];
-        for axis in 0..dimension {
-            basis_gradients[axis] = -1.0;
-            basis_gradients[(axis + 1) * dimension + axis] = 1.0;
+        let mut basis_values = Vec::with_capacity(quadrature.len() * basis_count);
+        let mut basis_gradients = Vec::with_capacity(quadrature.len() * basis_count * dimension);
+        for point in &quadrature {
+            let (values, gradients) = simplex_basis(dimension, 1, &point.coordinates)?;
+            basis_values.extend(values);
+            for gradient in gradients {
+                basis_gradients.extend(gradient);
+            }
         }
         Self::new(
             dimension,
@@ -335,9 +372,11 @@ pub(crate) fn rt0_basis_count(dimension: usize) -> usize {
 ///
 /// Uses the standard construction `phi_i(x) = x - p_i`, where `p_i` is reference vertex `i`
 /// (`p_0` is the origin, `p_k` is the `k`-th standard basis vector for `k = 1..=dimension`).
-/// This satisfies `integral_{F_i} phi_i . n_i = 1` for the reference simplex's own outward
-/// normal at facet `i`, and zero flux through every other facet -- verified directly (not
-/// merely asserted) by this module's own tests. The reference divergence `div(phi_i) =
+/// This satisfies `integral_{F_i} phi_i . n_i = d |K_ref| = 1 / (d - 1)!` (`1` on the triangle,
+/// `1/2` on the tetrahedron) for the reference simplex's own outward normal at facet `i`, and
+/// zero flux through every other facet -- verified directly (not merely asserted) by this
+/// module's own triangle test, and used by `crate::system`'s RT0 essential normal-trace data
+/// (C11.22) to convert a facet flux into a DOF value. The reference divergence `div(phi_i) =
 /// dimension` is the same constant for every `i` (RT0's basis functions differ only in which
 /// vertex is subtracted, and `d/dx_k(x_k - p_i,k) = 1` regardless of `p_i`), so it is returned
 /// once rather than per basis function.
@@ -456,6 +495,76 @@ pub(crate) fn gauss_legendre_unit_interval(count: usize) -> Vec<QuadraturePoint>
     }
     points.sort_by(|left, right| left.coordinates[0].total_cmp(&right.coordinates[0]));
     points
+}
+
+#[cfg(test)]
+mod p1_mass_tests {
+    use super::*;
+
+    fn reference_mass(element: &PreparedElement) -> Vec<f64> {
+        let n = element.basis_count();
+        let mut mass = vec![0.0; n * n];
+        for (point, quadrature) in element.quadrature().iter().enumerate() {
+            for i in 0..n {
+                for j in 0..n {
+                    mass[i * n + j] += quadrature.weight
+                        * element.basis_value(point, i).unwrap()
+                        * element.basis_value(point, j).unwrap();
+                }
+            }
+        }
+        mass
+    }
+
+    /// The reference P1 mass matrix is `|K| (1 + delta_ij) / ((d + 1)(d + 2))`; the barycenter
+    /// rule gives `|K| / (d + 1)^2` everywhere (rank one). C11.8.
+    #[test]
+    fn linear_simplex_degree_two_integrates_the_p1_mass_matrix_exactly() {
+        for dimension in 1..=3usize {
+            let barycenter = PreparedElement::linear_simplex(dimension).unwrap();
+            assert_eq!(barycenter.quadrature().len(), 1);
+            let n = dimension + 1;
+            let expected_volume = 1.0 / (1..=dimension).product::<usize>() as f64;
+            for value in reference_mass(&barycenter) {
+                assert!((value - expected_volume / (n * n) as f64).abs() < 1.0e-15);
+            }
+            assert!(matches!(
+                PreparedElement::linear_simplex_with_degree(dimension, 3),
+                Err(FinitumError::UnsupportedRealization(_))
+            ));
+
+            let element = PreparedElement::linear_simplex_with_degree(dimension, 2).unwrap();
+            assert!(element.quadrature().len() > 1);
+            let volume = element
+                .quadrature()
+                .iter()
+                .map(|point| point.weight)
+                .sum::<f64>();
+            assert!((volume - expected_volume).abs() < 1.0e-15);
+            let mass = reference_mass(&element);
+            let denominator = ((dimension + 1) * (dimension + 2)) as f64;
+            for i in 0..n {
+                for j in 0..n {
+                    let expected = expected_volume * if i == j { 2.0 } else { 1.0 } / denominator;
+                    assert!(
+                        (mass[i * n + j] - expected).abs() < 1.0e-15,
+                        "dimension {dimension} mass ({i}, {j}) = {} != {expected}",
+                        mass[i * n + j]
+                    );
+                }
+            }
+            // Partition of unity and constant gradients at every point.
+            for point in 0..element.quadrature().len() {
+                let sum = (0..n)
+                    .map(|basis| element.basis_value(point, basis).unwrap())
+                    .sum::<f64>();
+                assert!((sum - 1.0).abs() < 1.0e-15);
+                for axis in 0..dimension {
+                    assert_eq!(element.basis_gradient(point, 0).unwrap()[axis], -1.0);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
