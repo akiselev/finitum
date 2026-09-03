@@ -18,6 +18,7 @@ mod profile;
 mod realization;
 mod space;
 mod system;
+mod system_ids;
 mod topology;
 mod transfer;
 mod verification;
@@ -71,9 +72,13 @@ pub use space::{
     vector_nodal_dof_map,
 };
 pub use system::{
-    LinearizedSystemOperator, ReducedSystemOperator, SystemConstitutiveInput,
+    LinearizedSystemOperator, ReducedSystemOperator, SystemBlockOperator, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemOperator, SystemRealizationPlan,
     essential_constraints_from_system, system_constitutive_from_sources,
+};
+pub use system_ids::{
+    InstanceId, InstanceRecord, SYSTEM_ID_MAP_SCHEMA, SysRes, SysResId, SysVar, SysVarId,
+    SystemIdMap,
 };
 pub use topology::{
     CompatibleDofMaps, ExactSequence, FacetId, FacetIncidence, FacetTopology, MeshFacet,

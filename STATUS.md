@@ -8,6 +8,7 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7/E7 SV1-C1/C3 global transpose operators and distributed-coefficient VJPs
 + W7/P state-dependent `SystemOperator` residual/JVP/VJP with GX-A3 chain-rule tangents
 + W7/package 3 runtime inf-sup checker for realized mixed pairs
++ W7/SC-W1 (Finitum) system-level ids keying `BlockLayout` and public per-block actions/transposes
 
 ## Implemented
 
@@ -280,6 +281,47 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   `13-mixed-darcy.res` was mid-edit on 2026-09-03 (its `impermeable` block replaced by the
   natural closure, removing the exterior-facet integral the E6 RT0 facet path exercises).
 
+- SC-W1 Finitum side, items 1-2 (`sinbad/ARCHITECTURE.md` §2.3/§2.4/§8; W7 package 4):
+  - `src/system_ids.rs`: `InstanceId`/`SysVarId`/`SysResId` (`u32` newtypes, the wire width
+    §2.4 fixes) and `SystemIdMap`, Finitum's own origin table (instances with their
+    `(model, semantic digest, artifact digest)` receipt, every variable's `(instance, local
+    SymbolId)`, every residual's `(instance, equation, row symbol)`, display paths
+    `right.eb` / `right/<symbol>`, content-addressed identity `finitum-system-ids/1`).
+    `SystemIdMap::one_instance` is the degenerate identity map of §2.6 (`SysVarId(symbol.0)`,
+    `SysResId(block index)`, root unprefixed) -- which is exactly why every single-model
+    realization and Krasis's `SemanticId::new(block.symbol.0)` read stay numerically
+    unchanged; `SystemIdMap::compose(&[(name, &OperatorSystem)])` allocates dense ids in
+    instance-then-local order (§2.3) for a multi-instance group. Deviation recorded: Scientia's
+    `scientia-system/1` `OriginMap` is not committed yet, so these are Finitum newtypes with an
+    explicit mapping; the exact Scientia surface `compose` replaces is recorded in its doc
+    comment (`OriginMap.variables` / `OriginMap.residuals` / `OperatorSystem/2.instances`).
+  - `BlockLayout` is keyed by `SysVarId`: `FieldBlock` gains `variable: SysVarId` next to the
+    per-model `symbol` (kept, so Krasis's consumer compiles unchanged); `BlockLayout::new` is
+    the identity keying, `BlockLayout::new_keyed((SysVarId, SymbolId, entities, components))`
+    the composed one, where a symbol shared by two instances is deliberately *not* addressable
+    by `block(symbol)` (only `block_by_variable`/`values_by_variable`/`variables`).
+    `SystemRealizationPlan::new` builds and checks the one-instance map against the layout
+    (`plan.system_ids()`, `operator.system_ids()`).
+  - Public per-`(row: SysResId, column: SysVarId)` block actions on `SystemOperator`:
+    `block_jacobian_vector_product` / `block_vector_jacobian_product` (rate-shifted, at an
+    actual `(t, u, u_t)`; the row equation's bound JVP/VJP kernels with the direction/adjoint
+    masked to one block, so a cross-field chain-rule tangent is exactly the off-diagonal
+    block), the zero-point `block_action`/`block_transpose_action`, and
+    `block_operator(...) -> SystemBlockOperator` (rectangular Methodus `LinearOperator +
+    TransposableOperator`) for Krasis/Methodus block compositions.
+  - Evidence (`tests/w7_sc_w1_block_actions.rs`, 4 tests, on the W7/P two-field nonlinear
+    fixture): the one-instance map is the identity and keys the plan's layout; two instances
+    compose to dense ids `0..4` with a symbol-ambiguous keyed layout and typed refusals
+    (duplicate variable, duplicate instance name, empty composition); every block JVP equals
+    the masked-direction slice of the full JVP (1e-13), the blocks of a row sum to the row,
+    every block transpose is exact to 1e-12, the off-diagonal blocks are nonzero at a nonzero
+    state and vanish at zero; `SystemBlockOperator` satisfies the adjoint identity and refuses
+    wrong shapes/ids typed.
+  - Not landed: re-keying `SystemOperator`'s *internal* field tables (still per-model
+    `SymbolId`, valid for one instance); a multi-instance `SystemRealizationPlan` (two instances
+    of one model in one group) waits on Scientia's `OperatorSystem/2`; `RegionMap`/
+    `SystemEssentialConstraintRequirement` stay `RegionId`/`SymbolId`-keyed.
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -348,7 +390,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 144 passed, 0 failed across 22 binaries (W7 package 3; 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 148 passed, 0 failed across 23 binaries (W7 SC-W1 ids/block actions; 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models

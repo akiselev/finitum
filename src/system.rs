@@ -21,9 +21,10 @@ use crate::space::{
     DofMap, ElementRestriction, cell_constant_dof_map, quadratic_simplex_dof_map,
     vector_nodal_dof_map,
 };
+use crate::system_ids::{SysResId, SysVarId, SystemIdMap};
 use crate::{
     AffineMap, BlockLayout, CompatibleDofMaps, ConstraintSet, ExactSequence, FacetId,
-    FacetTopology, FieldSource, FinitumError, Mesh, PreparedElement, QuadraturePoint,
+    FacetTopology, FieldBlock, FieldSource, FinitumError, Mesh, PreparedElement, QuadraturePoint,
 };
 use methodus::{
     BlockLinearOperator, DaeOperator, Definiteness, EvaluationContext, LinearOperator,
@@ -51,6 +52,9 @@ pub struct SystemRealizationPlan {
     facets: FacetTopology,
     compatible_dofs: Option<CompatibleDofMaps>,
     exact_sequence: Option<ExactSequence>,
+    /// SC-W1: the system-level ids of this (one-instance) realization group and their
+    /// per-model origins; the layout's blocks are keyed by the same `SysVarId`s.
+    system_ids: SystemIdMap,
     artifact_digest: Digest,
 }
 
@@ -89,6 +93,18 @@ impl SystemRealizationPlan {
             }
         }
         validate_components(&system, &layout)?;
+        let system_ids = SystemIdMap::one_instance(&system)?;
+        for variable in system_ids.variables() {
+            match layout.block_by_variable(variable.id) {
+                Some(block) if block.symbol == variable.local => {}
+                _ => {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "layout block for field {} is not keyed by its system variable {}",
+                        variable.local, variable.id
+                    )));
+                }
+            }
+        }
         let facets = FacetTopology::from_mesh(&mesh)?;
         let uses_facets = system.blocks.iter().any(|block| {
             block
@@ -126,12 +142,19 @@ impl SystemRealizationPlan {
             facets,
             compatible_dofs,
             exact_sequence,
+            system_ids,
             artifact_digest,
         })
     }
 
     pub fn system(&self) -> &OperatorSystem {
         &self.system
+    }
+
+    /// SC-W1: the system-level ids (`SysVarId`/`SysResId`) of this realization group with
+    /// their per-model origins.
+    pub fn system_ids(&self) -> &SystemIdMap {
+        &self.system_ids
     }
 
     pub fn mesh(&self) -> &Mesh {
@@ -1533,10 +1556,27 @@ impl SystemOperator {
         action: SystemAction<'_>,
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
+        self.apply_cells_of(time, state, state_rate, action, output, None)
+    }
+
+    /// As [`Self::apply_cells`], restricted to one equation block (by index in
+    /// `system.blocks`) when `only_block` is set -- the per-row half of a public block action.
+    fn apply_cells_of(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        action: SystemAction<'_>,
+        output: &mut [f64],
+        only_block: Option<usize>,
+    ) -> Result<(), FinitumError> {
         for cell in 0..self.data.plan.mesh().cells().len() {
             let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
             let affine = AffineMap::from_cell(self.data.plan.mesh(), CellId(cell))?;
             for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
+                if only_block.is_some_and(|only| only != block_index) {
+                    continue;
+                }
                 self.apply_block_cell(
                     block_index,
                     block,
@@ -1552,6 +1592,207 @@ impl SystemOperator {
             }
         }
         Ok(())
+    }
+
+    /// SC-W1: the system-level ids of this realization group (`plan().system_ids()`).
+    pub fn system_ids(&self) -> &SystemIdMap {
+        self.data.plan.system_ids()
+    }
+
+    fn block_coordinates(
+        &self,
+        row: SysResId,
+        column: SysVarId,
+    ) -> Result<(usize, &FieldBlock, &FieldBlock), FinitumError> {
+        let ids = self.system_ids();
+        let residual = ids.residual_origin(row).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("system has no residual {row}"))
+        })?;
+        let block_index = self
+            .data
+            .plan
+            .system()
+            .blocks
+            .iter()
+            .position(|block| block.equation == residual.equation)
+            .ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "residual {row} names equation `{}` which the system does not carry",
+                    residual.equation
+                ))
+            })?;
+        let layout = self.layout();
+        let row_block = layout.block(residual.row).ok_or_else(|| {
+            FinitumError::ArtifactMismatch(format!(
+                "residual {row} row field {} has no layout block",
+                residual.row
+            ))
+        })?;
+        let column_block = layout.block_by_variable(column).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("layout has no block for {column}"))
+        })?;
+        Ok((block_index, row_block, column_block))
+    }
+
+    /// SC-W1 public per-`(row, column)` block action (`sinbad/ARCHITECTURE.md` §8): the
+    /// `(row, column)` block of the Jacobian `dR/du + rate_shift * dR/du_t` at `(t, u, u_t)`
+    /// applied to a column-block direction, i.e. the row equation's JVP with the direction
+    /// nonzero on `column`'s block only -- so a cross-field chain-rule tangent (`ka = ka(b)`
+    /// inside the `a` equation) is exactly the `(ea, b)` block, no expression rewriting.
+    /// `direction` has the column block's extent, `output` the row block's extent (its
+    /// `equation_sign` included). Admitted exterior-facet integrals carry no active input and
+    /// contribute nothing to any block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_jacobian_vector_product(
+        &self,
+        row: SysResId,
+        column: SysVarId,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        direction: &[f64],
+        rate_shift: f64,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let (block_index, row_block, column_block) = self.block_coordinates(row, column)?;
+        let dimension = self.dimension();
+        self.validate_point(time, state, state_rate, &vec![0.0; dimension])?;
+        validate_rate_shift(rate_shift)?;
+        if direction.len() != column_block.extent || output.len() != row_block.extent {
+            return Err(FinitumError::InvalidRealization(format!(
+                "block ({row}, {column}) JVP expects a direction of length {} and an output of \
+                 length {}, got {} and {}",
+                column_block.extent,
+                row_block.extent,
+                direction.len(),
+                output.len()
+            )));
+        }
+        validate_finite("block JVP direction", direction)?;
+        let mut state_direction = vec![0.0; dimension];
+        state_direction[column_block.offset..column_block.offset + column_block.extent]
+            .copy_from_slice(direction);
+        let rate_direction = state_direction
+            .iter()
+            .map(|value| rate_shift * value)
+            .collect::<Vec<_>>();
+        let mut full = vec![0.0; dimension];
+        self.apply_cells_of(
+            time,
+            state,
+            state_rate,
+            SystemAction::Jvp {
+                state_direction: &state_direction,
+                rate_direction: &rate_direction,
+            },
+            &mut full,
+            Some(block_index),
+        )?;
+        output.copy_from_slice(&full[row_block.offset..row_block.offset + row_block.extent]);
+        validate_finite("block JVP", output)
+    }
+
+    /// SC-W1 public per-`(row, column)` block transpose: the exact transpose of
+    /// [`Self::block_jacobian_vector_product`] (row adjoint in, column cotangent out),
+    /// executing the row equation's bound VJP kernels with every other row's adjoint at zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_vector_jacobian_product(
+        &self,
+        row: SysResId,
+        column: SysVarId,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        adjoint: &[f64],
+        rate_shift: f64,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let (block_index, row_block, column_block) = self.block_coordinates(row, column)?;
+        let dimension = self.dimension();
+        self.validate_point(time, state, state_rate, &vec![0.0; dimension])?;
+        validate_rate_shift(rate_shift)?;
+        if adjoint.len() != row_block.extent || output.len() != column_block.extent {
+            return Err(FinitumError::InvalidRealization(format!(
+                "block ({row}, {column}) VJP expects an adjoint of length {} and an output of \
+                 length {}, got {} and {}",
+                row_block.extent,
+                column_block.extent,
+                adjoint.len(),
+                output.len()
+            )));
+        }
+        validate_finite("block VJP adjoint", adjoint)?;
+        let mut full_adjoint = vec![0.0; dimension];
+        full_adjoint[row_block.offset..row_block.offset + row_block.extent]
+            .copy_from_slice(adjoint);
+        let mut full = vec![0.0; dimension];
+        self.apply_cells_of(
+            time,
+            state,
+            state_rate,
+            SystemAction::Vjp {
+                adjoint: &full_adjoint,
+                rate_shift,
+            },
+            &mut full,
+            Some(block_index),
+        )?;
+        output
+            .copy_from_slice(&full[column_block.offset..column_block.offset + column_block.extent]);
+        validate_finite("block VJP", output)
+    }
+
+    /// The zero-point (`t = 0`, zero state and rate, no rate shift) `(row, column)` block
+    /// action -- the block view of [`Self::apply_action`].
+    pub fn block_action(
+        &self,
+        row: SysResId,
+        column: SysVarId,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let zero = vec![0.0; self.dimension()];
+        self.block_jacobian_vector_product(row, column, 0.0, &zero, &zero, input, 0.0, output)
+    }
+
+    /// The zero-point `(row, column)` block transpose action.
+    pub fn block_transpose_action(
+        &self,
+        row: SysResId,
+        column: SysVarId,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let zero = vec![0.0; self.dimension()];
+        self.block_vector_jacobian_product(row, column, 0.0, &zero, &zero, input, 0.0, output)
+    }
+
+    /// One `(row, column)` block of the Jacobian at a linearization point as a rectangular
+    /// Methodus `LinearOperator + TransposableOperator` (rows = the row block's extent,
+    /// columns = the column block's extent), for Krasis/Methodus block compositions.
+    pub fn block_operator(
+        &self,
+        row: SysResId,
+        column: SysVarId,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<SystemBlockOperator, FinitumError> {
+        let (_, row_block, column_block) = self.block_coordinates(row, column)?;
+        self.validate_point(time, state, state_rate, &vec![0.0; self.dimension()])?;
+        validate_rate_shift(rate_shift)?;
+        Ok(SystemBlockOperator {
+            operator: self.clone(),
+            row,
+            column,
+            rows: row_block.extent,
+            columns: column_block.extent,
+            time,
+            state: state.to_vec(),
+            state_rate: state_rate.to_vec(),
+            rate_shift,
+        })
     }
 
     /// Essential-constraint-eliminated action, mirroring `MixedOperator::apply_reduced_action`
@@ -2193,6 +2434,93 @@ impl LinearOperator for SystemOperator {
 impl BlockLinearOperator for SystemOperator {
     fn block_layout(&self) -> &methodus::BlockLayout {
         &self.data.solver_layout
+    }
+}
+
+/// One `(row, column)` Jacobian block of a [`SystemOperator`] at a fixed linearization point
+/// (see [`SystemOperator::block_operator`]): a rectangular Methodus operator whose action is
+/// [`SystemOperator::block_jacobian_vector_product`] and whose transpose is
+/// [`SystemOperator::block_vector_jacobian_product`].
+#[derive(Clone, Debug)]
+pub struct SystemBlockOperator {
+    operator: SystemOperator,
+    row: SysResId,
+    column: SysVarId,
+    rows: usize,
+    columns: usize,
+    time: f64,
+    state: Vec<f64>,
+    state_rate: Vec<f64>,
+    rate_shift: f64,
+}
+
+impl SystemBlockOperator {
+    pub fn row(&self) -> SysResId {
+        self.row
+    }
+
+    pub fn column(&self) -> SysVarId {
+        self.column
+    }
+
+    pub fn rate_shift(&self) -> f64 {
+        self.rate_shift
+    }
+}
+
+impl LinearOperator for SystemBlockOperator {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn symmetry(&self) -> OperatorSymmetry {
+        OperatorSymmetry::Unknown
+    }
+
+    fn apply(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        self.operator
+            .block_jacobian_vector_product(
+                self.row,
+                self.column,
+                self.time,
+                &self.state,
+                &self.state_rate,
+                input,
+                self.rate_shift,
+                output,
+            )
+            .map_err(numeric_error)
+    }
+}
+
+impl TransposableOperator for SystemBlockOperator {
+    fn apply_transpose(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        self.operator
+            .block_vector_jacobian_product(
+                self.row,
+                self.column,
+                self.time,
+                &self.state,
+                &self.state_rate,
+                input,
+                self.rate_shift,
+                output,
+            )
+            .map_err(numeric_error)
     }
 }
 

@@ -1,10 +1,17 @@
 use crate::FinitumError;
+use crate::system_ids::SysVarId;
 use scientia::SymbolId;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// One field's block of a product-space layout. `symbol` is the per-model coordinate (kept
+/// for every single-model consumer, including Krasis's `SemanticId::new(symbol.0)` read);
+/// `variable` is the system-level key (SC-W1, `sinbad/ARCHITECTURE.md` §2.4) -- equal to
+/// `SysVarId(symbol.0)` for a layout built by [`BlockLayout::new`], and the composed dense id
+/// for one built by [`BlockLayout::new_keyed`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldBlock {
     pub symbol: SymbolId,
+    pub variable: SysVarId,
     pub entity_count: usize,
     pub component_count: usize,
     pub offset: usize,
@@ -12,38 +19,64 @@ pub struct FieldBlock {
 }
 
 /// Product-space global layout with explicit field and component extents.
+///
+/// Blocks are keyed by [`SysVarId`] (always unique) and, for the single-model case, by the
+/// per-model [`SymbolId`]; in a composed layout ([`Self::new_keyed`]) two instances of one model
+/// share symbols, so [`Self::block`] by symbol answers only for symbols that occur exactly once
+/// and every symbol-keyed accessor documents that rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockLayout {
     blocks: Vec<FieldBlock>,
     by_symbol: BTreeMap<SymbolId, usize>,
+    by_variable: BTreeMap<SysVarId, usize>,
     extent: usize,
 }
 
 impl BlockLayout {
+    /// Single-model layout: every block keyed by its per-model symbol, with the identity
+    /// system id `SysVarId(symbol.0)`.
     pub fn new(
         specifications: impl IntoIterator<Item = (SymbolId, usize, usize)>,
     ) -> Result<Self, FinitumError> {
+        Self::new_keyed(
+            specifications
+                .into_iter()
+                .map(|(symbol, entities, components)| {
+                    (SysVarId(symbol.0), symbol, entities, components)
+                }),
+        )
+    }
+
+    /// System-keyed layout (SC-W1): `(system variable, per-model symbol, entity count,
+    /// component count)` per block. System variables must be distinct; symbols may repeat
+    /// across instances (and then are not addressable by symbol).
+    pub fn new_keyed(
+        specifications: impl IntoIterator<Item = (SysVarId, SymbolId, usize, usize)>,
+    ) -> Result<Self, FinitumError> {
         let mut blocks = Vec::new();
-        let mut by_symbol = BTreeMap::new();
+        let mut by_variable = BTreeMap::new();
+        let mut symbol_counts: BTreeMap<SymbolId, usize> = BTreeMap::new();
         let mut offset = 0usize;
-        for (symbol, entity_count, component_count) in specifications {
+        for (variable, symbol, entity_count, component_count) in specifications {
             if entity_count == 0 || component_count == 0 {
                 return Err(FinitumError::InvalidRealization(format!(
-                    "block {symbol} must have non-zero entity and component counts"
+                    "block {variable} ({symbol}) must have non-zero entity and component counts"
                 )));
             }
-            if by_symbol.contains_key(&symbol) {
+            if by_variable.contains_key(&variable) {
                 return Err(FinitumError::InvalidRealization(format!(
-                    "block {symbol} is declared more than once"
+                    "block {variable} is declared more than once"
                 )));
             }
             let extent = entity_count.checked_mul(component_count).ok_or_else(|| {
-                FinitumError::InvalidRealization(format!("block {symbol} extent overflows usize"))
+                FinitumError::InvalidRealization(format!("block {variable} extent overflows usize"))
             })?;
             let index = blocks.len();
-            by_symbol.insert(symbol, index);
+            by_variable.insert(variable, index);
+            *symbol_counts.entry(symbol).or_default() += 1;
             blocks.push(FieldBlock {
                 symbol,
+                variable,
                 entity_count,
                 component_count,
                 offset,
@@ -58,9 +91,16 @@ impl BlockLayout {
                 "product-space layout must contain at least one field block".into(),
             ));
         }
+        let by_symbol = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| symbol_counts[&block.symbol] == 1)
+            .map(|(index, block)| (block.symbol, index))
+            .collect();
         Ok(Self {
             blocks,
             by_symbol,
+            by_variable,
             extent: offset,
         })
     }
@@ -73,10 +113,37 @@ impl BlockLayout {
         self.extent
     }
 
+    /// The block of a per-model symbol; `None` when no block carries it or when several do
+    /// (a composed layout with repeated instances -- use [`Self::block_by_variable`]).
     pub fn block(&self, symbol: SymbolId) -> Option<&FieldBlock> {
         self.by_symbol
             .get(&symbol)
             .map(|index| &self.blocks[*index])
+    }
+
+    /// The block of a system variable.
+    pub fn block_by_variable(&self, variable: SysVarId) -> Option<&FieldBlock> {
+        self.by_variable
+            .get(&variable)
+            .map(|index| &self.blocks[*index])
+    }
+
+    /// Every system variable in block order.
+    pub fn variables(&self) -> impl Iterator<Item = SysVarId> + '_ {
+        self.blocks.iter().map(|block| block.variable)
+    }
+
+    /// The slice of `vector` owned by a system variable's block.
+    pub fn values_by_variable<'a>(
+        &self,
+        vector: &'a [f64],
+        variable: SysVarId,
+    ) -> Result<&'a [f64], FinitumError> {
+        self.validate_vector(vector)?;
+        let block = self.block_by_variable(variable).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("layout has no block for {variable}"))
+        })?;
+        Ok(&vector[block.offset..block.offset + block.extent])
     }
 
     pub fn values<'a>(
