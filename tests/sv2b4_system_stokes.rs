@@ -24,10 +24,10 @@
 
 use finitum::{
     BlockCoupling, BlockLayout, CompatibleDofMaps, ConstraintSet, CouplingKind, DofId,
-    FacetTopology, FieldSource, FieldSpec, Mesh, MeshProfile, MixedOperator, MixedSpace,
-    PointEvaluation, RegionMap, RegionTagId, SystemConstitutiveInput,
-    SystemEssentialConstraintRequirement, SystemRealizationPlan, essential_constraints_from_system,
-    facet_membership_from, quadratic_simplex_dof_map, realize,
+    FacetTopology, FieldSource, FieldSpec, FinitumError, Mesh, MeshProfile, MixedOperator,
+    MixedSpace, PointEvaluation, RegionMap, RegionTagId, SystemConstitutiveInput,
+    SystemEssentialConstraintRequirement, SystemQuadrature, SystemRealizationPlan,
+    essential_constraints_from_system, facet_membership_from, quadratic_simplex_dof_map, realize,
 };
 use methodus::{
     EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector, OperatorSymmetry,
@@ -274,6 +274,20 @@ fn unsigned_stokes_operator_reports_unknown_symmetry_and_minres_refuses_it() {
         message.contains("Symmetric") || message.contains("symmetric"),
         "expected a symmetry-related refusal, got: {message}"
     );
+
+    // W7 7c (A): the barycenter rule cannot integrate a Taylor-Hood system and is refused
+    // typed at plan construction; the default plan reports the richest rule.
+    assert_eq!(plan.quadrature_rule(), SystemQuadrature::Richest);
+    let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
+    assert!(matches!(
+        SystemRealizationPlan::with_quadrature(
+            compiled.system.clone(),
+            mesh.mesh.clone(),
+            layout,
+            SystemQuadrature::Barycenter
+        ),
+        Err(FinitumError::UnsupportedRealization(_))
+    ));
 }
 
 /// Decisive acceptance: the `equation_sign`-corrected system operator is genuinely symmetric by

@@ -43,18 +43,7 @@ impl PreparedElement {
         }
         let basis_count = dimension + 1;
         let quadrature = match (degree, dimension) {
-            (0 | 1, _) => {
-                let weight = match dimension {
-                    1 => 1.0,
-                    2 => 0.5,
-                    3 => 1.0 / 6.0,
-                    _ => unreachable!("dimension was checked"),
-                };
-                vec![QuadraturePoint {
-                    coordinates: vec![1.0 / basis_count as f64; dimension],
-                    weight,
-                }]
-            }
+            (0 | 1, _) => barycenter_quadrature(dimension)?,
             (2, 1) => gauss_legendre_unit_interval(2),
             (2, 2) => [[0.5, 0.0], [0.5, 0.5], [0.0, 0.5]]
                 .into_iter()
@@ -267,6 +256,24 @@ pub(crate) fn simplex_basis_count(dimension: usize, order: u8) -> usize {
         2 => (dimension + 1) * (dimension + 2) / 2,
         _ => 0,
     }
+}
+
+/// The one-point barycenter rule of the reference simplex (exact for polynomial degree 1): the
+/// rule [`PreparedElement::linear_simplex`] tabulates on and the system path's
+/// [`crate::SystemQuadrature::Barycenter`].
+pub(crate) fn barycenter_quadrature(
+    dimension: usize,
+) -> Result<Vec<QuadraturePoint>, FinitumError> {
+    let weight = match dimension {
+        1 => 1.0,
+        2 => 0.5,
+        3 => 1.0 / 6.0,
+        _ => return Err(FinitumError::InvalidDimension(dimension)),
+    };
+    Ok(vec![QuadraturePoint {
+        coordinates: vec![1.0 / (dimension + 1) as f64; dimension],
+        weight,
+    }])
 }
 
 /// The shared quadrature rule `crate::mixed` evaluates every field's basis at, regardless of

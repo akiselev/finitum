@@ -82,8 +82,8 @@ pub use system::{
     SYSTEM_REALIZATION_ARTIFACT_SCHEMA, SystemBlockOperator, SystemBlockReceipt,
     SystemConstitutiveInput, SystemDistributedCoefficient, SystemEssentialConstraintRequirement,
     SystemExternalInput, SystemFieldArtifact, SystemOperator, SystemPartialAssemblyOperator,
-    SystemRealizationArtifact, SystemRealizationExternalInput, SystemRealizationPlan,
-    essential_constraints_from_system, system_constitutive_from_sources,
+    SystemQuadrature, SystemRealizationArtifact, SystemRealizationExternalInput,
+    SystemRealizationPlan, essential_constraints_from_system, system_constitutive_from_sources,
 };
 pub use system_ids::{
     InstanceId, InstanceRecord, SYSTEM_ID_MAP_SCHEMA, SysRes, SysResId, SysVar, SysVarId,

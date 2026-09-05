@@ -15,6 +15,8 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   element/partial representations and agreement/capability/artifact receipts on `SystemOperator`
 + W7/SC-W1 (Finitum) `SystemIdMap::from_scientia` (ids by value from `scientia-operator-system/2`)
   and the typed `@inf_sup` obligation consumed as `InfSupPairing::from_obligation`
++ W7 package 7c (Finitum, single compile path): per-plan `SystemQuadrature` with the P1
+  barycenter rule reproducing the single-model default bitwise on the system path
 
 ## Implemented
 
@@ -474,6 +476,53 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     Not landed: stored tables on facet integrals; regional (per-region) tables; the multi-
     instance `SystemRealizationPlan` (unchanged, waits on Scientia `OperatorSystem/2` adoption).
 
+- W7 package 7c, single compile path (Finitum, 2026-09-05; Sinbad's
+  `w7-7c-deliverable2-wip.md` "Cross-repo needs (Finitum)"), deliverable A -- per-plan
+  quadrature on the system path:
+  - `SystemQuadrature { Barycenter, Richest }` is chosen at
+    `SystemRealizationPlan::with_quadrature(system, mesh, layout, rule)` (`new` keeps
+    `Richest`: the degree-4 triangle / degree-2 tetrahedron / 3-point segment rule every plan
+    used before), reported by `quadrature_rule()`, tabulated by `quadrature()` before binding
+    and `SystemOperator::quadrature()` after (stored tables are sized per point), and inherited
+    by everything derived from the plan. `Barycenter` is the single-model P1 default
+    (`PreparedElement::linear_simplex`: one point per cell, C11.8's rank-one P1 mass included)
+    and is refused typed (`UnsupportedRealization`) for any field that is not an order-0/1
+    Lagrange (H1/L2) field -- one point cannot integrate a P2 stiffness or an RT0 mass (the
+    Taylor-Hood refusal is pinned in `tests/sv2b4_system_stokes.rs`).
+  - **Digest change (loud):** the rule is part of the plan identity, so the plan digest
+    payload is now `finitum-system-realization/2` (adds `quadrature`), and EVERY
+    `finitum-system-operator/2` value changes with it (the operator payload embeds the plan
+    digest; the operator payload's shape and schema id are unchanged). No sibling pins a
+    digest value (Sinbad's `sc_w1_reroute` fixtures pin solutions, observables and verdicts).
+  - Evidence (`tests/w7_system_path_parity.rs`, +4 tests): on `Barycenter` the one-instance
+    system reproduces the single-model DEFAULT plan bitwise (relative difference exactly 0) --
+    residual, JVP, shifted VJP, coefficient JVP/VJP, linearized action and transpose, the
+    zero-point CSR action, and the realization-agreement report (outputs, verdicts, max-abs
+    errors) -- on `01-poisson` (cell and vertex design layouts) and `03-nonlinear-heat`
+    (closures `rho`, `cp`, `k`, stored `Q`, rate shifts 0 and 2.5). The only roundoff left
+    (1.2e-16..2.7e-16) is the cross-representation check of the system CSR matvec against the
+    single-model matrix-free linearized action, which sums in a different order by
+    construction (the single-model linearized operator has no assembly); the `Richest` parity
+    stays at 1.3e-16..4.1e-16.
+  - Sinbad's `03` final-time nodal ladder reproduced on the system path (BDF2, step 0.05 to
+    0.4, `k = 1 + 0.2 (T - 300)` closure with its tangent, stored `rho = cp = 1` and the
+    closed-form `Q`, walls at 300, RMS nodal error at `t = 0.4`, dense Newton): `Barycenter`
+    2x2/4x4/8x8 errors 1.177e-1 / 3.223e-2 / 8.802e-3, pair orders 1.868 / 1.872 (gate >= 1.8,
+    Sinbad's `reference-orders/1` minimum); `Richest` errors 5.185e-2 / 1.692e-2 / 4.786e-3
+    -- the very numbers Sinbad's diagnosis recorded under the degree-4 rule -- pair orders
+    1.616 / 1.822. The order loss Sinbad saw is the rule's, not the system path's. (The
+    `Richest` 8x8 level was measured once for this record; the battery keeps its first pair,
+    the six-point 8x8 level under dense Newton costs minutes in a debug build.)
+  - Cost (`system_path_residual_and_jvp_cost_is_recorded_against_the_single_model_plan`,
+    debug build, residual + JVP wall time, recorded not gated; two runs): `Barycenter` 3x3
+    single-model 5.5-6.3 ms vs system 6.8-7.1 ms (1.08-1.28x), 24x24 332-445 ms vs 412-434 ms
+    (0.98-1.24x); `Richest` 3x3 30.7-35.6 vs 36.0-39.7 ms (1.01-1.29x), 24x24 1.90-2.03 s vs
+    1.95-2.06 s (1.01-1.03x). Within the 1.5x target; the 4-8x Sinbad measured is the
+    six-point rule itself (24x24: 0.4 s -> 2.0 s on either path), gone on `Barycenter`.
+  - Cross-repo need (Sinbad): build every P1 level with
+    `SystemRealizationPlan::with_quadrature(.., SystemQuadrature::Barycenter)` and size tables
+    with `plan.quadrature()` as today; keep `new` (`Richest`) for Taylor-Hood and RT0/P0.
+
 - SC-W1 Finitum side, HANDOFF §6 items (W7, 2026-09-05): Scientia's landed system ids and typed
   inf-sup pairing consumed.
   - `SystemIdMap::from_scientia(&scientia::SystemOperator)`: every `SysVar { id, owner, local }`
@@ -565,7 +614,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 164 passed, 0 failed across 27 binaries (SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 168 passed, 0 failed across 27 binaries (W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -688,7 +737,8 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    symmetry proof, `OperatorStructure` threading, and H(div)/RT0 + P0 compatible realization;
    the real Stokes and mixed-Darcy corpus systems both solve. Per-block stored tables and the
    value-covering `finitum-system-operator/2` digest landed with SC-W1 system-path parity
-   (2026-09-05). Remaining in this area: regional (per-region) external tables, Hcurl
+   (2026-09-05); the plan digest became `finitum-system-realization/2` (quadrature rule) with
+   W7 7c A, changing every operator digest value. Remaining in this area: regional (per-region) external tables, Hcurl
    realization, and interior-facet/DG measures;
 5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
    under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).

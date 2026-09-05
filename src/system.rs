@@ -1,6 +1,7 @@
 use crate::CellBatchLayout;
 use crate::element::{
-    rt0_basis_count, rt0_reference_basis, simplex_basis, simplex_basis_count, simplex_quadrature,
+    barycenter_quadrature, rt0_basis_count, rt0_reference_basis, simplex_basis,
+    simplex_basis_count, simplex_quadrature,
 };
 use crate::mesh::CellId;
 use crate::mixed::{
@@ -47,6 +48,38 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// The shared cell quadrature rule a [`SystemRealizationPlan`] integrates every field with
+/// (W7 package 7c, single compile path): chosen per plan at
+/// [`SystemRealizationPlan::with_quadrature`], reported by [`SystemRealizationPlan::quadrature`]
+/// and [`SystemOperator::quadrature`] so stored tables ([`SystemExternalInput`]) are sized per
+/// point, and part of the plan's identity ([`SystemRealizationPlan::artifact_digest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemQuadrature {
+    /// One point per cell at the barycenter, exact for polynomial degree 1: the rule
+    /// [`PreparedElement::linear_simplex`] (the single-model P1 default, C11.8) tabulates on, so
+    /// a one-instance P1 system on it reproduces the single-model default plan bitwise.
+    /// Admitted for order-0/1 Lagrange (H1/L2) fields only -- one point cannot integrate a P2
+    /// stiffness or an RT0 mass -- and, exactly like the single-model default, it
+    /// under-integrates the P1 mass matrix to a rank-one local block (C11.8).
+    Barycenter,
+    /// The richest rule this crate has for the mesh dimension: degree 4 on triangles (6
+    /// points), degree 2 on tetrahedra (4 points), 3-point Gauss on segments -- what every
+    /// system plan integrated with before the rule became a choice, and what a Taylor-Hood
+    /// (P2/P1) or RT0/P0 system needs.
+    Richest,
+}
+
+impl SystemQuadrature {
+    /// The reference-simplex table of this rule in `dimension` (1..=3).
+    pub fn table(self, dimension: usize) -> Result<Vec<QuadraturePoint>, FinitumError> {
+        match self {
+            Self::Barycenter => barycenter_quadrature(dimension),
+            Self::Richest => simplex_quadrature(dimension),
+        }
+    }
+}
+
 /// Digest-bound concrete ownership plan for an FC8 mixed operator system.
 #[derive(Clone, Debug)]
 pub struct SystemRealizationPlan {
@@ -59,14 +92,32 @@ pub struct SystemRealizationPlan {
     /// SC-W1: the system-level ids of this (one-instance) realization group and their
     /// per-model origins; the layout's blocks are keyed by the same `SysVarId`s.
     system_ids: SystemIdMap,
+    /// The shared cell quadrature rule every field is integrated with (part of
+    /// `artifact_digest`).
+    quadrature: SystemQuadrature,
     artifact_digest: Digest,
 }
 
 impl SystemRealizationPlan {
+    /// [`Self::with_quadrature`] on [`SystemQuadrature::Richest`] -- the rule every system plan
+    /// integrated with before the rule became a per-plan choice.
     pub fn new(
         system: OperatorSystem,
         mesh: Mesh,
         layout: BlockLayout,
+    ) -> Result<Self, FinitumError> {
+        Self::with_quadrature(system, mesh, layout, SystemQuadrature::Richest)
+    }
+
+    /// Validates the shape of the (one-instance) `system` over `mesh`/`layout` and fixes the
+    /// shared cell quadrature rule every field is integrated with ([`Self::quadrature`]).
+    /// [`SystemQuadrature::Barycenter`] is refused typed (`UnsupportedRealization`) when any
+    /// block requires a field that is not an order-0/1 Lagrange (H1/L2) field.
+    pub fn with_quadrature(
+        system: OperatorSystem,
+        mesh: Mesh,
+        layout: BlockLayout,
+        quadrature: SystemQuadrature,
     ) -> Result<Self, FinitumError> {
         for symbol in &system.field_order {
             if layout.block(*symbol).is_none() {
@@ -93,6 +144,27 @@ impl SystemRealizationPlan {
                         "system coordinate ({}, {}) is absent from the concrete layout",
                         coordinate.row, coordinate.column
                     )));
+                }
+            }
+        }
+        if quadrature == SystemQuadrature::Barycenter {
+            for block in &system.blocks {
+                for element in &block.requirements.elements {
+                    let lagrange = matches!(
+                        element.family,
+                        ElementFamilyRequirement::H1 | ElementFamilyRequirement::L2
+                    );
+                    if !lagrange || element.polynomial_order > 1 {
+                        return Err(FinitumError::UnsupportedRealization(format!(
+                            "the barycenter quadrature rule is admitted for order-0/1 Lagrange \
+                             (H1/L2) fields only; equation `{}` requires {:?}(order={}) for \
+                             field {}",
+                            block.equation,
+                            element.family,
+                            element.polynomial_order,
+                            element.symbol
+                        )));
+                    }
                 }
             }
         }
@@ -138,7 +210,7 @@ impl SystemRealizationPlan {
         } else {
             (None, None)
         };
-        let artifact_digest = digest_plan(&system, &mesh, &layout, &facets);
+        let artifact_digest = digest_plan(&system, &mesh, &layout, &facets, quadrature);
         Ok(Self {
             system: Arc::new(system),
             mesh,
@@ -147,6 +219,7 @@ impl SystemRealizationPlan {
             compatible_dofs,
             exact_sequence,
             system_ids,
+            quadrature,
             artifact_digest,
         })
     }
@@ -189,7 +262,12 @@ impl SystemRealizationPlan {
     /// field with (see [`SystemOperator::quadrature`]) -- available before binding so stored
     /// tables ([`SystemExternalInput`]) can be laid out over it.
     pub fn quadrature(&self) -> Result<Vec<QuadraturePoint>, FinitumError> {
-        simplex_quadrature(self.mesh.dimension())
+        self.quadrature.table(self.mesh.dimension())
+    }
+
+    /// The rule [`Self::quadrature`] tabulates, fixed at [`Self::with_quadrature`].
+    pub fn quadrature_rule(&self) -> SystemQuadrature {
+        self.quadrature
     }
 }
 
@@ -232,6 +310,7 @@ fn digest_plan(
     mesh: &Mesh,
     layout: &BlockLayout,
     facets: &FacetTopology,
+    quadrature: SystemQuadrature,
 ) -> Digest {
     #[derive(Serialize)]
     struct BlockIdentity {
@@ -249,9 +328,10 @@ fn digest_plan(
         cells: Vec<Vec<usize>>,
         blocks: Vec<BlockIdentity>,
         facet_count: usize,
+        quadrature: SystemQuadrature,
     }
     let bytes = serde_json::to_vec(&Payload {
-        schema: "finitum-system-realization/1",
+        schema: "finitum-system-realization/2",
         system: &system.artifact_digest,
         dimension: mesh.dimension(),
         vertices: mesh.vertices(),
@@ -271,6 +351,7 @@ fn digest_plan(
             })
             .collect(),
         facet_count: facets.facets().len(),
+        quadrature,
     })
     .expect("system realization identity is serializable");
     Digest {
@@ -1231,7 +1312,7 @@ impl SystemRealizationPlan {
                 }
             }
         }
-        let quadrature = simplex_quadrature(self.mesh.dimension())?;
+        let quadrature = self.quadrature()?;
         let fields = build_field_elements(
             &self.system,
             &self.mesh,
@@ -2678,8 +2759,10 @@ impl SystemOperator {
     /// The L2 mass (Gram) matrix `integral(phi_i phi_j)` of one realized Lagrange field
     /// (P0, P1, or P2; a vector field is block-diagonal across its components), dense row-major
     /// over the field's own [`BlockLayout`] block extent, integrated with the operator's shared
-    /// quadrature (degree-4 exact on triangles, degree-2 on tetrahedra -- the 3-D P2 mass is
-    /// under-integrated, the same limit `STATUS.md` records for the cell quadrature). This is
+    /// quadrature (the plan's [`SystemQuadrature`]: on `Richest`, degree-4 exact on triangles,
+    /// degree-2 on tetrahedra -- the 3-D P2 mass is under-integrated, the same limit `STATUS.md`
+    /// records for the cell quadrature; on `Barycenter` the P1 mass is rank one per cell,
+    /// C11.8). This is
     /// the multiplier norm [`crate::estimate_inf_sup`] takes as [`crate::InfSupNorm::Gram`];
     /// an RT0 field is refused typed (its L2 mass needs the Piola-mapped basis, which no
     /// multiplier field of this crate's admitted pairings uses).
