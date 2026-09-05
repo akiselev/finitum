@@ -275,6 +275,35 @@ fn unsigned_stokes_operator_reports_unknown_symmetry_and_minres_refuses_it() {
         "expected a symmetry-related refusal, got: {message}"
     );
 
+    // W7 7c (B): a taken proof outranks the claim in both directions. Assembling the unsigned
+    // system shows it is not self-adjoint, so the proof records `Nonsymmetric` -- a failed
+    // proof never upgrades the structural `Unknown` -- on the operator, its reduced form, and
+    // the capability; MINRES still refuses, now on a declared nonsymmetry.
+    assert_eq!(
+        operator.prove_symmetry(1.0e-9).unwrap(),
+        OperatorSymmetry::Nonsymmetric
+    );
+    assert_eq!(operator.symmetry(), OperatorSymmetry::Nonsymmetric);
+    assert_eq!(reduced.symmetry(), OperatorSymmetry::Nonsymmetric);
+    assert_eq!(
+        reduced.capability().symmetry,
+        OperatorSymmetry::Nonsymmetric
+    );
+    let error = solve_minres(
+        &reduced,
+        None,
+        None,
+        &EvaluationContext::reproducible(),
+        &right_hand_side,
+        &vec![0.0; dimension],
+        &config,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("nonsymmetric"),
+        "expected a declared-nonsymmetric refusal, got: {error}"
+    );
+
     // W7 7c (A): the barycenter rule cannot integrate a Taylor-Hood system and is refused
     // typed at plan construction; the default plan reports the richest rule.
     assert_eq!(plan.quadrature_rule(), SystemQuadrature::Richest);

@@ -2820,13 +2820,16 @@ impl SystemOperator {
         Ok(matrix)
     }
 
-    /// Establishes, once, whether this operator's action is self-adjoint, and records the
-    /// answer for every later [`Self::symmetry`] query on this operator (and its clones) --
-    /// mirroring `RealizationPlan::prove_symmetry` exactly, including its dimension cap. Only
-    /// meaningful (and only consulted by [`Self::symmetry`]) when
-    /// `SystemRealizationPlan::bind_kernels`'s `equation_sign` was nontrivial; for the default
-    /// (unsigned) case `symmetry()` already reports Scientia's structural claim without needing
-    /// a proof.
+    /// Establishes, once, whether this operator's zero-point action is self-adjoint by
+    /// assembling it, and records the answer for every later [`Self::symmetry`] query on this
+    /// operator, its clones, and every [`ReducedSystemOperator`] / [`LinearizedSystemOperator`]
+    /// / capability derived from it -- mirroring `RealizationPlan::prove_symmetry` exactly,
+    /// including its dimension cap. A taken proof outranks Scientia's structural claim in both
+    /// directions: a passed proof upgrades a structural `Unknown`/`Nonsymmetric` claim to
+    /// `Symmetric` (so a Methodus conjugate-gradient or MINRES solve admits the operator with no
+    /// caller-side assumption), a failed proof reports `Nonsymmetric` and never upgrades
+    /// anything. A refused proof (non-finite tolerance, dimension cap) records nothing and
+    /// leaves the claim as it was.
     pub fn prove_symmetry(&self, tolerance: f64) -> Result<OperatorSymmetry, FinitumError> {
         if let Some(proof) = self.data.symmetry_proof.get() {
             return Ok(*proof);
@@ -3282,19 +3285,19 @@ impl LinearOperator for SystemOperator {
         self.dimension()
     }
 
-    /// Scientia's structural `form_symmetry` (C5.4/C5.5, item 8) when no `equation_sign`
-    /// orientation correction was applied at [`SystemRealizationPlan::bind_kernels`] time
-    /// (`structure.form_symmetry` describes exactly this, unsigned, system); otherwise the
-    /// proof recorded by an explicit [`Self::prove_symmetry`] call, or `Unknown` when no proof
-    /// has been established yet -- a resigned system's symmetry is not implied by the unsigned
-    /// system's structural claim, so it is never reused silently.
+    /// The proof recorded by a taken [`Self::prove_symmetry`] call when there is one (proof
+    /// outranks declaration, in both directions); otherwise Scientia's structural
+    /// `form_symmetry` (C5.4/C5.5, item 8) when no `equation_sign` orientation correction was
+    /// applied at [`SystemRealizationPlan::bind_kernels`] time (`structure.form_symmetry`
+    /// describes exactly this, unsigned, system), or `Unknown` for a resigned system -- a
+    /// resigned system's symmetry is not implied by the unsigned system's structural claim, so
+    /// it is never reused silently.
     fn symmetry(&self) -> OperatorSymmetry {
+        if let Some(proof) = self.data.symmetry_proof.get() {
+            return *proof;
+        }
         if self.data.equation_sign.values().any(|&sign| sign != 1.0) {
-            self.data
-                .symmetry_proof
-                .get()
-                .copied()
-                .unwrap_or(OperatorSymmetry::Unknown)
+            OperatorSymmetry::Unknown
         } else {
             map_form_symmetry(self.data.structure.form_symmetry)
         }

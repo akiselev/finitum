@@ -16,7 +16,8 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7/SC-W1 (Finitum) `SystemIdMap::from_scientia` (ids by value from `scientia-operator-system/2`)
   and the typed `@inf_sup` obligation consumed as `InfSupPairing::from_obligation`
 + W7 package 7c (Finitum, single compile path): per-plan `SystemQuadrature` with the P1
-  barycenter rule reproducing the single-model default bitwise on the system path
+  barycenter rule reproducing the single-model default bitwise on the system path, and
+  proof-aware `symmetry()` (a taken `prove_symmetry` outranks the structural claim)
 
 ## Implemented
 
@@ -523,6 +524,34 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     `SystemRealizationPlan::with_quadrature(.., SystemQuadrature::Barycenter)` and size tables
     with `plan.quadrature()` as today; keep `new` (`Richest`) for Taylor-Hood and RT0/P0.
 
+- W7 package 7c, deliverable B (Finitum, 2026-09-05) -- proof-aware symmetry on the system
+  path:
+  - `SystemOperator::symmetry()` -- and so `properties().symmetry()` on `SystemOperator`,
+    `ReducedSystemOperator` and `LinearizedSystemOperator`, and the capability's `symmetry` --
+    reports a taken `prove_symmetry` first: Scientia's structural claim before a proof (or
+    `Unknown` for an `equation_sign`-resigned system, as before), the assembly proof after, in
+    both directions: a passed proof upgrades `Unknown`/`Nonsymmetric` to `Symmetric`, a failed
+    proof reports `Nonsymmetric` and never upgrades anything, a refused proof (dimension cap,
+    bad tolerance) records nothing. Proof, never declaration: a Methodus conjugate-gradient or
+    MINRES solve admits the operator with no caller-side `AssumeSymmetric`. A proof is evidence
+    about the operator, not identity: the digest is untouched.
+  - Evidence (`tests/w7_system_path_symmetry.rs`, 2 tests, on the new corpus snapshot
+    `17-linear-elasticity.res` and `01-poisson.res`; `tests/sv2b4_system_stokes.rs` extended):
+    17-linear-elasticity as a one-instance 3-D system on a 3x3x3 cube (the opaque `stress`
+    constitutive as a closure with its exact Hooke tangent, a stored body-force table, the
+    whole boundary clamped, `Barycenter`) carries the structural claim `Nonsymmetric`, is
+    refused by Methodus CG under `RequireDeclared` before the proof, is proven `Symmetric` by
+    assembly, every symmetry surface then reports `Symmetric` with the digest unchanged, and CG
+    under `RequireDeclared` converges in 8 iterations to a relative residual of 2.6e-16.
+    01-poisson is structurally `Symmetric` (C5.4/C5.5) already: CG admits it before the proof,
+    the proof confirms, the solution is unchanged. The unsigned Stokes system (structural
+    `Unknown`) fails its proof: `Nonsymmetric` on the operator, its reduced form and the
+    capability, and MINRES refuses on the declared nonsymmetry -- a failed proof never upgrades.
+  - Cross-repo need (Sinbad): drop the WIP patch's `ConjugateGradientSymmetryPolicy::
+    AssumeSymmetric` fallback under a proof; keep calling `operator.prove_symmetry(tol)` once
+    per level when CG/MINRES is requested and hand the reduced operator to Methodus with the
+    default `RequireDeclared`.
+
 - SC-W1 Finitum side, HANDOFF §6 items (W7, 2026-09-05): Scientia's landed system ids and typed
   inf-sup pairing consumed.
   - `SystemIdMap::from_scientia(&scientia::SystemOperator)`: every `SysVar { id, owner, local }`
@@ -614,7 +643,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 168 passed, 0 failed across 27 binaries (W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 170 passed, 0 failed across 28 binaries (W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
