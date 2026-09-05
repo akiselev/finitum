@@ -1,3 +1,4 @@
+use crate::CellBatchLayout;
 use crate::element::{
     rt0_basis_count, rt0_reference_basis, simplex_basis, simplex_basis_count, simplex_quadrature,
 };
@@ -6,16 +7,19 @@ use crate::mixed::{
     BlockEssentialValue, BlockNullspaceCandidate, essential_constraints_for_blocks,
     solver_block_layout,
 };
+use crate::optimized::ElementAssemblyOperator;
 use crate::profile::{
     RegionMap, TaggedMesh, evaluate_kernel_partial, evaluate_kernel_value, evaluate_table_slope,
     evaluate_table_value, named_coordinate_inputs,
 };
 use crate::realization::{
-    BoundBundle, CellGeometry, FacetGeometry, PointActiveInput, PointEvaluation,
-    active_probe_inputs, apply_basis_adjoint, bind_kernels, component_count, evaluate_basis_input,
-    execute_jvp_values, execute_primal_values, execute_vjp_values, gather_test_adjoint,
-    point_parameter_cotangents, probe_direction_evaluation, transpose_scatter_shape,
-    validate_finite,
+    BoundBundle, CapabilityElement, CellGeometry, ConstraintKind, DerivativeProduct,
+    DistributedCoefficient, ExternalInput, FacetGeometry, PointActiveInput, PointEvaluation,
+    RealizationCapability, RealizationExternalInput, RealizationReceipt, RepresentationKind,
+    active_probe_inputs, apply_basis_adjoint, bind_kernels, build_capability, component_count,
+    evaluate_basis_input, execute_jvp_values, execute_parameter_jvp_values, execute_primal_values,
+    execute_vjp_values, gather_test_adjoint, point_parameter_cotangents,
+    probe_direction_evaluation, transpose_scatter_shape, validate_finite,
 };
 use crate::space::{
     DofMap, ElementRestriction, cell_constant_dof_map, quadratic_simplex_dof_map,
@@ -27,7 +31,7 @@ use crate::{
     FacetTopology, FieldBlock, FieldSource, FinitumError, Mesh, PreparedElement, QuadraturePoint,
 };
 use methodus::{
-    BlockLinearOperator, DaeOperator, Definiteness, EvaluationContext, LinearOperator,
+    BlockLinearOperator, CsrMatrix, DaeOperator, Definiteness, EvaluationContext, LinearOperator,
     NonlinearOperator, NumericError, OperatorProperties, OperatorStructureHint, OperatorSymmetry,
     TransposableOperator,
 };
@@ -179,6 +183,13 @@ impl SystemRealizationPlan {
 
     pub fn artifact_digest(&self) -> &Digest {
         &self.artifact_digest
+    }
+
+    /// The shared cell quadrature table [`SystemRealizationPlan::bind_kernels`] integrates every
+    /// field with (see [`SystemOperator::quadrature`]) -- available before binding so stored
+    /// tables ([`SystemExternalInput`]) can be laid out over it.
+    pub fn quadrature(&self) -> Result<Vec<QuadraturePoint>, FinitumError> {
+        simplex_quadrature(self.mesh.dimension())
     }
 }
 
@@ -877,6 +888,68 @@ impl SystemConstitutiveInput {
     }
 }
 
+/// SC-W1 system-path parity (a): a stored quadrature-point table bound to one non-basis input
+/// of a cell integral of the residual `residual` -- the system counterpart of the stored
+/// [`ExternalInput`] a `RealizationPlan` carries, in the same cell/quadrature/component order
+/// over [`SystemOperator::quadrature`] (build one with [`ExternalInput::from_coefficient_at`] to
+/// parameterize it by a design vector, or [`ExternalInput::new`]). Bound through
+/// [`SystemRealizationPlan::bind_kernels_with_inputs`]; state-independent (its direction is
+/// zero, exactly as a stored single-model input), and covered value-by-value by the operator
+/// digest.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemExternalInput {
+    pub residual: SysResId,
+    pub input: ExternalInput,
+}
+
+/// SC-W1 system-path parity (a): one stored input of residual `residual`'s cell integral viewed
+/// as a distributed coefficient over a caller-owned design space -- the system counterpart of
+/// [`DistributedCoefficient`], consumed by [`SystemOperator::coefficient_dimension`],
+/// [`SystemOperator::coefficient_jacobian_vector_product`] and its exact transpose
+/// [`SystemOperator::coefficient_vector_jacobian_product`] (and their
+/// [`ReducedSystemOperator`] forms).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemDistributedCoefficient {
+    pub residual: SysResId,
+    pub coefficient: DistributedCoefficient,
+}
+
+/// One resolved non-basis input binding of a system operator.
+enum SystemInputBinding<'a> {
+    Stored(&'a ExternalInput),
+    Constitutive(&'a SystemConstitutiveInput),
+}
+
+/// The non-basis input bindings every point evaluation of a system operator resolves against:
+/// the closure-based constitutive inputs and the stored tables, keyed by
+/// `(block index, integral index, input)`, plus the shared quadrature's point count the stored
+/// tables are indexed with.
+struct SystemInputBindings<'a> {
+    constitutive: &'a BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+    stored: &'a BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
+    point_count: usize,
+}
+
+impl SystemInputBindings<'_> {
+    fn resolve(
+        &self,
+        key: (usize, usize, TensorInputId),
+    ) -> Result<SystemInputBinding<'_>, FinitumError> {
+        if let Some(stored) = self.stored.get(&key) {
+            return Ok(SystemInputBinding::Stored(stored));
+        }
+        self.constitutive
+            .get(&key)
+            .map(SystemInputBinding::Constitutive)
+            .ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "integral {} input {:?} has no bound constitutive or stored input",
+                    key.1, key.2
+                ))
+            })
+    }
+}
+
 /// Maps Scientia's structural `FormSymmetry` (C5.4) directly onto a declared
 /// `methodus::OperatorSymmetry` (C5.5) -- item 8's "thread `OperatorStructure` into the realized
 /// operator's declared `symmetry()`".
@@ -941,9 +1014,15 @@ fn derive_nullspace_candidates(
         .collect()
 }
 
+/// Schema of [`SystemOperator::digest`]'s payload: `/2` adds every stored table's values
+/// (SC-W1 system-path parity), so two operators differing only in a design vector differ in
+/// identity exactly as two `RealizationPlan`s do.
+pub const SYSTEM_OPERATOR_DIGEST_SCHEMA: &str = "finitum-system-operator/2";
+
 fn system_operator_digest(
     plan: &SystemRealizationPlan,
     constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+    stored: &BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
     equation_sign: &BTreeMap<usize, f64>,
     facet_regions: &BTreeMap<RegionId, Vec<FacetId>>,
 ) -> Digest {
@@ -956,16 +1035,37 @@ fn system_operator_digest(
         identity: &'a str,
     }
     #[derive(Serialize)]
+    struct StoredIdentity<'a> {
+        block_index: usize,
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        values: &'a [f64],
+    }
+    #[derive(Serialize)]
     struct Payload<'a> {
         schema: &'static str,
         plan_digest: &'a Digest,
         constitutive: Vec<ConstitutiveIdentity<'a>>,
+        stored: Vec<StoredIdentity<'a>>,
         equation_sign: &'a BTreeMap<usize, f64>,
         facet_regions: BTreeMap<u32, Vec<usize>>,
     }
     let payload = Payload {
-        schema: "finitum-system-operator/1",
+        schema: SYSTEM_OPERATOR_DIGEST_SCHEMA,
         plan_digest: plan.artifact_digest(),
+        stored: stored
+            .iter()
+            .map(
+                |(&(block_index, integral_index, input), table)| StoredIdentity {
+                    block_index,
+                    integral_index,
+                    input,
+                    component_count: table.component_count(),
+                    values: table.values(),
+                },
+            )
+            .collect(),
         constitutive: constitutive
             .iter()
             .map(
@@ -1049,6 +1149,24 @@ impl SystemRealizationPlan {
     pub fn bind_kernels_with_facets(
         &self,
         constitutive: Vec<SystemConstitutiveInput>,
+        equation_sign: BTreeMap<String, f64>,
+        facet_regions: BTreeMap<RegionId, Vec<FacetId>>,
+    ) -> Result<SystemOperator, FinitumError> {
+        self.bind_kernels_with_inputs(constitutive, Vec::new(), equation_sign, facet_regions)
+    }
+
+    /// As [`Self::bind_kernels_with_facets`], additionally binding stored quadrature-point
+    /// tables ([`SystemExternalInput`], SC-W1 system-path parity) to non-basis inputs of cell
+    /// integrals: each names a residual of this plan's [`SystemIdMap`], an existing non-`Basis`
+    /// input of one of that residual's `SemanticMeasure::Cell` integrals, carries that input's
+    /// component count, and has exactly `cells * quadrature points * components` values over
+    /// [`SystemOperator::quadrature`]. A key bound both as a closure and as a table, a facet
+    /// integral, a basis input, or a shape mismatch is refused typed. Every non-basis cell
+    /// input must be bound one way or the other.
+    pub fn bind_kernels_with_inputs(
+        &self,
+        constitutive: Vec<SystemConstitutiveInput>,
+        stored: Vec<SystemExternalInput>,
         equation_sign: BTreeMap<String, f64>,
         facet_regions: BTreeMap<RegionId, Vec<FacetId>>,
     ) -> Result<SystemOperator, FinitumError> {
@@ -1192,6 +1310,97 @@ impl SystemRealizationPlan {
                 )));
             }
         }
+        let mut stored_by_key = BTreeMap::new();
+        for table in stored {
+            let origin = self
+                .system_ids
+                .residual_origin(table.residual)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "stored input names residual {} which the system does not carry",
+                        table.residual
+                    ))
+                })?;
+            let block_index = self
+                .system
+                .blocks
+                .iter()
+                .position(|block| block.equation == origin.equation)
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "residual {} names equation `{}` which the system does not carry",
+                        table.residual, origin.equation
+                    ))
+                })?;
+            let block = &self.system.blocks[block_index];
+            let integral = block
+                .factorization
+                .integrals
+                .iter()
+                .find(|integral| integral.integral_index == table.input.integral_index)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "stored input names absent integral {} of equation `{}`",
+                        table.input.integral_index, block.equation
+                    ))
+                })?;
+            if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "stored system inputs are realized on cell integrals only; equation `{}` \
+                     integral {} has measure {:?}",
+                    block.equation, integral.integral_index, integral.measure
+                )));
+            }
+            let input = integral
+                .primal
+                .inputs
+                .iter()
+                .find(|input| input.id == table.input.input)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "stored input names undeclared input {:?} of equation `{}` integral {}",
+                        table.input.input, block.equation, integral.integral_index
+                    ))
+                })?;
+            if input.source == InputSourceRequirement::Basis {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "equation `{}` integral {} input {:?} is a basis input, not an external one",
+                    block.equation, integral.integral_index, input.id
+                )));
+            }
+            let components = component_count(&input.shape)?;
+            let expected = self.mesh.cells().len() * quadrature.len() * components;
+            if table.input.component_count() != components || table.input.values().len() != expected
+            {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "stored input for equation `{}` integral {} input {:?} has {} components \
+                     and {} values; the realization expects {components} components over {} \
+                     cells x {} quadrature points ({expected} values)",
+                    block.equation,
+                    integral.integral_index,
+                    input.id,
+                    table.input.component_count(),
+                    table.input.values().len(),
+                    self.mesh.cells().len(),
+                    quadrature.len()
+                )));
+            }
+            let key = (block_index, integral.integral_index, input.id);
+            if constitutive_by_key.contains_key(&key) {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "equation `{}` integral {} input {:?} is bound both as a constitutive \
+                     closure and as a stored table",
+                    block.equation, integral.integral_index, input.id
+                )));
+            }
+            if stored_by_key.insert(key, table.input).is_some() {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "stored input for equation `{}` integral {} input {:?} is bound more than \
+                     once",
+                    block.equation, integral.integral_index, input.id
+                )));
+            }
+        }
         for (block_index, block) in self.system.blocks.iter().enumerate() {
             for integral in &block.factorization.integrals {
                 for input in &integral.primal.inputs {
@@ -1199,12 +1408,12 @@ impl SystemRealizationPlan {
                         continue;
                     }
                     let key = (block_index, integral.integral_index, input.id);
-                    if !constitutive_by_key.contains_key(&key) {
+                    if !constitutive_by_key.contains_key(&key) && !stored_by_key.contains_key(&key)
+                    {
                         return Err(FinitumError::UnsupportedRealization(format!(
                             "equation `{}` integral {} input {:?} requires a caller-supplied \
-                             SystemConstitutiveInput (system realization admits closure-based \
-                             ModelDefinedConstitutive/Value/Property/ExternalValue resolution \
-                             only -- Stored/regional external tensor tables remain future work)",
+                             SystemConstitutiveInput closure or a stored SystemExternalInput \
+                             table (regional external tensor tables remain future work)",
                             block.equation, integral.integral_index, input.id
                         )));
                     }
@@ -1240,6 +1449,7 @@ impl SystemRealizationPlan {
         let digest = system_operator_digest(
             self,
             &constitutive_by_key,
+            &stored_by_key,
             &equation_sign_by_block,
             &facet_regions,
         );
@@ -1250,6 +1460,7 @@ impl SystemRealizationPlan {
                 quadrature,
                 bindings,
                 constitutive: constitutive_by_key,
+                stored: stored_by_key,
                 equation_sign: equation_sign_by_block,
                 facet_regions,
                 facet_geometries,
@@ -1274,6 +1485,8 @@ struct SystemOperatorData {
     quadrature: Vec<QuadraturePoint>,
     bindings: BTreeMap<usize, BTreeMap<(usize, usize), BoundBundle>>,
     constitutive: BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+    /// Stored quadrature-point tables (SC-W1 system-path parity), keyed like `constitutive`.
+    stored: BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
     /// Per-block-index equation orientation (`1.0` or `-1.0`, absent means `1.0`); see
     /// `SystemRealizationPlan::bind_kernels`'s `equation_sign` parameter.
     equation_sign: BTreeMap<usize, f64>,
@@ -1571,27 +1784,626 @@ impl SystemOperator {
         only_block: Option<usize>,
     ) -> Result<(), FinitumError> {
         for cell in 0..self.data.plan.mesh().cells().len() {
-            let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
-            let affine = AffineMap::from_cell(self.data.plan.mesh(), CellId(cell))?;
-            for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
-                if only_block.is_some_and(|only| only != block_index) {
-                    continue;
-                }
-                self.apply_block_cell(
-                    block_index,
-                    block,
-                    cell,
-                    &geometry,
-                    &affine,
-                    time,
-                    state,
-                    state_rate,
-                    action,
-                    output,
-                )?;
-            }
+            self.apply_cell_blocks(cell, time, state, state_rate, action, output, only_block)?;
         }
         Ok(())
+    }
+
+    /// One cell's contribution of every block (or of `only_block`) to `output`.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_cell_blocks(
+        &self,
+        cell: usize,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        action: SystemAction<'_>,
+        output: &mut [f64],
+        only_block: Option<usize>,
+    ) -> Result<(), FinitumError> {
+        let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
+        let affine = AffineMap::from_cell(self.data.plan.mesh(), CellId(cell))?;
+        for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
+            if only_block.is_some_and(|only| only != block_index) {
+                continue;
+            }
+            self.apply_block_cell(
+                block_index,
+                block,
+                cell,
+                &geometry,
+                &affine,
+                time,
+                state,
+                state_rate,
+                action,
+                output,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn input_bindings(&self) -> SystemInputBindings<'_> {
+        SystemInputBindings {
+            constitutive: &self.data.constitutive,
+            stored: &self.data.stored,
+            point_count: self.data.quadrature.len(),
+        }
+    }
+
+    /// The shared cell quadrature table every field of this operator is integrated with
+    /// (degree-4-exact on triangles, degree-2 on tetrahedra); stored tables
+    /// ([`SystemExternalInput`]) and distributed coefficients ([`crate::CoefficientLayout`]) are
+    /// laid out over it.
+    pub fn quadrature(&self) -> &[QuadraturePoint] {
+        &self.data.quadrature
+    }
+
+    /// Per-cell gather of every realized field's local DOF values from a layout-wide vector.
+    fn gather_local(&self, cell: usize, vector: &[f64]) -> BTreeMap<SymbolId, Vec<f64>> {
+        let layout = self.layout();
+        self.data
+            .fields
+            .iter()
+            .map(|(&symbol, field)| {
+                let field_block = layout
+                    .block(symbol)
+                    .expect("realized field implies a layout block");
+                let restriction = &field.dofs.restrictions()[cell];
+                (
+                    symbol,
+                    restriction
+                        .dofs
+                        .iter()
+                        .map(|dof| vector[field_block.offset + dof.0])
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// The layout-wide DOFs each cell touches: every realized field's cell restriction, offset
+    /// into its block, in field (`SymbolId`) order -- the element restriction a cell-local
+    /// matrix of the whole system is indexed by.
+    fn cell_restrictions(&self) -> Vec<ElementRestriction> {
+        let layout = self.layout();
+        (0..self.data.plan.mesh().cells().len())
+            .map(|cell| ElementRestriction {
+                dofs: self
+                    .data
+                    .fields
+                    .iter()
+                    .flat_map(|(&symbol, field)| {
+                        let offset = layout
+                            .block(symbol)
+                            .expect("realized field implies a layout block")
+                            .offset;
+                        field.dofs.restrictions()[cell]
+                            .dofs
+                            .iter()
+                            .map(move |dof| crate::DofId(offset + dof.0))
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Resolves `coefficient` to its block index, integral, and stored table, refusing an
+    /// unknown residual/integral/input, a facet integral, or a closure-bound (constitutive)
+    /// input, whose values are not a design vector.
+    fn coefficient_binding(
+        &self,
+        coefficient: &SystemDistributedCoefficient,
+    ) -> Result<(usize, &IntegralOperatorFactorization, &ExternalInput), FinitumError> {
+        let origin = self
+            .system_ids()
+            .residual_origin(coefficient.residual)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "distributed coefficient names residual {} which the system does not carry",
+                    coefficient.residual
+                ))
+            })?;
+        let system = self.data.plan.system();
+        let block_index = system
+            .blocks
+            .iter()
+            .position(|block| block.equation == origin.equation)
+            .ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "residual {} names equation `{}` which the system does not carry",
+                    coefficient.residual, origin.equation
+                ))
+            })?;
+        let integral = system.blocks[block_index]
+            .factorization
+            .integrals
+            .iter()
+            .find(|integral| integral.integral_index == coefficient.coefficient.integral_index)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "distributed coefficient names absent integral {} of residual {}",
+                    coefficient.coefficient.integral_index, coefficient.residual
+                ))
+            })?;
+        if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "distributed coefficients are realized on cell integrals only; integral {} has \
+                 measure {:?}",
+                integral.integral_index, integral.measure
+            )));
+        }
+        let key = (
+            block_index,
+            integral.integral_index,
+            coefficient.coefficient.input,
+        );
+        match self.data.stored.get(&key) {
+            Some(stored) => Ok((block_index, integral, stored)),
+            None if self.data.constitutive.contains_key(&key) => {
+                Err(FinitumError::UnsupportedRealization(format!(
+                    "residual {} integral {} input {:?} is a constitutive closure, not a stored \
+                     distributed coefficient",
+                    coefficient.residual, key.1, key.2
+                )))
+            }
+            None => Err(FinitumError::MissingExternalInput {
+                integral: key.1,
+                input: key.2,
+            }),
+        }
+    }
+
+    /// SC-W1 system-path parity (a): the design-space extent of `coefficient` under its
+    /// layout over this operator's shared quadrature (`RealizationPlan::coefficient_dimension`).
+    pub fn coefficient_dimension(
+        &self,
+        coefficient: &SystemDistributedCoefficient,
+    ) -> Result<usize, FinitumError> {
+        let (_, _, stored) = self.coefficient_binding(coefficient)?;
+        coefficient.coefficient.layout.dimension_at(
+            self.data.plan.mesh(),
+            self.data.quadrature.len(),
+            stored.component_count(),
+        )
+    }
+
+    /// SC-W1 system-path parity (a): `dR/dp * direction` at `(t, u, u_t)` in the layout's
+    /// physical coordinates -- the coefficient's residual's bound parameter (frozen-input) JVP
+    /// kernels with the direction routed to that input only, scaled by the row's
+    /// `equation_sign`; the exact system counterpart of
+    /// `RealizationPlan::coefficient_jacobian_vector_product`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coefficient_jacobian_vector_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        coefficient: &SystemDistributedCoefficient,
+        direction: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.validate_point(time, state, state_rate, output)?;
+        let (block_index, integral, stored) = self.coefficient_binding(coefficient)?;
+        let components = stored.component_count();
+        let expected = self.coefficient_dimension(coefficient)?;
+        if direction.len() != expected {
+            return Err(FinitumError::InvalidRealization(format!(
+                "coefficient direction has length {}, expected {expected}",
+                direction.len()
+            )));
+        }
+        validate_finite("coefficient direction", direction)?;
+        let block = &self.data.plan.system().blocks[block_index];
+        let row_field = &self.data.fields[&block.row];
+        let row_block = self
+            .layout()
+            .block(block.row)
+            .expect("row field implies a layout block");
+        let sign = self
+            .data
+            .equation_sign
+            .get(&block_index)
+            .copied()
+            .unwrap_or(1.0);
+        let mesh = self.data.plan.mesh();
+        let bindings = &self.data.bindings[&block_index];
+        output.fill(0.0);
+        for cell in 0..mesh.cells().len() {
+            let geometry = CellGeometry::new(mesh, CellId(cell))?;
+            let affine = AffineMap::from_cell(mesh, CellId(cell))?;
+            let local_state = self.gather_local(cell, state);
+            let local_rate = self.gather_local(cell, state_rate);
+            let row_restriction = &row_field.dofs.restrictions()[cell];
+            let mut local_output = vec![0.0; row_restriction.dofs.len()];
+            for (point, quadrature_point) in self.data.quadrature.iter().enumerate() {
+                let reference_point = &quadrature_point.coordinates;
+                let scale = quadrature_point.weight * geometry.determinant();
+                let weights = coefficient.coefficient.layout.weights_at(
+                    mesh,
+                    &self.data.quadrature,
+                    cell,
+                    point,
+                )?;
+                let point_direction = (0..components)
+                    .map(|component| {
+                        weights
+                            .iter()
+                            .map(|(entity, weight)| {
+                                weight * direction[entity * components + component]
+                            })
+                            .sum::<f64>()
+                    })
+                    .collect::<Vec<_>>();
+                let (inputs, _) = point_inputs_system(
+                    &self.data.fields,
+                    integral,
+                    cell,
+                    point,
+                    &geometry,
+                    &affine,
+                    reference_point,
+                    time,
+                    &local_state,
+                    &local_rate,
+                    &self.input_bindings(),
+                    block_index,
+                )?;
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = bound_kernel(bindings, block, integral, output_index)?;
+                    let Some(point_output) = execute_parameter_jvp_values(
+                        bound,
+                        &inputs,
+                        coefficient.coefficient.input,
+                        &point_direction,
+                    )?
+                    else {
+                        continue;
+                    };
+                    apply_field_basis_adjoint(
+                        row_field,
+                        &geometry,
+                        &affine,
+                        cell,
+                        point,
+                        reference_point,
+                        &qoutput.binding.evaluation.derivative,
+                        &point_output,
+                        scale,
+                        &mut local_output,
+                    )?;
+                }
+            }
+            for (local_index, dof) in row_restriction.dofs.iter().enumerate() {
+                output[row_block.offset + dof.0] += sign * local_output[local_index];
+            }
+        }
+        validate_finite("system coefficient JVP", output)
+    }
+
+    /// SC-W1 system-path parity (a): `(dR/dp)^T * adjoint` -- the exact transpose of
+    /// [`Self::coefficient_jacobian_vector_product`], each quadrature point's parameter
+    /// cotangent (the bound parameter kernel's point-local Jacobian contracted against the
+    /// row field's sign-scaled test adjoint) accumulated into the caller-owned design space
+    /// through the transpose of the layout's interpolation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coefficient_vector_jacobian_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        coefficient: &SystemDistributedCoefficient,
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let probe = vec![0.0; self.dimension()];
+        self.validate_point(time, state, state_rate, &probe)?;
+        self.validate_vector("system coefficient VJP adjoint", adjoint)?;
+        let (block_index, integral, stored) = self.coefficient_binding(coefficient)?;
+        let components = stored.component_count();
+        let expected = self.coefficient_dimension(coefficient)?;
+        if output.len() != expected {
+            return Err(FinitumError::InvalidRealization(format!(
+                "coefficient VJP output has length {}, expected {expected}",
+                output.len()
+            )));
+        }
+        let block = &self.data.plan.system().blocks[block_index];
+        let row_field = &self.data.fields[&block.row];
+        let row_block = self
+            .layout()
+            .block(block.row)
+            .expect("row field implies a layout block");
+        let sign = self
+            .data
+            .equation_sign
+            .get(&block_index)
+            .copied()
+            .unwrap_or(1.0);
+        let mesh = self.data.plan.mesh();
+        let bindings = &self.data.bindings[&block_index];
+        output.fill(0.0);
+        for cell in 0..mesh.cells().len() {
+            let geometry = CellGeometry::new(mesh, CellId(cell))?;
+            let affine = AffineMap::from_cell(mesh, CellId(cell))?;
+            let local_state = self.gather_local(cell, state);
+            let local_rate = self.gather_local(cell, state_rate);
+            let row_restriction = &row_field.dofs.restrictions()[cell];
+            let local_adjoint = row_restriction
+                .dofs
+                .iter()
+                .map(|dof| sign * adjoint[row_block.offset + dof.0])
+                .collect::<Vec<_>>();
+            for (point, quadrature_point) in self.data.quadrature.iter().enumerate() {
+                let reference_point = &quadrature_point.coordinates;
+                let scale = quadrature_point.weight * geometry.determinant();
+                let weights = coefficient.coefficient.layout.weights_at(
+                    mesh,
+                    &self.data.quadrature,
+                    cell,
+                    point,
+                )?;
+                let (inputs, _) = point_inputs_system(
+                    &self.data.fields,
+                    integral,
+                    cell,
+                    point,
+                    &geometry,
+                    &affine,
+                    reference_point,
+                    time,
+                    &local_state,
+                    &local_rate,
+                    &self.input_bindings(),
+                    block_index,
+                )?;
+                for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                    let bound = bound_kernel(bindings, block, integral, output_index)?;
+                    let output_components = component_count(&qoutput.shape)?;
+                    let seed = gather_field_test_adjoint(
+                        row_field,
+                        &geometry,
+                        &affine,
+                        cell,
+                        point,
+                        reference_point,
+                        &qoutput.binding.evaluation.derivative,
+                        output_components,
+                        &local_adjoint,
+                    )?;
+                    let cotangents = point_parameter_cotangents(bound, &inputs, &seed)?;
+                    let Some(cotangent) = cotangents.get(&coefficient.coefficient.input) else {
+                        continue;
+                    };
+                    if cotangent.len() != components {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "coefficient cotangent has {} components, expected {components}",
+                            cotangent.len()
+                        )));
+                    }
+                    for (entity, weight) in &weights {
+                        for component in 0..components {
+                            output[entity * components + component] +=
+                                scale * weight * cotangent[component];
+                        }
+                    }
+                }
+            }
+        }
+        validate_finite("system coefficient VJP", output)
+    }
+
+    /// SC-W1 system-path parity (b): the zero-point linear view as one cell-local matrix per
+    /// cell over [`Self::cell_restrictions`] (unit-column probing of the cell's own JVP), the
+    /// counterpart of `RealizationPlan::element_assembly`; refuses admitted exterior-facet
+    /// integrals exactly as the single-model path does. `constraints` are the essential rows
+    /// the operator is reduced by (empty for the physical operator).
+    fn element_assembly_with(
+        &self,
+        constraints: ConstraintSet,
+        lane_width: usize,
+    ) -> Result<ElementAssemblyOperator, FinitumError> {
+        if !self.data.facet_regions.is_empty() {
+            return Err(FinitumError::UnsupportedRealization(
+                "element assembly does not yet cover exterior facet integrals (GX-C4)".into(),
+            ));
+        }
+        let dimension = self.dimension();
+        let zero = vec![0.0; dimension];
+        let restrictions = self.cell_restrictions();
+        let mut local_matrices = Vec::with_capacity(restrictions.len());
+        for (cell, restriction) in restrictions.iter().enumerate() {
+            let local_dimension = restriction.dofs.len();
+            let mut matrix = vec![0.0; local_dimension * local_dimension];
+            for (column, dof) in restriction.dofs.iter().enumerate() {
+                let mut direction = vec![0.0; dimension];
+                direction[dof.0] = 1.0;
+                let mut output = vec![0.0; dimension];
+                self.apply_cell_blocks(
+                    cell,
+                    0.0,
+                    &zero,
+                    &zero,
+                    SystemAction::Jvp {
+                        state_direction: &direction,
+                        rate_direction: &zero,
+                    },
+                    &mut output,
+                    None,
+                )?;
+                for (row, row_dof) in restriction.dofs.iter().enumerate() {
+                    matrix[row * local_dimension + column] = output[row_dof.0];
+                }
+            }
+            local_matrices.push(matrix);
+        }
+        ElementAssemblyOperator::new(
+            dimension,
+            self.data.plan.artifact_digest().clone(),
+            restrictions,
+            constraints,
+            local_matrices,
+            lane_width,
+        )
+    }
+
+    /// Element assembly of the physical (unreduced) operator; see [`ReducedSystemOperator::element_assembly`] for the constrained one.
+    pub fn element_assembly(
+        &self,
+        lane_width: usize,
+    ) -> Result<ElementAssemblyOperator, FinitumError> {
+        self.element_assembly_with(ConstraintSet::new(self.dimension(), [])?, lane_width)
+    }
+
+    fn partial_assembly_with(
+        &self,
+        constraints: ConstraintSet,
+        lane_width: usize,
+    ) -> Result<SystemPartialAssemblyOperator, FinitumError> {
+        if !self.data.constitutive.is_empty() {
+            return Err(FinitumError::UnsupportedRealization(
+                "partial assembly currently requires state-independent external inputs (a \
+                 constitutive closure is bound; the single-model path refuses its dynamic \
+                 inputs the same way)"
+                    .into(),
+            ));
+        }
+        if !self.data.facet_regions.is_empty() {
+            return Err(FinitumError::UnsupportedRealization(
+                "partial assembly does not yet cover exterior facet integrals (GX-C4)".into(),
+            ));
+        }
+        let mesh = self.data.plan.mesh();
+        let system = self.data.plan.system();
+        let zero = vec![0.0; self.dimension()];
+        let mut point_actions = Vec::with_capacity(mesh.cells().len());
+        for cell in 0..mesh.cells().len() {
+            let geometry = CellGeometry::new(mesh, CellId(cell))?;
+            let affine = AffineMap::from_cell(mesh, CellId(cell))?;
+            let local_zero = self.gather_local(cell, &zero);
+            let mut cell_actions = Vec::new();
+            for (block_index, block) in system.blocks.iter().enumerate() {
+                let sign = self
+                    .data
+                    .equation_sign
+                    .get(&block_index)
+                    .copied()
+                    .unwrap_or(1.0);
+                let bindings = &self.data.bindings[&block_index];
+                for integral in &block.factorization.integrals {
+                    if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
+                        continue;
+                    }
+                    let active_inputs = integral
+                        .primal
+                        .inputs
+                        .iter()
+                        .filter(|input| {
+                            input.source == InputSourceRequirement::Basis
+                                && input.role == TensorInputRole::Active
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let input_components = active_inputs
+                        .iter()
+                        .map(|input| component_count(&input.shape))
+                        .sum::<Result<usize, _>>()?;
+                    if input_components == 0 {
+                        continue;
+                    }
+                    for (point, quadrature_point) in self.data.quadrature.iter().enumerate() {
+                        let reference_point = &quadrature_point.coordinates;
+                        let scale = sign * quadrature_point.weight * geometry.determinant();
+                        let (inputs, _) = point_inputs_system(
+                            &self.data.fields,
+                            integral,
+                            cell,
+                            point,
+                            &geometry,
+                            &affine,
+                            reference_point,
+                            0.0,
+                            &local_zero,
+                            &local_zero,
+                            &self.input_bindings(),
+                            block_index,
+                        )?;
+                        for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
+                            let bound = bound_kernel(bindings, block, integral, output_index)?;
+                            let mut columns = Vec::with_capacity(input_components);
+                            for selected in 0..input_components {
+                                let mut directions = integral
+                                    .primal
+                                    .inputs
+                                    .iter()
+                                    .map(|input| {
+                                        component_count(&input.shape)
+                                            .map(|count| (input.id, vec![0.0; count]))
+                                    })
+                                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                                let mut offset = 0;
+                                for input in &active_inputs {
+                                    let count = component_count(&input.shape)?;
+                                    if (offset..offset + count).contains(&selected) {
+                                        directions
+                                            .get_mut(&input.id)
+                                            .expect("input was inserted")[selected - offset] = 1.0;
+                                        break;
+                                    }
+                                    offset += count;
+                                }
+                                columns.push(execute_jvp_values(bound, &inputs, &directions)?);
+                            }
+                            let output_components = component_count(&qoutput.shape)?;
+                            if columns
+                                .iter()
+                                .any(|column| column.len() != output_components)
+                            {
+                                return Err(FinitumError::InvalidRealization(
+                                    "partial point Jacobian has inconsistent output extents".into(),
+                                ));
+                            }
+                            let mut matrix = vec![0.0; output_components * input_components];
+                            for (column, values) in columns.iter().enumerate() {
+                                for (row, value) in values.iter().copied().enumerate() {
+                                    matrix[row * input_components + column] = value;
+                                }
+                            }
+                            cell_actions.push(SystemPartialPointAction {
+                                row: block.row,
+                                point,
+                                scale,
+                                active_inputs: active_inputs.clone(),
+                                output_derivative: qoutput.binding.evaluation.derivative,
+                                output_components,
+                                matrix,
+                            });
+                        }
+                    }
+                }
+            }
+            point_actions.push(cell_actions);
+        }
+        let batches = CellBatchLayout::new(mesh.cells().len(), lane_width)?;
+        Ok(SystemPartialAssemblyOperator {
+            operator: self.clone(),
+            constraints,
+            point_actions,
+            batches,
+        })
+    }
+
+    /// SC-W1 system-path parity (b): the zero-point linear view as stored per-quadrature-point
+    /// Jacobians (from the concatenated active field evaluations of each block integral output
+    /// to that output) applied through the fields' own basis actions -- the counterpart of
+    /// `RealizationPlan::partial_assembly`, exact for a system whose inputs are all stored
+    /// tables or basis fields; refuses a bound constitutive closure and exterior-facet integrals
+    /// exactly as the single-model path refuses dynamic inputs and facets.
+    pub fn partial_assembly(
+        &self,
+        lane_width: usize,
+    ) -> Result<SystemPartialAssemblyOperator, FinitumError> {
+        self.partial_assembly_with(ConstraintSet::new(self.dimension(), [])?, lane_width)
     }
 
     /// SC-W1: the system-level ids of this realization group (`plan().system_ids()`).
@@ -2050,7 +2862,7 @@ impl SystemOperator {
                                 time,
                                 &local_state,
                                 &local_rate,
-                                &self.data.constitutive,
+                                &self.input_bindings(),
                                 block_index,
                             )?;
                             let point_output = match &directions {
@@ -2067,7 +2879,7 @@ impl SystemOperator {
                                         time,
                                         local_state_direction,
                                         local_rate_direction,
-                                        &self.data.constitutive,
+                                        &self.input_bindings(),
                                         block_index,
                                         &evaluation,
                                     )?;
@@ -2136,7 +2948,7 @@ impl SystemOperator {
                                 time,
                                 &local_state,
                                 &local_rate,
-                                &self.data.constitutive,
+                                &self.input_bindings(),
                                 block_index,
                             )?;
                             let seed = gather_field_test_adjoint(
@@ -2166,7 +2978,7 @@ impl SystemOperator {
                                     rate_shift,
                                     &evaluation,
                                     &active_inputs,
-                                    &self.data.constitutive,
+                                    &self.input_bindings(),
                                     block_index,
                                     &parameter_cotangents,
                                     &mut cotangents,
@@ -2840,6 +3652,536 @@ impl ReducedSystemOperator {
     }
 }
 
+impl ReducedSystemOperator {
+    /// [`SystemOperator::coefficient_dimension`] of the underlying physical operator.
+    pub fn coefficient_dimension(
+        &self,
+        coefficient: &SystemDistributedCoefficient,
+    ) -> Result<usize, FinitumError> {
+        self.operator.coefficient_dimension(coefficient)
+    }
+
+    /// SC-W1 system-path parity (a): the essential-constraint-eliminated form of
+    /// [`SystemOperator::coefficient_jacobian_vector_product`], row for row the
+    /// `RealizationPlan` one -- constraint rows carry zero coefficient derivative, because
+    /// essential values are frozen inputs of the realization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coefficient_jacobian_vector_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        coefficient: &SystemDistributedCoefficient,
+        direction: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let dimension = self.operator.dimension();
+        if output.len() != dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "reduced system coefficient JVP expects output length {dimension}, got {}",
+                output.len()
+            )));
+        }
+        let physical_state = self.constraints.expand(state)?;
+        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let mut physical_output = vec![0.0; dimension];
+        self.operator.coefficient_jacobian_vector_product(
+            time,
+            &physical_state,
+            &physical_rate,
+            coefficient,
+            direction,
+            &mut physical_output,
+        )?;
+        output.copy_from_slice(&self.constraints.restrict_transpose(&physical_output)?);
+        for constraint in self.constraints.constraints() {
+            output[constraint.target.0] = 0.0;
+        }
+        validate_finite("reduced system coefficient JVP", output)
+    }
+
+    /// SC-W1 system-path parity (a): the exact transpose of
+    /// [`Self::coefficient_jacobian_vector_product`] (constraint rows of the adjoint masked
+    /// out before the homogeneous expansion); affine dependency constraints refuse exactly as
+    /// [`Self::vector_jacobian_product`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coefficient_vector_jacobian_product(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        coefficient: &SystemDistributedCoefficient,
+        adjoint: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        let dimension = self.operator.dimension();
+        if adjoint.len() != dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "reduced system coefficient VJP expects adjoint length {dimension}, got {}",
+                adjoint.len()
+            )));
+        }
+        if self.constraints.has_affine_dependencies() {
+            return Err(FinitumError::UnsupportedRealization(
+                "coefficient_vector_jacobian_product refuses affine dependency constraints; \
+                 their exact transpose is not yet implemented (SV1-C2)"
+                    .into(),
+            ));
+        }
+        let physical_state = self.constraints.expand(state)?;
+        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let mut restricted_adjoint = adjoint.to_vec();
+        for constraint in self.constraints.constraints() {
+            restricted_adjoint[constraint.target.0] = 0.0;
+        }
+        let physical_adjoint = self.constraints.expand_homogeneous(&restricted_adjoint)?;
+        self.operator.coefficient_vector_jacobian_product(
+            time,
+            &physical_state,
+            &physical_rate,
+            coefficient,
+            &physical_adjoint,
+            output,
+        )
+    }
+
+    /// Canonical CSR assembly of the reduced zero-point linear view by unit-column probing of
+    /// [`LinearOperator::apply`] (constraint rows included), the counterpart of
+    /// `RealizationPlan::assemble`; Methodus's `CsrMatrix` is `TransposableOperator`, so the
+    /// assembled transpose is available without a symmetry declaration.
+    pub fn assemble(&self) -> Result<CsrMatrix, FinitumError> {
+        assemble_by_probing(self)
+    }
+
+    /// [`SystemOperator::element_assembly`] reduced by this operator's constraint rows.
+    pub fn element_assembly(
+        &self,
+        lane_width: usize,
+    ) -> Result<ElementAssemblyOperator, FinitumError> {
+        self.operator
+            .element_assembly_with(self.constraints.clone(), lane_width)
+    }
+
+    /// [`SystemOperator::partial_assembly`] reduced by this operator's constraint rows.
+    pub fn partial_assembly(
+        &self,
+        lane_width: usize,
+    ) -> Result<SystemPartialAssemblyOperator, FinitumError> {
+        self.operator
+            .partial_assembly_with(self.constraints.clone(), lane_width)
+    }
+
+    /// SC-W1 system-path parity (b): what this reduced system realization admitted, in the
+    /// single-model [`RealizationCapability`] shape (`finitum-realization-capability/1`):
+    /// every block's admitted element requirements (deduplicated by field), every block
+    /// integral's measure, the constraint kinds present, the representation kinds and
+    /// derivative products this operator exposes (element/partial assembly only without facet
+    /// integrals; `Vjp` and `CoefficientVjp` under the affine-dependency rule; the coefficient
+    /// products exactly when a stored cell input is bound), and its declared symmetry. The
+    /// receipt's source digests are the per-block requirement/factorization/kernel digests for
+    /// a one-block system and the blake3 of their ordered lists otherwise; the realization
+    /// digest is [`SystemOperator::digest`].
+    pub fn capability(&self) -> RealizationCapability {
+        let data = &self.operator.data;
+        let system = data.plan.system();
+        let mut elements = Vec::new();
+        for block in &system.blocks {
+            for element in &block.requirements.elements {
+                if elements
+                    .iter()
+                    .any(|seen: &CapabilityElement| seen.symbol == element.symbol)
+                {
+                    continue;
+                }
+                elements.push(CapabilityElement {
+                    symbol: element.symbol,
+                    topological_dimension: element.topological_dimension,
+                    family: element.family,
+                    polynomial_order: element.polynomial_order,
+                    value_shape: element.value_shape.clone(),
+                });
+            }
+        }
+        let measures = system
+            .blocks
+            .iter()
+            .flat_map(|block| block.factorization.integrals.iter())
+            .map(|integral| integral.measure.clone())
+            .collect::<Vec<_>>();
+        let mut constraint_kinds = BTreeSet::new();
+        for constraint in self.constraints.constraints() {
+            if constraint.dependencies.is_empty() {
+                constraint_kinds.insert(ConstraintKind::Fixed);
+            } else {
+                constraint_kinds.insert(ConstraintKind::AffineDependency);
+            }
+        }
+        let mut representation_kinds = vec![
+            RepresentationKind::MatrixFree,
+            RepresentationKind::Assembled,
+        ];
+        if data.facet_regions.is_empty() {
+            representation_kinds.push(RepresentationKind::ElementAssembly);
+            if data.constitutive.is_empty() {
+                representation_kinds.push(RepresentationKind::PartialAssembly);
+            }
+        }
+        let affine = self.constraints.has_affine_dependencies();
+        let mut derivative_products = vec![DerivativeProduct::Primal, DerivativeProduct::Jvp];
+        if !affine {
+            derivative_products.push(DerivativeProduct::Vjp);
+        }
+        if !data.stored.is_empty() {
+            derivative_products.push(DerivativeProduct::CoefficientJvp);
+            if !affine {
+                derivative_products.push(DerivativeProduct::CoefficientVjp);
+            }
+        }
+        let receipt = RealizationReceipt {
+            source_requirements_digest: combined_digest(
+                system
+                    .blocks
+                    .iter()
+                    .map(|block| &block.requirements.artifact_digest),
+            ),
+            source_factorization_digest: combined_digest(
+                system
+                    .blocks
+                    .iter()
+                    .map(|block| &block.factorization.artifact_digest),
+            ),
+            source_kernels_digest: combined_digest(
+                system
+                    .blocks
+                    .iter()
+                    .map(|block| &block.kernels.artifact_digest),
+            ),
+            realization_digest: data.digest.clone(),
+        };
+        build_capability(
+            data.plan.mesh().dimension(),
+            elements,
+            measures,
+            constraint_kinds.into_iter().collect(),
+            representation_kinds,
+            derivative_products,
+            self.symmetry(),
+            receipt,
+        )
+    }
+
+    /// SC-W1 system-path parity (b): the inspectable projection of this reduced system
+    /// realization ([`SystemRealizationArtifact`]).
+    pub fn artifact(&self) -> SystemRealizationArtifact {
+        let data = &self.operator.data;
+        let system = data.plan.system();
+        let ids = data.plan.system_ids();
+        let blocks = system
+            .blocks
+            .iter()
+            .map(|block| SystemBlockReceipt {
+                equation: block.equation.clone(),
+                residual: ids
+                    .residuals()
+                    .iter()
+                    .find(|residual| residual.equation == block.equation)
+                    .map(|residual| residual.id),
+                source_requirements_digest: block.requirements.artifact_digest.clone(),
+                source_factorization_digest: block.factorization.artifact_digest.clone(),
+                source_kernels_digest: block.kernels.artifact_digest.clone(),
+            })
+            .collect();
+        let fields = data
+            .fields
+            .iter()
+            .map(|(&symbol, field)| SystemFieldArtifact {
+                symbol,
+                variable: data
+                    .plan
+                    .layout()
+                    .block(symbol)
+                    .expect("realized field implies a layout block")
+                    .variable,
+                dofs: field.dofs.clone(),
+            })
+            .collect();
+        let residual_of = |block_index: usize| {
+            ids.residuals()
+                .iter()
+                .find(|residual| residual.equation == system.blocks[block_index].equation)
+                .map(|residual| residual.id)
+        };
+        let mut external_inputs = Vec::new();
+        for (&(block_index, integral_index, input), table) in &data.stored {
+            external_inputs.push(SystemRealizationExternalInput {
+                residual: residual_of(block_index),
+                input: RealizationExternalInput::Stored {
+                    integral_index,
+                    input,
+                    component_count: table.component_count(),
+                    values: table.values().to_vec(),
+                },
+            });
+        }
+        for (&(block_index, integral_index, input), closure) in &data.constitutive {
+            external_inputs.push(SystemRealizationExternalInput {
+                residual: residual_of(block_index),
+                input: RealizationExternalInput::Dynamic {
+                    integral_index,
+                    input,
+                    component_count: closure.component_count,
+                    identity: closure.identity.clone(),
+                },
+            });
+        }
+        SystemRealizationArtifact {
+            schema: SYSTEM_REALIZATION_ARTIFACT_SCHEMA.into(),
+            artifact_digest: data.digest.clone(),
+            plan_digest: data.plan.artifact_digest().clone(),
+            system_ids_identity: ids.identity().clone(),
+            blocks,
+            mesh: data.plan.mesh().clone(),
+            fields,
+            constraints: self.constraints.clone(),
+            external_inputs,
+        }
+    }
+}
+
+/// The per-block digest itself for one block, the blake3 of the ordered list otherwise.
+fn combined_digest<'a>(digests: impl Iterator<Item = &'a Digest>) -> Digest {
+    let digests = digests.collect::<Vec<_>>();
+    match digests.as_slice() {
+        [single] => (*single).clone(),
+        many => Digest::blake3(&serde_json::to_vec(many).expect("digests are serializable")),
+    }
+}
+
+fn assemble_by_probing(operator: &dyn LinearOperator) -> Result<CsrMatrix, FinitumError> {
+    let rows = operator.rows();
+    let columns = operator.columns();
+    let context = EvaluationContext::reproducible();
+    let mut entries = Vec::new();
+    let mut direction = vec![0.0; columns];
+    let mut output = vec![0.0; rows];
+    for column in 0..columns {
+        direction[column] = 1.0;
+        operator
+            .apply(&context, &direction, &mut output)
+            .map_err(|error| FinitumError::Assembly(error.to_string()))?;
+        for (row, value) in output.iter().copied().enumerate() {
+            if value != 0.0 {
+                entries.push((row, column, value));
+            }
+        }
+        direction[column] = 0.0;
+    }
+    CsrMatrix::from_triplets(rows, columns, entries)
+        .map_err(|error| FinitumError::Assembly(error.to_string()))
+}
+
+pub const SYSTEM_REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-system-realization-artifact/1";
+
+/// Receipt of one system block's Scientia artifact chain in a [`SystemRealizationArtifact`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SystemBlockReceipt {
+    pub equation: String,
+    pub residual: Option<SysResId>,
+    pub source_requirements_digest: Digest,
+    pub source_factorization_digest: Digest,
+    pub source_kernels_digest: Digest,
+}
+
+/// One realized field of a [`SystemRealizationArtifact`]: its per-model symbol, its system
+/// variable, and its DOF map (the layout block it occupies is `symbol`'s in the layout).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SystemFieldArtifact {
+    pub symbol: SymbolId,
+    pub variable: SysVarId,
+    pub dofs: DofMap,
+}
+
+/// One bound non-basis input of a [`SystemRealizationArtifact`], in the single-model
+/// [`RealizationExternalInput`] shape plus the residual it belongs to.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SystemRealizationExternalInput {
+    pub residual: Option<SysResId>,
+    pub input: RealizationExternalInput,
+}
+
+/// SC-W1 system-path parity (b): the stable, inspectable projection of one reduced system
+/// realization -- the counterpart of [`crate::RealizationArtifact`] with one entry per block,
+/// field, and bound input. Like it, this is not a reconstruction API: bound kernels are
+/// absent and constitutive closures appear only by their digest-covered identity.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SystemRealizationArtifact {
+    pub schema: String,
+    /// [`SystemOperator::digest`] (`finitum-system-operator/2`).
+    pub artifact_digest: Digest,
+    pub plan_digest: Digest,
+    /// [`SystemIdMap::identity`] (`finitum-system-ids/1`).
+    pub system_ids_identity: Digest,
+    pub blocks: Vec<SystemBlockReceipt>,
+    pub mesh: Mesh,
+    pub fields: Vec<SystemFieldArtifact>,
+    pub constraints: ConstraintSet,
+    pub external_inputs: Vec<SystemRealizationExternalInput>,
+}
+
+/// One stored quadrature-point Jacobian of a [`SystemPartialAssemblyOperator`].
+#[derive(Clone, Debug)]
+struct SystemPartialPointAction {
+    row: SymbolId,
+    point: usize,
+    /// Quadrature weight x cell determinant x the row's `equation_sign`.
+    scale: f64,
+    active_inputs: Vec<QFunctionInput>,
+    output_derivative: DerivativeEvaluation,
+    output_components: usize,
+    /// Row-major point Jacobian from the concatenated active field evaluations to one output.
+    matrix: Vec<f64>,
+}
+
+/// SC-W1 system-path parity (b): the quadrature-data (`E^T B^T D B E`) realization of a
+/// system's zero-point linear view -- per-cell, per-point stored Jacobians applied through
+/// each field's own basis action and the row field's basis transpose, never a cell or global
+/// matrix (see [`SystemOperator::partial_assembly`]). Constraint rows are handled exactly as
+/// [`crate::PartialAssemblyOperator`]'s.
+#[derive(Clone, Debug)]
+pub struct SystemPartialAssemblyOperator {
+    operator: SystemOperator,
+    constraints: ConstraintSet,
+    point_actions: Vec<Vec<SystemPartialPointAction>>,
+    batches: CellBatchLayout,
+}
+
+impl SystemPartialAssemblyOperator {
+    pub fn batches(&self) -> &CellBatchLayout {
+        &self.batches
+    }
+
+    pub fn stored_point_action_count(&self) -> usize {
+        self.point_actions.iter().map(Vec::len).sum()
+    }
+
+    fn apply_inner(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        let dimension = self.operator.dimension();
+        if input.len() != dimension || output.len() != dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "system partial-assembly input/output must contain {dimension} values"
+            )));
+        }
+        validate_finite("system partial-assembly input", input)?;
+        let physical = self.constraints.expand_homogeneous(input)?;
+        let data = &self.operator.data;
+        let mesh = data.plan.mesh();
+        let layout = data.plan.layout();
+        let mut physical_output = vec![0.0; dimension];
+        for batch in 0..self.batches.batch_count() {
+            for cell in self.batches.batch(batch).expect("batch index is bounded") {
+                let Some(cell) = *cell else { continue };
+                let geometry = CellGeometry::new(mesh, CellId(cell))?;
+                let affine = AffineMap::from_cell(mesh, CellId(cell))?;
+                let local = self.operator.gather_local(cell, &physical);
+                let mut local_outputs = local
+                    .iter()
+                    .map(|(&symbol, values)| (symbol, vec![0.0; values.len()]))
+                    .collect::<BTreeMap<_, _>>();
+                for action in &self.point_actions[cell] {
+                    let reference_point = &data.quadrature[action.point].coordinates;
+                    let mut point_input = Vec::new();
+                    for qinput in &action.active_inputs {
+                        if qinput.binding.evaluation.derivative
+                            == DerivativeEvaluation::TimeDerivative
+                        {
+                            point_input.extend(vec![0.0; component_count(&qinput.shape)?]);
+                            continue;
+                        }
+                        let field = &data.fields[&qinput.binding.symbol];
+                        point_input.extend(evaluate_field_basis_input(
+                            field,
+                            &geometry,
+                            &affine,
+                            cell,
+                            action.point,
+                            reference_point,
+                            qinput,
+                            &local[&qinput.binding.symbol],
+                        )?);
+                    }
+                    let input_components = point_input.len();
+                    let mut point_output = vec![0.0; action.output_components];
+                    for (row, value) in point_output.iter_mut().enumerate() {
+                        *value = (0..input_components)
+                            .map(|column| {
+                                action.matrix[row * input_components + column] * point_input[column]
+                            })
+                            .sum();
+                    }
+                    apply_field_basis_adjoint(
+                        &data.fields[&action.row],
+                        &geometry,
+                        &affine,
+                        cell,
+                        action.point,
+                        reference_point,
+                        &action.output_derivative,
+                        &point_output,
+                        action.scale,
+                        local_outputs
+                            .get_mut(&action.row)
+                            .expect("row field is realized"),
+                    )?;
+                }
+                for (symbol, local_output) in &local_outputs {
+                    let offset = layout
+                        .block(*symbol)
+                        .expect("realized field implies a layout block")
+                        .offset;
+                    let restriction = &data.fields[symbol].dofs.restrictions()[cell];
+                    for (local_index, dof) in restriction.dofs.iter().enumerate() {
+                        physical_output[offset + dof.0] += local_output[local_index];
+                    }
+                }
+            }
+        }
+        output.copy_from_slice(&self.constraints.restrict_transpose(&physical_output)?);
+        for constraint in self.constraints.constraints() {
+            output[constraint.target.0] = self
+                .constraints
+                .direction_residual(input, constraint.target)?;
+        }
+        validate_finite("system partial-assembly output", output)
+    }
+}
+
+impl LinearOperator for SystemPartialAssemblyOperator {
+    fn rows(&self) -> usize {
+        self.operator.dimension()
+    }
+
+    fn columns(&self) -> usize {
+        self.operator.dimension()
+    }
+
+    fn symmetry(&self) -> OperatorSymmetry {
+        if self.constraints.has_affine_dependencies() {
+            OperatorSymmetry::Nonsymmetric
+        } else {
+            self.operator.symmetry()
+        }
+    }
+
+    fn apply(
+        &self,
+        _context: &EvaluationContext,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), NumericError> {
+        self.apply_inner(input, output).map_err(numeric_error)
+    }
+}
+
 impl DaeOperator for ReducedSystemOperator {
     fn dimension(&self) -> usize {
         self.operator.dimension()
@@ -2994,6 +4336,15 @@ impl LinearizedSystemOperator {
 
     pub fn rate_shift(&self) -> f64 {
         self.rate_shift
+    }
+
+    /// Canonical CSR assembly of this Jacobian at its linearization point by unit-column
+    /// probing of [`LinearOperator::apply`] -- the system counterpart of
+    /// `RealizationPlan::assemble` for a nonlinear state; Methodus's `CsrMatrix` is
+    /// `TransposableOperator`, so the assembled transpose action is available alongside
+    /// [`TransposableOperator::apply_transpose`]'s kernel-executed one.
+    pub fn assemble(&self) -> Result<CsrMatrix, FinitumError> {
+        assemble_by_probing(self)
     }
 }
 
@@ -3596,7 +4947,7 @@ fn accumulate_parameter_cotangents_system(
     rate_shift: f64,
     evaluation: &PointEvaluation,
     active_inputs: &[&QFunctionInput],
-    constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+    bindings: &SystemInputBindings<'_>,
     block_index: usize,
     parameter_cotangents: &BTreeMap<TensorInputId, Vec<f64>>,
     cotangents: &mut BTreeMap<TensorInputId, Vec<f64>>,
@@ -3633,12 +4984,11 @@ fn accumulate_parameter_cotangents_system(
             continue;
         }
         let key = (block_index, integral.integral_index, *input_id);
-        let binding = constitutive.get(&key).ok_or_else(|| {
-            FinitumError::ArtifactMismatch(format!(
-                "integral {} input {:?} has no bound constitutive input",
-                integral.integral_index, input_id
-            ))
-        })?;
+        let binding = match bindings.resolve(key)? {
+            // A stored table is state-independent: no chain rule through it.
+            SystemInputBinding::Stored(_) => continue,
+            SystemInputBinding::Constitutive(binding) => binding,
+        };
         for probe_input in active_inputs {
             let count = component_count(&probe_input.shape)?;
             for component in 0..count {
@@ -3685,7 +5035,7 @@ fn point_inputs_system(
     time: f64,
     local_state: &BTreeMap<SymbolId, Vec<f64>>,
     local_rate: &BTreeMap<SymbolId, Vec<f64>>,
-    constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+    bindings: &SystemInputBindings<'_>,
     block_index: usize,
 ) -> Result<(BTreeMap<TensorInputId, Vec<f64>>, PointEvaluation), FinitumError> {
     let mut inputs = BTreeMap::new();
@@ -3736,13 +5086,12 @@ fn point_inputs_system(
             continue;
         }
         let key = (block_index, integral.integral_index, input.id);
-        let binding = constitutive.get(&key).ok_or_else(|| {
-            FinitumError::ArtifactMismatch(format!(
-                "integral {} input {:?} has no bound constitutive input",
-                integral.integral_index, input.id
-            ))
-        })?;
-        let values = (binding.value)(&evaluation);
+        let values = match bindings.resolve(key)? {
+            SystemInputBinding::Stored(stored) => stored
+                .point_values(cell, point, bindings.point_count)
+                .to_vec(),
+            SystemInputBinding::Constitutive(binding) => (binding.value)(&evaluation),
+        };
         if values.len() != component_count(&input.shape)? {
             return Err(FinitumError::InvalidRealization(format!(
                 "constitutive input {:?} returned {} components, expected {}",
@@ -3769,7 +5118,7 @@ fn point_directions_system(
     time: f64,
     local_state_direction: &BTreeMap<SymbolId, Vec<f64>>,
     local_rate_direction: &BTreeMap<SymbolId, Vec<f64>>,
-    constitutive: &BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+    bindings: &SystemInputBindings<'_>,
     block_index: usize,
     evaluation: &PointEvaluation,
 ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
@@ -3821,13 +5170,12 @@ fn point_directions_system(
             continue;
         }
         let key = (block_index, integral.integral_index, input.id);
-        let binding = constitutive.get(&key).ok_or_else(|| {
-            FinitumError::ArtifactMismatch(format!(
-                "integral {} input {:?} has no bound constitutive input",
-                integral.integral_index, input.id
-            ))
-        })?;
-        let values = (binding.direction)(evaluation, &direction_evaluation);
+        let values = match bindings.resolve(key)? {
+            SystemInputBinding::Stored(stored) => vec![0.0; stored.component_count()],
+            SystemInputBinding::Constitutive(binding) => {
+                (binding.direction)(evaluation, &direction_evaluation)
+            }
+        };
         if values.len() != component_count(&input.shape)? {
             return Err(FinitumError::InvalidRealization(format!(
                 "constitutive input direction {:?} returned {} components, expected {}",

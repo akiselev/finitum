@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ConstraintSet, ExactSequence, FinitumError, Mesh, NonmatchingTransfer, RealizationPlan,
+    ReducedSystemOperator,
 };
 
 pub const VERIFICATION_REPORT_SCHEMA: &str = "finitum.verification-report/v1";
@@ -421,6 +422,48 @@ pub fn check_realization_agreement(
     let subject = VerificationSubject {
         identity: "realization-plan".into(),
         digest: plan.digest().clone(),
+    };
+    make_report(VerificationCheckKind::RealizationAgreement, subject, body)
+        .map(|(header, body)| RealizationAgreementReport { header, body })
+}
+
+/// SC-W1 system-path parity (b): [`check_realization_agreement`] over a reduced system
+/// realization -- its matrix-free action against its canonical CSR assembly, element assembly,
+/// and quadrature-partial assembly on one probe, in the same report shape (subject identity
+/// `system-operator`, digest [`crate::SystemOperator::digest`]). A one-instance system
+/// reproduces the single-model report's outputs and verdicts.
+pub fn check_system_realization_agreement(
+    operator: &ReducedSystemOperator,
+    probe: &[f64],
+    lane_width: usize,
+    tolerance: ComparisonTolerance,
+) -> Result<RealizationAgreementReport, FinitumError> {
+    if probe.len() != operator.rows() || probe.iter().any(|value| !value.is_finite()) {
+        return Err(invalid(format!(
+            "realization probe must contain {} finite values",
+            operator.rows()
+        )));
+    }
+    let context = EvaluationContext::reproducible();
+    let matrix_free_output = apply(operator, &context, probe)?;
+    let assembled_output = apply(&operator.assemble()?, &context, probe)?;
+    let element_assembled_output = apply(&operator.element_assembly(lane_width)?, &context, probe)?;
+    let partial_assembled_output = apply(&operator.partial_assembly(lane_width)?, &context, probe)?;
+    let body = RealizationAgreementBody {
+        tolerance,
+        lane_width,
+        probe: probe.to_vec(),
+        assembled: compare(&matrix_free_output, &assembled_output, tolerance)?,
+        element_assembled: compare(&matrix_free_output, &element_assembled_output, tolerance)?,
+        partial_assembled: compare(&matrix_free_output, &partial_assembled_output, tolerance)?,
+        matrix_free_output,
+        assembled_output,
+        element_assembled_output,
+        partial_assembled_output,
+    };
+    let subject = VerificationSubject {
+        identity: "system-operator".into(),
+        digest: operator.operator().digest().clone(),
     };
     make_report(VerificationCheckKind::RealizationAgreement, subject, body)
         .map(|(header, body)| RealizationAgreementReport { header, body })

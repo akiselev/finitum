@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-09-03
+Updated: 2026-09-05
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
 (Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and
@@ -11,6 +11,8 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7/SC-W1 (Finitum) system-level ids keying `BlockLayout` and public per-block actions/transposes
 + W7/SC-W1 (Finitum) / SV2-B2 interface-measure realization binding Malleus facet-pair kernels
 + W7 follow-ups: C11.8 degree-2 P1 quadrature (opt-in) and C11.22 RT0 essential normal-trace data
++ W7/SC-W1 (Finitum) system-path parity: stored design tables, coefficient JVP/VJP, assembled/
+  element/partial representations and agreement/capability/artifact receipts on `SystemOperator`
 
 ## Implemented
 
@@ -403,6 +405,73 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     `ConnectionRealizationPlan`). Time-derivative traces, curved facets, and dimension 1 are
     refused typed.
 
+- SC-W1 system-path parity (W7, 2026-09-05; GX-CONTRACTS C12.6 "not landed" items (a) and
+  (b)): the one-instance `SystemRealizationPlan` now carries every single-model surface Sinbad's
+  E7 path consumes, and reproduces the `RealizationPlan` products to roundoff.
+  - (a) Stored tables on the system path: `SystemExternalInput { residual: SysResId, input:
+    ExternalInput }` bound through `SystemRealizationPlan::bind_kernels_with_inputs(constitutive,
+    stored, equation_sign, facet_regions)` (`bind_kernels[_with_facets]` delegate with no
+    tables) to a non-basis input of a cell integral, laid out over the shared quadrature
+    (`SystemRealizationPlan::quadrature()` before binding, `SystemOperator::quadrature()`
+    after; `ExternalInput::from_coefficient_at(.., quadrature, layout, design)` builds a design
+    table over it, `from_coefficient` delegates to it, `CoefficientLayout::dimension_at`
+    likewise); a stored input is state-independent (zero direction, no chain rule), so a mixed
+    binding (closures for properties, tables for sources/design slots) is admitted. Every
+    non-basis cell input must be bound one way; wrong extent, basis inputs, facet integrals,
+    double and closure+table bindings refuse typed (`InvalidRealization`/`UnsupportedRealization`).
+    `SystemDistributedCoefficient { residual, coefficient: DistributedCoefficient }` keys
+    `SystemOperator::{coefficient_dimension, coefficient_jacobian_vector_product,
+    coefficient_vector_jacobian_product}` (physical coordinates; the residual's parameter kernels
+    with the direction routed to that input, sign-scaled; the VJP through the layout's
+    interpolation transpose) and their `ReducedSystemOperator` forms (constraint rows zero /
+    masked, affine dependencies refused as SV1-C2). `LinearizedSystemOperator::assemble()` and
+    `ReducedSystemOperator::assemble()` give canonical CSR (Methodus `CsrMatrix`, a
+    `TransposableOperator`) at the linearization point / zero point. **Digest change:**
+    `SystemOperator::digest` payload is `finitum-system-operator/2`
+    (`SYSTEM_OPERATOR_DIGEST_SCHEMA`), adding every stored table's values -- two operators
+    differing only in a design vector now differ in identity, exactly as two `RealizationPlan`s
+    do; every `/1` digest changes.
+  - (b) Representations and receipts: `SystemOperator::element_assembly(lane_width)` (per-cell
+    local matrices over the concatenated field restrictions, offset into the layout; the existing
+    `ElementAssemblyOperator`), `SystemOperator::partial_assembly(lane_width) ->
+    SystemPartialAssemblyOperator` (stored per-(block, integral, output, point) Jacobians applied
+    through each field's own basis action; refuses a bound constitutive closure exactly as the
+    single-model path refuses dynamic inputs, and facet integrals), both on
+    `ReducedSystemOperator` with its constraint rows; `check_system_realization_agreement(&reduced,
+    probe, lane_width, tolerance) -> RealizationAgreementReport` (subject `system-operator`,
+    digest = the operator digest); `ReducedSystemOperator::capability() -> RealizationCapability`
+    (`finitum-realization-capability/1`, same type: elements deduplicated by field, all block
+    measures, constraint kinds, representation kinds honest about facets/closures, coefficient
+    products exactly when a table is bound, `symmetry()` = Scientia's structural claim, receipt
+    source digests = the block's for one block / blake3 of the ordered per-block lists otherwise,
+    realization digest = operator digest); `ReducedSystemOperator::artifact() ->
+    SystemRealizationArtifact` (`finitum-system-realization-artifact/1`: operator/plan/system-id
+    digests, per-block `SystemBlockReceipt`, mesh, per-field `SystemFieldArtifact { symbol,
+    variable, dofs }`, constraints, bound inputs as `RealizationExternalInput` + residual).
+  - Evidence (`tests/w7_system_path_parity.rs`, 5 tests, on the corpus snapshots
+    `01-poisson.res` and the new `03-nonlinear-heat.res` snapshot): the one-instance system's
+    factorization digest equals the single-model one and `essential_constraints_from_system`
+    derives the identical constraint set; with both paths integrating on the shared degree-4
+    rule (the test tabulates P1 at the system's table), residual, JVP, rate-shifted VJP,
+    coefficient JVP/VJP, linearized action and transpose action, and the assembled CSR action and
+    transpose agree to a worst relative difference of `1.9e-16` (Poisson, cell layout),
+    `3.5e-16` (Poisson, vertex layout), `4.1e-16` / `2.7e-16` (nonlinear heat at a nonzero
+    state and rate, shifts 0 and 2.5, closures `rho = 1 + 0.2T`, `cp = 1 + 0.3T^2`,
+    `k = 1 + 0.1T`, `Q` the cell-layout design table); the system coefficient and linearized
+    adjoint identities hold to `1e-12`; the zero-point CSR transposes agree; the realization-
+    agreement reports carry the same outputs and the same max-abs errors (`8.9e-16` assembled,
+    `4.4e-16` element, `0` partial) with all verdicts accepted; the capability's elements,
+    measures, constraint kinds, representation kinds, derivative products, source digests, and
+    (once the single-model symmetry is proven) symmetry are equal; the artifact's block digests,
+    DOF map, constraints, mesh, and inputs equal the single-model artifact's; the design vector
+    is part of the `/2` identity; the nonlinear system's capability omits `PartialAssembly` and
+    its `partial_assembly` refuses typed; coefficient/binding misuse refuses typed.
+  - Deviation from the single-model shape: the coefficient handle and the stored input carry a
+    `SysResId` (SC-W1's residual key), not an equation name, so Sinbad's merged runner can key by
+    system ids from the start; `SystemConstitutiveInput` keeps its equation-name key unchanged.
+    Not landed: stored tables on facet integrals; regional (per-region) tables; the multi-
+    instance `SystemRealizationPlan` (unchanged, waits on Scientia `OperatorSystem/2` adoption).
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -471,7 +540,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 156 passed, 0 failed across 25 binaries (W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 161 passed, 0 failed across 26 binaries (SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -592,10 +661,10 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
 4. Done (E6: `739e2aa`, `5da4744`, `1af8946`): the executable Scientia-form-driven system
    realization — `SystemOperator` with per-block bound kernels, load vector, equation-sign
    symmetry proof, `OperatorStructure` threading, and H(div)/RT0 + P0 compatible realization;
-   the real Stokes and mixed-Darcy corpus systems both solve. Remaining in this area:
-   per-block stored/regional external inputs (only the closure-based `SystemConstitutiveInput`
-   slice exists), a content-addressed digest over the executable system realization (the
-   shape-only `artifact_digest` remains), Hcurl realization, and interior-facet/DG measures;
+   the real Stokes and mixed-Darcy corpus systems both solve. Per-block stored tables and the
+   value-covering `finitum-system-operator/2` digest landed with SC-W1 system-path parity
+   (2026-09-05). Remaining in this area: regional (per-region) external tables, Hcurl
+   realization, and interior-facet/DG measures;
 5. FC3 `minimum_polynomial_degree`-honoring quadrature (the P1 mass-matrix
    under-integration follow-up recorded in GX-CONTRACTS C11.7/C11.8).
 6. SC composition (design `sinbad/ARCHITECTURE.md` §8, §12). Landed by W7 (2026-09-03):

@@ -26,7 +26,7 @@ use crate::profile::{
 };
 use crate::{
     CellId, ConstraintSet, DofMap, FacetId, FacetIncidence, FacetTopology, FinitumError, Mesh,
-    PreparedElement, simplex_basis,
+    PreparedElement, QuadraturePoint, simplex_basis,
 };
 
 pub const REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-realization-plan/2";
@@ -63,8 +63,20 @@ impl CoefficientLayout {
         element: &PreparedElement,
         component_count: usize,
     ) -> Result<usize, FinitumError> {
+        self.dimension_at(mesh, element.quadrature().len(), component_count)
+    }
+
+    /// As [`Self::dimension`] for a realization integrating every cell with a `point_count`-
+    /// point quadrature table that is not owned by one [`PreparedElement`] -- the system path
+    /// (`SystemOperator::quadrature`), whose fields share one table (SC-W1 system-path parity).
+    pub fn dimension_at(
+        self,
+        mesh: &Mesh,
+        point_count: usize,
+        component_count: usize,
+    ) -> Result<usize, FinitumError> {
         let entities = match self {
-            CoefficientLayout::QuadraturePoint => mesh.cells().len() * element.quadrature().len(),
+            CoefficientLayout::QuadraturePoint => mesh.cells().len() * point_count,
             CoefficientLayout::Cell => mesh.cells().len(),
             CoefficientLayout::Vertex => mesh.vertices().len(),
         };
@@ -82,17 +94,24 @@ impl CoefficientLayout {
         cell: usize,
         point: usize,
     ) -> Result<Vec<(usize, f64)>, FinitumError> {
+        self.weights_at(mesh, element.quadrature(), cell, point)
+    }
+
+    /// As [`Self::weights`] over an explicit cell quadrature table (the system path's shared
+    /// table).
+    pub(crate) fn weights_at(
+        self,
+        mesh: &Mesh,
+        quadrature: &[QuadraturePoint],
+        cell: usize,
+        point: usize,
+    ) -> Result<Vec<(usize, f64)>, FinitumError> {
         match self {
-            CoefficientLayout::QuadraturePoint => {
-                Ok(vec![(cell * element.quadrature().len() + point, 1.0)])
-            }
+            CoefficientLayout::QuadraturePoint => Ok(vec![(cell * quadrature.len() + point, 1.0)]),
             CoefficientLayout::Cell => Ok(vec![(cell, 1.0)]),
             CoefficientLayout::Vertex => {
-                let (values, _) = simplex_basis(
-                    mesh.dimension(),
-                    1,
-                    &element.quadrature()[point].coordinates,
-                )?;
+                let (values, _) =
+                    simplex_basis(mesh.dimension(), 1, &quadrature[point].coordinates)?;
                 Ok(mesh.cells()[cell]
                     .vertices
                     .iter()
@@ -295,12 +314,38 @@ impl ExternalInput {
         layout: CoefficientLayout,
         design: &[f64],
     ) -> Result<Self, FinitumError> {
+        Self::from_coefficient_at(
+            integral_index,
+            input,
+            component_count,
+            mesh,
+            element.quadrature(),
+            layout,
+            design,
+        )
+    }
+
+    /// As [`Self::from_coefficient`] over an explicit cell quadrature table -- the table a
+    /// system realization shares across its fields (`SystemOperator::quadrature`), so the same
+    /// design vector parameterizes a `SystemOperator` integral input exactly as it does a
+    /// `RealizationPlan` one (`SystemOperator::coefficient_jacobian_vector_product` and its
+    /// transpose differentiate through this map).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_coefficient_at(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        quadrature: &[QuadraturePoint],
+        layout: CoefficientLayout,
+        design: &[f64],
+    ) -> Result<Self, FinitumError> {
         if component_count == 0 {
             return Err(FinitumError::InvalidRealization(
                 "coefficient component count must be non-zero".into(),
             ));
         }
-        let expected = layout.dimension(mesh, element, component_count)?;
+        let expected = layout.dimension_at(mesh, quadrature.len(), component_count)?;
         if design.len() != expected {
             return Err(FinitumError::InvalidRealization(format!(
                 "coefficient design vector has length {}, layout {layout:?} expects {expected}",
@@ -308,11 +353,11 @@ impl ExternalInput {
             )));
         }
         validate_finite("coefficient design vector", design)?;
-        let point_count = element.quadrature().len();
+        let point_count = quadrature.len();
         let mut values = Vec::with_capacity(mesh.cells().len() * point_count * component_count);
         for cell in 0..mesh.cells().len() {
             for point in 0..point_count {
-                let weights = layout.weights(mesh, element, cell, point)?;
+                let weights = layout.weights_at(mesh, quadrature, cell, point)?;
                 for component in 0..component_count {
                     values.push(
                         weights
@@ -367,7 +412,17 @@ impl ExternalInput {
         Self::new(integral_index, input, component_count, values)
     }
 
-    fn point_values(&self, cell: usize, point: usize, point_count: usize) -> &[f64] {
+    /// Components per quadrature point of this table.
+    pub fn component_count(&self) -> usize {
+        self.component_count
+    }
+
+    /// The stored table in cell/quadrature/component order.
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
+
+    pub(crate) fn point_values(&self, cell: usize, point: usize, point_count: usize) -> &[f64] {
         let start = (cell * point_count + point) * self.component_count;
         &self.values[start..start + self.component_count]
     }
@@ -987,6 +1042,47 @@ struct CapabilityDigestPayload<'a> {
     receipt: &'a RealizationReceipt,
 }
 
+/// Seals one [`RealizationCapability`] under the canonical `finitum-realization-capability/1`
+/// digest -- the one place that payload is spelled, shared by `RealizationPlan::capability`
+/// and the system path's `ReducedSystemOperator::capability`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_capability(
+    topology_dimension: usize,
+    elements: Vec<CapabilityElement>,
+    measures: Vec<SemanticMeasure>,
+    constraint_kinds: Vec<ConstraintKind>,
+    representation_kinds: Vec<RepresentationKind>,
+    derivative_products: Vec<DerivativeProduct>,
+    symmetry: OperatorSymmetry,
+    receipt: RealizationReceipt,
+) -> RealizationCapability {
+    let payload = CapabilityDigestPayload {
+        schema: REALIZATION_CAPABILITY_SCHEMA,
+        topology_dimension,
+        elements: &elements,
+        measures: &measures,
+        constraint_kinds: &constraint_kinds,
+        representation_kinds: &representation_kinds,
+        derivative_products: &derivative_products,
+        symmetry,
+        receipt: &receipt,
+    };
+    let digest =
+        Digest::blake3(&serde_json::to_vec(&payload).expect("capability payload is serializable"));
+    RealizationCapability {
+        schema: REALIZATION_CAPABILITY_SCHEMA.into(),
+        topology_dimension,
+        elements,
+        measures,
+        constraint_kinds,
+        representation_kinds,
+        derivative_products,
+        symmetry,
+        receipt,
+        digest,
+    }
+}
+
 impl RealizationPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1264,23 +1360,8 @@ impl RealizationPlan {
             source_kernels_digest: self.data.kernels_digest.clone(),
             realization_digest: self.data.digest.clone(),
         };
-        let payload = CapabilityDigestPayload {
-            schema: REALIZATION_CAPABILITY_SCHEMA,
-            topology_dimension: self.data.mesh.dimension(),
-            elements: &elements,
-            measures: &measures,
-            constraint_kinds: &constraint_kinds,
-            representation_kinds: &representation_kinds,
-            derivative_products: &derivative_products,
-            symmetry,
-            receipt: &receipt,
-        };
-        let digest = Digest::blake3(
-            &serde_json::to_vec(&payload).expect("capability payload is serializable"),
-        );
-        RealizationCapability {
-            schema: REALIZATION_CAPABILITY_SCHEMA.into(),
-            topology_dimension: self.data.mesh.dimension(),
+        build_capability(
+            self.data.mesh.dimension(),
             elements,
             measures,
             constraint_kinds,
@@ -1288,8 +1369,7 @@ impl RealizationPlan {
             derivative_products,
             symmetry,
             receipt,
-            digest,
-        }
+        )
     }
 
     /// Checks every `BoundaryPartitionRequirement` this plan's source requirements declared
@@ -5050,7 +5130,7 @@ pub(crate) fn execute_jvp_values(
 /// point-local `d(output)/d(hot_input) * direction`. Returns `None` when `hot_input` is not an
 /// operand of this output's kernels at all (the output does not depend on it); refuses typed
 /// when the kernel reads the input but its parameter program carries no tangent for it.
-fn execute_parameter_jvp_values(
+pub(crate) fn execute_parameter_jvp_values(
     bound: &BoundBundle,
     inputs: &BTreeMap<TensorInputId, Vec<f64>>,
     hot_input: TensorInputId,

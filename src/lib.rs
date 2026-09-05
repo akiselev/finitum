@@ -78,8 +78,11 @@ pub use space::{
     vector_nodal_dof_map,
 };
 pub use system::{
-    LinearizedSystemOperator, ReducedSystemOperator, SystemBlockOperator, SystemConstitutiveInput,
-    SystemEssentialConstraintRequirement, SystemOperator, SystemRealizationPlan,
+    LinearizedSystemOperator, ReducedSystemOperator, SYSTEM_OPERATOR_DIGEST_SCHEMA,
+    SYSTEM_REALIZATION_ARTIFACT_SCHEMA, SystemBlockOperator, SystemBlockReceipt,
+    SystemConstitutiveInput, SystemDistributedCoefficient, SystemEssentialConstraintRequirement,
+    SystemExternalInput, SystemFieldArtifact, SystemOperator, SystemPartialAssemblyOperator,
+    SystemRealizationArtifact, SystemRealizationExternalInput, SystemRealizationPlan,
     essential_constraints_from_system, system_constitutive_from_sources,
 };
 pub use system_ids::{
@@ -99,5 +102,6 @@ pub use verification::{
     TransferConservationBody, TransferConservationReport, VERIFICATION_REPORT_SCHEMA,
     ValidatedVerification, VerificationCheckKind, VerificationReportHeader, VerificationSubject,
     check_constraint_work, check_exact_sequence, check_global_transpose, check_mesh_refinement,
-    check_nodal_patch, check_realization_agreement, check_transfer_conservation,
+    check_nodal_patch, check_realization_agreement, check_system_realization_agreement,
+    check_transfer_conservation,
 };
