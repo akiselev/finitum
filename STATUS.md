@@ -16,8 +16,10 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7/SC-W1 (Finitum) `SystemIdMap::from_scientia` (ids by value from `scientia-operator-system/2`)
   and the typed `@inf_sup` obligation consumed as `InfSupPairing::from_obligation`
 + W7 package 7c (Finitum, single compile path): per-plan `SystemQuadrature` with the P1
-  barycenter rule reproducing the single-model default bitwise on the system path, and
-  proof-aware `symmetry()` (a taken `prove_symmetry` outranks the structural claim)
+  barycenter rule reproducing the single-model default bitwise on the system path,
+  proof-aware `symmetry()` (a taken `prove_symmetry` outranks the structural claim), and the
+  transient all-table agreement report equal to the single-model one with a typed, named
+  `RepresentationUnsupported` refusal otherwise
 
 ## Implemented
 
@@ -385,8 +387,10 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     and changing the default silently changed that wire size (four `cad_derivatives` tests
     failed on `expected 36 values, got 12`), so the exact rule is opt-in per element. The
     Scientia-system path (`SystemRealizationPlan`, what Krasis's `CoupledLeaf::reduced_system`
-    wraps) already integrates with the degree-4 triangle / degree-2 tetrahedron rules and has
-    no rank deficiency. Evidence: the `p1_mass_tests` unit test (reference mass
+    wraps) integrates with the degree-4 triangle / degree-2 tetrahedron rules by default
+    (`SystemQuadrature::Richest`) and has no rank deficiency there; on
+    `SystemQuadrature::Barycenter` (W7 7c A) it shares the single-model default's rank-one P1
+    mass by design. Evidence: the `p1_mass_tests` unit test (reference mass
     `|K|(1 + delta_ij)/((d+1)(d+2))` to 1e-15 in 1-3D; the barycenter rule's rank-one
     `|K|/(d+1)^2` recorded; degree 3 refused).
   - C11.22 (Sinbad lane need): `essential_constraints_from_system` admits an RT0
@@ -552,6 +556,38 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     per level when CG/MINRES is requested and hand the reduced operator to Methodus with the
     default `RequireDeclared`.
 
+- W7 package 7c, deliverable C (Finitum, 2026-09-05) -- realization agreement on a transient
+  one-block system with all-table inputs (Sinbad's D2):
+  - Reproduced on the new corpus snapshot `02-transient-diffusion.res` as a one-instance system
+    with every input a stored `SystemExternalInput` table (`capacity`, `k`, `f`; the
+    `capacity * dt(u)` mass/rate term present): `check_system_realization_agreement` accepts,
+    and its report equals the single-model `check_realization_agreement` report -- all four
+    outputs bitwise, the three verdicts accepted, the maximum absolute errors equal -- on
+    `Barycenter`, and to 1.9e-16 with equal errors on `Richest`; the state products
+    (residual, JVP, shifted VJP, linearized action/transpose, zero-point CSR) are bitwise on
+    `Barycenter`. So the D2 refusal is not the mass term: it is a closure. Sinbad's
+    `depends_on_fields` rule makes `capacity = storage_capacity(u)` and `k = diffusivity(u)`
+    closure pairs because the providers name the state field, although the case binds them to
+    constants.
+  - Typed refusal: `FinitumError::RepresentationUnsupported { representation:
+    RepresentationKind, equation, integral, input: Option<TensorInputId>, reason }` (Display
+    `REPRESENTATION_UNSUPPORTED: ...`) from `SystemOperator::partial_assembly` -- and so from
+    the agreement check -- names the first closure-bound input (the closure's identity in
+    `reason`) or the first non-cell integral (`input: None`). Pinned with `k` a closure on 02:
+    the report is refused naming `PartialAssembly`, `evolution`, the integral and `k`'s input
+    id; the single-model report refuses too (`UnsupportedRealization`, unchanged); the system
+    capability omits `PartialAssembly`; element assembly still agrees bitwise
+    (`tests/w7_system_path_parity.rs`, +2 tests; the nonlinear-heat refusal pin updated).
+  - Recorded gap (single-model path, not this package): `RealizationPlan::capability` lists
+    every representation kind unconditionally, so it claims `PartialAssembly` for a dynamic
+    input its own `partial_assembly` refuses; the system capability is honest.
+  - Cross-repo need (Sinbad): bind a `ModelDefinedProperty`/`ModelDefinedValue` whose case
+    binding is a constant (or a coordinate/time expression) as a stored table even when the
+    provider's declared arguments name a field, and reserve the closure pair for definitions
+    that actually read the state (an expression over `T`, a `ModelDefinedConstitutive`); then
+    D2's agreement report passes on the system path as it did on the single-model path. Carry
+    a `RepresentationUnsupported` refusal into the receipt instead of `None`.
+
 - SC-W1 Finitum side, HANDOFF §6 items (W7, 2026-09-05): Scientia's landed system ids and typed
   inf-sup pairing consumed.
   - `SystemIdMap::from_scientia(&scientia::SystemOperator)`: every `SysVar { id, owner, local }`
@@ -643,7 +679,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 170 passed, 0 failed across 28 binaries (W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 172 passed, 0 failed across 28 binaries (W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models

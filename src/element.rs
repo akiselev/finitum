@@ -26,7 +26,8 @@ impl PreparedElement {
     /// is sized against -- one point per cell. It under-integrates the P1 mass matrix to a
     /// rank-one local block (GX-CONTRACTS C11.8); a caller realizing a mass-shaped integrand
     /// (`dt(u)`, reaction terms) selects [`Self::linear_simplex_with_degree`]`(dimension, 2)`
-    /// instead. The Scientia-system path (`SystemRealizationPlan`) does not use this rule.
+    /// instead. The Scientia-system path (`SystemRealizationPlan`) integrates with its richest
+    /// rule by default and with this one on [`crate::SystemQuadrature::Barycenter`] (W7 7c).
     pub fn linear_simplex(dimension: usize) -> Result<Self, FinitumError> {
         Self::linear_simplex_with_degree(dimension, 1)
     }

@@ -2341,21 +2341,44 @@ impl SystemOperator {
         constraints: ConstraintSet,
         lane_width: usize,
     ) -> Result<SystemPartialAssemblyOperator, FinitumError> {
-        if !self.data.constitutive.is_empty() {
-            return Err(FinitumError::UnsupportedRealization(
-                "partial assembly currently requires state-independent external inputs (a \
-                 constitutive closure is bound; the single-model path refuses its dynamic \
-                 inputs the same way)"
-                    .into(),
-            ));
-        }
-        if !self.data.facet_regions.is_empty() {
-            return Err(FinitumError::UnsupportedRealization(
-                "partial assembly does not yet cover exterior facet integrals (GX-C4)".into(),
-            ));
-        }
         let mesh = self.data.plan.mesh();
         let system = self.data.plan.system();
+        if let Some((&(block_index, integral_index, input), binding)) =
+            self.data.constitutive.iter().next()
+        {
+            return Err(FinitumError::RepresentationUnsupported {
+                representation: RepresentationKind::PartialAssembly,
+                equation: system.blocks[block_index].equation.clone(),
+                integral: integral_index,
+                input: Some(input),
+                reason: format!(
+                    "the constitutive closure `{}` is bound to this input; partial assembly \
+                     stores state-independent point Jacobians, so it requires every non-basis \
+                     input to be a stored table (the single-model path refuses its dynamic \
+                     inputs the same way)",
+                    binding.identity
+                ),
+            });
+        }
+        for block in &system.blocks {
+            if let Some(integral) = block
+                .factorization
+                .integrals
+                .iter()
+                .find(|integral| !matches!(integral.measure, SemanticMeasure::Cell { .. }))
+            {
+                return Err(FinitumError::RepresentationUnsupported {
+                    representation: RepresentationKind::PartialAssembly,
+                    equation: block.equation.clone(),
+                    integral: integral.integral_index,
+                    input: None,
+                    reason: format!(
+                        "partial assembly does not yet cover {:?} integrals (GX-C4)",
+                        integral.measure
+                    ),
+                });
+            }
+        }
         let zero = vec![0.0; self.dimension()];
         let mut point_actions = Vec::with_capacity(mesh.cells().len());
         for cell in 0..mesh.cells().len() {

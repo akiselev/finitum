@@ -10,7 +10,8 @@
 //! plan (`PreparedElement::linear_simplex`) bitwise on `01-poisson`, `02-transient-diffusion`
 //! and `03-nonlinear-heat`; the `03` final-time nodal ladder on the system path recovers pair
 //! order 2; the residual + JVP cost of the system path is recorded against the single-model
-//! plan.
+//! plan; the `02` realization-agreement report with every input a stored table equals the
+//! single-model report, and a closure-bound input is refused typed, naming the input.
 
 use finitum::{
     BlockLayout, CoefficientLayout, ConstraintSet, DerivativeProduct, DistributedCoefficient,
@@ -30,14 +31,15 @@ use methodus::{
 use quantitas::UnitRegistry;
 use scientia::{
     DerivativeEvaluation, InputSourceRequirement, OperatorSystem, SemanticModel, SymbolId,
-    compile_operator_system, compile_semantics, derive_variational_form, factor_operator,
-    infer_form_requirements, lower_operator_kernels,
+    TensorInputId, compile_operator_system, compile_semantics, derive_variational_form,
+    factor_operator, infer_form_requirements, lower_operator_kernels,
 };
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::time::Instant;
 
 const POISSON: &str = include_str!("fixtures/corpus/01-poisson.res");
+const TRANSIENT_DIFFUSION: &str = include_str!("fixtures/corpus/02-transient-diffusion.res");
 const NONLINEAR_HEAT: &str = include_str!("fixtures/corpus/03-nonlinear-heat.res");
 /// Bitwise parity (the barycenter rule against the single-model default element).
 const BITWISE: f64 = 0.0;
@@ -976,10 +978,20 @@ fn one_instance_nonlinear_heat_reproduces_the_single_model_products_at_a_nonzero
             .derivative_products
             .contains(&DerivativeProduct::CoefficientJvp)
     );
-    assert!(matches!(
-        pair.reduced.partial_assembly(4),
-        Err(FinitumError::UnsupportedRealization(_))
-    ));
+    // The refusal is typed and names the closure-bound input and the representation.
+    match pair.reduced.partial_assembly(4) {
+        Err(FinitumError::RepresentationUnsupported {
+            representation,
+            equation,
+            input,
+            ..
+        }) => {
+            assert_eq!(representation, RepresentationKind::PartialAssembly);
+            assert_eq!(equation, "energy");
+            assert!(input.is_some());
+        }
+        other => panic!("expected a typed representation refusal, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1145,6 +1157,283 @@ fn system_coefficient_bindings_are_refused_typed() {
 // report (deliverable C).
 // ---------------------------------------------------------------------------------------------
 
+/// Every state product Sinbad's transient path consumes, compared between the two paths at one
+/// sampled `(t, u, u_t)` and one rate shift, without a design coefficient: residual, JVP,
+/// shifted VJP, linearized action and transpose, and the assembled CSR at the linearization
+/// point. Returns the largest relative difference seen.
+fn compare_state_products(
+    plan: &RealizationPlan,
+    reduced: &ReducedSystemOperator,
+    time: f64,
+    rate_shift: f64,
+    tolerance: f64,
+    label: &str,
+) -> f64 {
+    let dimension = plan.dimension();
+    assert_eq!(reduced.rows(), dimension);
+    let state = probe_vector(dimension, 0.3, 1.0);
+    let rate = probe_vector(dimension, 1.7, 0.5);
+    let state_direction = probe_vector(dimension, 2.9, 0.8);
+    let rate_direction = probe_vector(dimension, 4.1, 0.6);
+    let adjoint = probe_vector(dimension, 5.3, 1.1);
+    let mut worst = 0.0_f64;
+    let mut single = vec![0.0; dimension];
+    let mut system = vec![0.0; dimension];
+    plan.residual(time, &state, &rate, &mut single).unwrap();
+    reduced.residual(time, &state, &rate, &mut system).unwrap();
+    worst = worst.max(assert_parity(
+        &single,
+        &system,
+        tolerance,
+        &format!("{label}: residual"),
+    ));
+    plan.jacobian_vector_product(
+        time,
+        &state,
+        &rate,
+        &state_direction,
+        &rate_direction,
+        &mut single,
+    )
+    .unwrap();
+    reduced
+        .jacobian_vector_product(
+            time,
+            &state,
+            &rate,
+            &state_direction,
+            &rate_direction,
+            &mut system,
+        )
+        .unwrap();
+    worst = worst.max(assert_parity(
+        &single,
+        &system,
+        tolerance,
+        &format!("{label}: JVP"),
+    ));
+    plan.vector_jacobian_product_shifted(time, &state, &rate, &adjoint, rate_shift, &mut single)
+        .unwrap();
+    reduced
+        .vector_jacobian_product_shifted(time, &state, &rate, &adjoint, rate_shift, &mut system)
+        .unwrap();
+    worst = worst.max(assert_parity(
+        &single,
+        &system,
+        tolerance,
+        &format!("{label}: VJP"),
+    ));
+    let context = EvaluationContext::reproducible();
+    let single_jacobian = plan.linearize(time, &state, &rate, rate_shift).unwrap();
+    let system_jacobian = reduced.linearize(time, &state, &rate, rate_shift).unwrap();
+    single_jacobian
+        .apply(&context, &state_direction, &mut single)
+        .unwrap();
+    system_jacobian
+        .apply(&context, &state_direction, &mut system)
+        .unwrap();
+    worst = worst.max(assert_parity(
+        &single,
+        &system,
+        tolerance,
+        &format!("{label}: linearized action"),
+    ));
+    single_jacobian
+        .apply_transpose(&context, &adjoint, &mut single)
+        .unwrap();
+    system_jacobian
+        .apply_transpose(&context, &adjoint, &mut system)
+        .unwrap();
+    worst = worst.max(assert_parity(
+        &single,
+        &system,
+        tolerance,
+        &format!("{label}: linearized transpose action"),
+    ));
+    // Cross-representation (CSR matvec vs matrix-free), roundoff by construction.
+    let assembled = system_jacobian.assemble().unwrap();
+    single_jacobian
+        .apply(&context, &state_direction, &mut single)
+        .unwrap();
+    assembled
+        .apply(&context, &state_direction, &mut system)
+        .unwrap();
+    let cross = assert_parity(
+        &single,
+        &system,
+        tolerance.max(PARITY),
+        &format!("{label}: assembled action (cross-representation)"),
+    );
+    eprintln!(
+        "{label}: worst single-model vs system relative difference {worst:e} \
+         (CSR-vs-matrix-free cross-representation {cross:e})"
+    );
+    worst
+}
+
+/// How `02-transient-diffusion.res`'s `k` (`diffusivity(u)`) is bound on both paths: a stored
+/// table -- every input a table, Sinbad's D2 shape -- or a closure, what Sinbad's
+/// `depends_on_fields` rule makes of a provider that names the state field, the case the
+/// partial-assembly representation refuses typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffusivityBinding {
+    Table,
+    Closure,
+}
+
+struct TransientPair {
+    plan: RealizationPlan,
+    reduced: ReducedSystemOperator,
+    diffusivity_integral: usize,
+    diffusivity_input: TensorInputId,
+}
+
+/// Both realizations of `02-transient-diffusion.res` (`capacity * dt(u) - div(k grad u) = f`)
+/// on `tagged`: `capacity = 1`, `f = 0.4` stored tables on both paths, `k = 1` bound as
+/// `diffusivity` says, homogeneous walls, one constraint set.
+fn transient_diffusion_pair(
+    tagged: &TaggedMesh,
+    rule: SystemQuadrature,
+    diffusivity: DiffusivityBinding,
+) -> TransientPair {
+    let compiled = compile(TRANSIENT_DIFFUSION, "TransientDiffusion", "evolution");
+    let semantic = &compiled.semantic.semantic;
+    let model = &semantic.models[0];
+    let form = derive_variational_form(semantic, "TransientDiffusion", "evolution").unwrap();
+    let requirements = infer_form_requirements(semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let kernels = lower_operator_kernels(&factorization).unwrap();
+    let block = &compiled.system.blocks[0];
+    assert_eq!(
+        block.factorization.artifact_digest,
+        factorization.artifact_digest
+    );
+    let mesh = tagged.mesh.clone();
+    let unknown = block.row;
+    let block_layout = BlockLayout::new([(unknown, mesh.vertices().len(), 1)]).unwrap();
+    let system_plan = SystemRealizationPlan::with_quadrature(
+        compiled.system.clone(),
+        mesh.clone(),
+        block_layout,
+        rule,
+    )
+    .unwrap();
+    let quadrature = system_plan.quadrature().unwrap();
+    let element = single_model_element(rule, &quadrature);
+    let dofs = vector_nodal_dof_map(&mesh, 1).unwrap();
+    let region_map = walls_region_map(factorization.essential_constraints[0].region);
+    let constraints = essential_constraints_from(
+        tagged,
+        &dofs,
+        &factorization.essential_constraints,
+        &region_map,
+        &[FieldSource::constant([0.0])],
+    )
+    .unwrap();
+    let residual = SysResId(0);
+    let table_extent = mesh.cells().len() * quadrature.len();
+    let mut stored_single = Vec::new();
+    let mut dynamic_single = Vec::new();
+    let mut stored_system = Vec::new();
+    let mut constitutive = Vec::new();
+    let mut diffusivity_key = None;
+    for integral in &factorization.integrals {
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let name = symbol_name(model, input.binding.symbol);
+            let constant = match name {
+                "capacity" => 1.0,
+                "k" => 1.0,
+                "f" => SOURCE,
+                other => panic!("unexpected external input {other}"),
+            };
+            if name == "k" {
+                diffusivity_key = Some((integral.integral_index, input.id));
+                if diffusivity == DiffusivityBinding::Closure {
+                    dynamic_single.push(
+                        DynamicExternalInput::new(
+                            integral.integral_index,
+                            input.id,
+                            1,
+                            "k=1",
+                            |_evaluation| vec![1.0],
+                            |_evaluation, _direction| vec![0.0],
+                        )
+                        .unwrap(),
+                    );
+                    constitutive.push(
+                        SystemConstitutiveInput::new(
+                            block.equation.clone(),
+                            integral.integral_index,
+                            input.id,
+                            1,
+                            "k=1",
+                            |_evaluation| vec![1.0],
+                            |_evaluation, _direction| vec![0.0],
+                        )
+                        .unwrap(),
+                    );
+                    continue;
+                }
+            }
+            let table = ExternalInput::new(
+                integral.integral_index,
+                input.id,
+                1,
+                vec![constant; table_extent],
+            )
+            .unwrap();
+            stored_single.push(table.clone());
+            stored_system.push(SystemExternalInput {
+                residual,
+                input: table,
+            });
+        }
+    }
+    let (diffusivity_integral, diffusivity_input) =
+        diffusivity_key.expect("the evolution form binds k");
+    let plan = RealizationPlan::new_stateful(
+        requirements,
+        factorization,
+        kernels,
+        mesh,
+        element,
+        dofs,
+        constraints.clone(),
+        stored_single,
+        dynamic_single,
+    )
+    .unwrap();
+    let operator = system_plan
+        .bind_kernels_with_inputs(
+            constitutive,
+            stored_system,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+    let system_constraints = essential_constraints_from_system(
+        &operator,
+        tagged,
+        &region_map,
+        &[SystemEssentialConstraintRequirement {
+            field: unknown,
+            requirement: block.factorization.essential_constraints[0].clone(),
+            value: FieldSource::constant([0.0]),
+        }],
+    )
+    .unwrap();
+    assert_eq!(system_constraints, constraints);
+    TransientPair {
+        plan,
+        reduced: operator.reduced(system_constraints).unwrap(),
+        diffusivity_integral,
+        diffusivity_input,
+    }
+}
+
 /// Deliverable A gate, `01-poisson`: on the barycenter rule the one-instance system reproduces
 /// the single-model DEFAULT plan (`PreparedElement::linear_simplex`) bitwise -- residual, JVP,
 /// VJP, coefficient JVP/VJP, linearized and assembled actions, the zero-point CSR, and the
@@ -1224,6 +1513,161 @@ fn one_instance_nonlinear_heat_on_the_barycenter_rule_reproduces_the_default_pla
         );
         assert_eq!(worst, 0.0);
     }
+}
+
+/// Deliverables A and C, `02-transient-diffusion` with every input a stored table (mass/rate
+/// term present): the state products are bitwise on the barycenter rule and to roundoff on the
+/// richest rule, and the system-path realization-agreement report equals the single-model one
+/// (outputs, verdicts, maximum absolute errors) on both rules.
+#[test]
+fn one_instance_transient_diffusion_with_all_table_inputs_reproduces_the_agreement_report() {
+    let tagged = unit_square(4);
+    for (rule, tolerance, error_tolerance) in [
+        (SystemQuadrature::Barycenter, BITWISE, 0.0),
+        (SystemQuadrature::Richest, PARITY, 1.0e-14),
+    ] {
+        let pair = transient_diffusion_pair(&tagged, rule, DiffusivityBinding::Table);
+        for rate_shift in [0.0, 3.0] {
+            compare_state_products(
+                &pair.plan,
+                &pair.reduced,
+                0.2,
+                rate_shift,
+                tolerance,
+                &format!("transient diffusion {rule:?} shift {rate_shift}"),
+            );
+        }
+        let dimension = pair.plan.dimension();
+        let probe = probe_vector(dimension, 9.7, 1.0);
+        let single = check_realization_agreement(&pair.plan, &probe, 4, TOLERANCE).unwrap();
+        let system =
+            check_system_realization_agreement(&pair.reduced, &probe, 4, TOLERANCE).unwrap();
+        assert_eq!(system.header.subject.identity, "system-operator");
+        assert_reports_agree(
+            &single,
+            &system,
+            tolerance,
+            error_tolerance,
+            &format!("transient diffusion {rule:?}"),
+        );
+        let capability = pair.reduced.capability();
+        assert!(
+            capability
+                .representation_kinds
+                .contains(&RepresentationKind::PartialAssembly)
+        );
+        assert_eq!(
+            capability.representation_kinds,
+            pair.plan.capability().representation_kinds
+        );
+        // Zero-point CSR against zero-point CSR (same representation on both paths).
+        let context = EvaluationContext::reproducible();
+        let mut left = vec![0.0; dimension];
+        let mut right = vec![0.0; dimension];
+        pair.plan
+            .assemble()
+            .unwrap()
+            .apply(&context, &probe, &mut left)
+            .unwrap();
+        pair.reduced
+            .assemble()
+            .unwrap()
+            .apply(&context, &probe, &mut right)
+            .unwrap();
+        assert_parity(
+            &left,
+            &right,
+            tolerance,
+            &format!("transient diffusion {rule:?} zero-point CSR action"),
+        );
+    }
+}
+
+/// Deliverable C, the refusal path: with `k` a closure (Sinbad's `depends_on_fields` reading of
+/// `diffusivity(u)`), the partial-assembly representation -- and so the agreement report --
+/// is refused with a typed reason naming the representation, the equation, the integral and
+/// the input, on the system path and (untyped, as before) on the single-model path; the
+/// capability is honest about it.
+#[test]
+fn a_closure_bound_input_refuses_the_transient_agreement_report_typed_and_named() {
+    let tagged = unit_square(3);
+    let pair = transient_diffusion_pair(
+        &tagged,
+        SystemQuadrature::Barycenter,
+        DiffusivityBinding::Closure,
+    );
+    compare_state_products(
+        &pair.plan,
+        &pair.reduced,
+        0.2,
+        1.5,
+        BITWISE,
+        "transient diffusion closure-bound k",
+    );
+    let dimension = pair.plan.dimension();
+    let probe = probe_vector(dimension, 9.7, 1.0);
+    let refusal = check_system_realization_agreement(&pair.reduced, &probe, 4, TOLERANCE)
+        .expect_err("a closure-bound input has no partial-assembly representation");
+    match &refusal {
+        FinitumError::RepresentationUnsupported {
+            representation,
+            equation,
+            integral,
+            input,
+            reason,
+        } => {
+            assert_eq!(*representation, RepresentationKind::PartialAssembly);
+            assert_eq!(equation, "evolution");
+            assert_eq!(*integral, pair.diffusivity_integral);
+            assert_eq!(*input, Some(pair.diffusivity_input));
+            assert!(reason.contains("k=1"), "reason names the closure: {reason}");
+        }
+        other => panic!("expected a typed representation refusal, got {other:?}"),
+    }
+    assert!(
+        refusal
+            .to_string()
+            .starts_with("REPRESENTATION_UNSUPPORTED: PartialAssembly")
+    );
+    assert!(matches!(
+        check_realization_agreement(&pair.plan, &probe, 4, TOLERANCE),
+        Err(FinitumError::UnsupportedRealization(_))
+    ));
+    let capability = pair.reduced.capability();
+    assert!(
+        !capability
+            .representation_kinds
+            .contains(&RepresentationKind::PartialAssembly)
+    );
+    assert!(
+        capability
+            .representation_kinds
+            .contains(&RepresentationKind::ElementAssembly)
+    );
+    // Recorded gap (single-model path, not this package): `RealizationPlan::capability` lists
+    // every representation kind unconditionally, so it still claims `PartialAssembly` for the
+    // dynamic input its own `partial_assembly` refuses above; the system capability is honest.
+    assert!(
+        pair.plan
+            .capability()
+            .representation_kinds
+            .contains(&RepresentationKind::PartialAssembly)
+    );
+    // The other representations still agree bitwise.
+    let context = EvaluationContext::reproducible();
+    let mut single = vec![0.0; dimension];
+    let mut system = vec![0.0; dimension];
+    pair.plan
+        .element_assembly(4)
+        .unwrap()
+        .apply(&context, &probe, &mut single)
+        .unwrap();
+    pair.reduced
+        .element_assembly(4)
+        .unwrap()
+        .apply(&context, &probe, &mut system)
+        .unwrap();
+    assert_eq!(single, system);
 }
 
 // ---------------------------------------------------------------------------------------------

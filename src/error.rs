@@ -102,6 +102,19 @@ pub enum FinitumError {
         right: String,
         vertex: usize,
     },
+    /// A global representation ([`crate::RepresentationKind`]) this realization cannot take,
+    /// named down to the equation, the integral, and (when one is the cause) the bound input.
+    #[error(
+        "REPRESENTATION_UNSUPPORTED: {representation:?} is refused at equation `{equation}` \
+         integral {integral} (input {input:?}): {reason}"
+    )]
+    RepresentationUnsupported {
+        representation: crate::RepresentationKind,
+        equation: String,
+        integral: usize,
+        input: Option<scientia::TensorInputId>,
+        reason: String,
+    },
     #[error("REALIZATION_TANGENT_UNAVAILABLE: {0}")]
     RealizationTangentUnavailable(String),
     #[error("INF_SUP_UNSTABLE: {0}")]
