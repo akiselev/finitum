@@ -1,12 +1,14 @@
 //! System-level identities for realization (SC-W1, `sinbad/ARCHITECTURE.md` §2.3/§2.4/§2.6).
 //!
-//! Scientia's `scientia-system/1` artifact (`OriginMap`, `SysVarId`, `SysResId`, `InstanceId`)
-//! is still in flight, so Finitum keys its realization by its **own** newtypes of the same
-//! `u32` wire width and carries an explicit origin table ([`SystemIdMap`]) that says, for
-//! every system-level id, which instance and which per-model coordinate it came from. When
-//! Scientia's artifact lands, the map is built from Scientia's `OriginMap` instead of from the
-//! per-model `OperatorSystem`s directly (see [`SystemIdMap::compose`] for the exact surface
-//! Finitum needs); the ids and the realization keyed by them do not change.
+//! Finitum keys its realization by its **own** newtypes of the same `u32` wire width as
+//! Scientia's `scientia-system/1` ids and carries an explicit origin table ([`SystemIdMap`])
+//! that says, for every system-level id, which instance and which per-model coordinate it came
+//! from. [`SystemIdMap::from_scientia`] builds the map from Scientia's
+//! `scientia-operator-system/2` `SystemOperator` (its `variables`, `residuals`, `instances`,
+//! and `instance_artifacts`; the ids are copied by value, never re-allocated);
+//! [`SystemIdMap::compose`] is Finitum's own allocation of the same canonical order, proven
+//! equal to Scientia's on a declared two-instance system (`tests/w7_sc_w1_scientia_ids.rs`),
+//! and kept for callers composing per-model `/1` artifacts by hand.
 //!
 //! Allocation is canonical (§2.3): instance declaration order, then local id order (variables
 //! by `SymbolId`, residuals by equation order within the instance's `OperatorSystem`), dense
@@ -16,7 +18,7 @@
 //! today from `FieldBlock::symbol` -- numerically unchanged.
 
 use crate::FinitumError;
-use scientia::{Digest, OperatorSystem, SymbolId};
+use scientia::{Digest, OperatorSystem, ResidualOrigin, SymbolId};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -194,6 +196,68 @@ impl SystemIdMap {
                 });
             }
         }
+        Self::build(records, variables, residuals)
+    }
+
+    /// The map Scientia's `scientia-operator-system/2` artifact fixes (HANDOFF §6, W7): every
+    /// `SysVar { id, owner, local }` and `SysResBlock { id, origin: Equation { instance, name },
+    /// row }` copied by value into Finitum's newtypes (same `u32` wire width, no re-allocation),
+    /// with one [`InstanceRecord`] per `instances` entry whose `artifact_digest` is the
+    /// instance's entry in `instance_artifacts` (the per-model `/1` artifact digest). The
+    /// implicit root instance (empty `name`) is recorded under its model name, which is exactly
+    /// what [`Self::one_instance`] records, so the two maps -- and their `finitum-system-ids/1`
+    /// identities -- coincide for an implicit one-instance system. An instance without an
+    /// artifact digest, or an id/origin the map's own consistency rules reject (duplicate ids,
+    /// duplicate instance names, a row that is not a system variable), is refused typed.
+    pub fn from_scientia(operator: &scientia::SystemOperator) -> Result<Self, FinitumError> {
+        let mut records = Vec::with_capacity(operator.instances.len());
+        for record in &operator.instances {
+            let artifact_digest = operator
+                .instance_artifacts
+                .iter()
+                .find(|(instance, _)| *instance == record.instance)
+                .map(|(_, digest)| digest.clone())
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "scientia system operator carries no `/1` artifact digest for instance \
+                         {} (`{}`)",
+                        record.instance.0, record.model_name
+                    ))
+                })?;
+            records.push(InstanceRecord {
+                instance: InstanceId(record.instance.0),
+                name: if record.name.is_empty() {
+                    record.model_name.clone()
+                } else {
+                    record.name.clone()
+                },
+                model: record.model_name.clone(),
+                semantic_digest: record.semantic_digest.clone(),
+                artifact_digest,
+            });
+        }
+        let variables = operator
+            .variables
+            .iter()
+            .map(|variable| SysVar {
+                id: SysVarId(variable.id.0),
+                instance: InstanceId(variable.owner.0),
+                local: variable.local,
+            })
+            .collect();
+        let residuals = operator
+            .residuals
+            .iter()
+            .map(|residual| {
+                let ResidualOrigin::Equation { instance, name, .. } = &residual.origin;
+                SysRes {
+                    id: SysResId(residual.id.0),
+                    instance: InstanceId(instance.0),
+                    equation: name.clone(),
+                    row: residual.row,
+                }
+            })
+            .collect();
         Self::build(records, variables, residuals)
     }
 

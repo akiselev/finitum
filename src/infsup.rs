@@ -29,7 +29,7 @@
 
 use crate::{BlockLayout, ConstraintSet, DofId, FinitumError};
 use methodus::{EvaluationContext, LinearOperator};
-use scientia::{Digest, OperatorStructure, SymbolId};
+use scientia::{Digest, OperatorStructure, SymbolId, VerificationObligationKind};
 use serde::Serialize;
 
 /// Schema of [`InfSupEstimate`].
@@ -47,6 +47,31 @@ pub struct InfSupPairing {
 }
 
 impl InfSupPairing {
+    /// The pairing Scientia's typed `VerificationObligationKind::InfSup { pair, constrained,
+    /// multiplier }` carries (SC-W1: the unique gradient-conforming unknown and the unique
+    /// L2/DG unknown, read off the spaces, never off a name). Refused typed when the obligation
+    /// is not an `InfSup` one (`InvalidRealization`) or when Scientia could not decide either
+    /// field from the spaces (`UnsupportedRealization`); [`Self::from_structure`] is the
+    /// structural fallback for that case.
+    pub fn from_obligation(kind: &VerificationObligationKind) -> Result<Self, FinitumError> {
+        match kind {
+            VerificationObligationKind::InfSup {
+                constrained: Some(constrained),
+                multiplier: Some(multiplier),
+                ..
+            } => Self::new(*constrained, *multiplier),
+            VerificationObligationKind::InfSup { pair, .. } => {
+                Err(FinitumError::UnsupportedRealization(format!(
+                    "inf-sup obligation `{pair}` carries no typed constrained/multiplier pairing \
+                     (Scientia could not decide it from the spaces); derive it structurally"
+                )))
+            }
+            other => Err(FinitumError::InvalidRealization(format!(
+                "verification obligation {other:?} is not an inf-sup obligation"
+            ))),
+        }
+    }
+
     pub fn new(constrained: SymbolId, multiplier: SymbolId) -> Result<Self, FinitumError> {
         if constrained == multiplier {
             return Err(FinitumError::InvalidRealization(format!(
@@ -67,10 +92,9 @@ impl InfSupPairing {
     /// multipliers, a multiplier coupled to several fields, a multiplier coupled to nothing) is
     /// refused typed rather than guessed.
     ///
-    /// Recorded need: Scientia's `VerificationObligationKind::InfSup { pair }` carries only a
-    /// display string (`"Taylor-Hood"`, `"RT0-P0"`), not the two `SymbolId`s; a typed
-    /// `InfSup { pair, constrained, multiplier }` would let a case bind this pairing directly
-    /// instead of re-deriving it here.
+    /// [`Self::from_obligation`] reads the same pairing off Scientia's typed `@inf_sup`
+    /// obligation instead; on the corpus Stokes and Darcy models the two agree
+    /// (`tests/w7_sc_w1_scientia_ids.rs`).
     pub fn from_structure(structure: &OperatorStructure) -> Result<Self, FinitumError> {
         let present_diagonal = |field: SymbolId| {
             structure

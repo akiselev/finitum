@@ -13,6 +13,8 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W7 follow-ups: C11.8 degree-2 P1 quadrature (opt-in) and C11.22 RT0 essential normal-trace data
 + W7/SC-W1 (Finitum) system-path parity: stored design tables, coefficient JVP/VJP, assembled/
   element/partial representations and agreement/capability/artifact receipts on `SystemOperator`
++ W7/SC-W1 (Finitum) `SystemIdMap::from_scientia` (ids by value from `scientia-operator-system/2`)
+  and the typed `@inf_sup` obligation consumed as `InfSupPairing::from_obligation`
 
 ## Implemented
 
@@ -472,6 +474,29 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     Not landed: stored tables on facet integrals; regional (per-region) tables; the multi-
     instance `SystemRealizationPlan` (unchanged, waits on Scientia `OperatorSystem/2` adoption).
 
+- SC-W1 Finitum side, HANDOFF §6 items (W7, 2026-09-05): Scientia's landed system ids and typed
+  inf-sup pairing consumed.
+  - `SystemIdMap::from_scientia(&scientia::SystemOperator)`: every `SysVar { id, owner, local }`
+    and `SysResBlock { id, origin: Equation { instance, name }, row }` copied by value into
+    Finitum's `u32` newtypes (no re-allocation), one `InstanceRecord` per instance with the
+    `artifact_digest` taken from `instance_artifacts` (an instance without one refuses
+    `ArtifactMismatch`); the implicit root (empty name) is recorded under its model name.
+    Evidence (`tests/w7_sc_w1_scientia_ids.rs`, 3 tests): the implicit one-instance Poisson map
+    from Scientia **equals** `SystemIdMap::one_instance` (same `finitum-system-ids/1` identity,
+    `SysVarId(symbol.0)`, `SysResId(0)`, the `/1` artifact digest of the directly compiled
+    system); a declared two-instance `TwoHeat { a, b: HeatConduction }` map from Scientia
+    **equals** `SystemIdMap::compose(&[("a", ..), ("b", ..)])` (same identity; dense ids
+    `0..2`, paths `b.thermal`, rows = Scientia's `SysResBlock.row`), so Finitum's own dense
+    allocation is proven to be Scientia's and `compose` is kept only for callers composing `/1`
+    artifacts by hand. `InfSupPairing::from_obligation(&VerificationObligationKind)` binds the
+    typed `InfSup { constrained: Some, multiplier: Some }` pairing (refuses a non-inf-sup kind
+    `InvalidRealization`, an undecided `None` side `UnsupportedRealization`, a same-field pair);
+    on the corpus `StokesFlow` and `MixedDarcy` snapshots the typed pairing equals
+    `InfSupPairing::from_structure`'s structural derivation. Not landed: re-keying
+    `SystemOperator`'s internal field tables by `SysVarId` and the multi-instance
+    `SystemRealizationPlan` (two instances of one model in one group) -- the id map is ready
+    for it, the per-block field/constraint tables are still per-model `SymbolId`.
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -540,7 +565,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 161 passed, 0 failed across 26 binaries (SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 164 passed, 0 failed across 27 binaries (SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -674,16 +699,18 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    actions/transposes (`b477525`); and the SV2-B2 interface-measure realization binding Malleus
    facet-pair kernels (`d552da2`). Still open, in order of pull:
    - re-key `SystemOperator`'s internal field tables and admit a multi-instance
-     `SystemRealizationPlan` once Scientia's `scientia-system/1` `OriginMap` /
-     `OperatorSystem/2` land (replace `SystemIdMap::compose`'s own allocation by Scientia's);
+     `SystemRealizationPlan` (Scientia's `scientia-operator-system/2` ids are now consumed by
+     `SystemIdMap::from_scientia`, proven equal to `compose`; the operator's per-field tables
+     are the remaining per-model-keyed part);
    - bridge Scientia's `InteriorFacet`/`Interface` factorizations (they already carry
      `MinusTrace`/`PlusTrace` inputs) into `InterfaceKernel`s so `bind_kernels` stops refusing
      them -- needs a driving `.res` case (SC-W2 CHT), plus `BoundChain::Composed`
      quadrature-point evaluation of a producer instance's output kernel;
    - SC-W2 `InterfaceRealization`/`ConnectionRealizationPlan` (elimination first) over the
      `InterfaceMeasure::between` machinery, multiplier/Nitsche and transfer beyond 1-D in SC-W3;
-   - typed inf-sup pairing from Scientia (`InfSup { pair, constrained, multiplier }`) and an
-     H(div)-norm variant of the estimate.
+   - an H(div)-norm variant of the inf-sup estimate (the typed pairing from Scientia's
+     `InfSup { pair, constrained, multiplier }` is consumed by `InfSupPairing::from_obligation`;
+     wiring `require_inf_sup_stable` at run time is Sinbad's).
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.
