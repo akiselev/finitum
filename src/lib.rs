@@ -17,6 +17,7 @@ mod mixed;
 mod optimized;
 mod profile;
 mod realization;
+mod sampler;
 mod space;
 mod system;
 mod system_ids;
@@ -72,6 +73,12 @@ pub use realization::{
     PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
     RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
     RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from,
+};
+pub use sampler::{
+    ExteriorFacet, FIELD_SAMPLER_SCHEMA, FacetTrace, FieldSample, FieldSampler,
+    FieldSamplerConventions, PhysicalQuadraturePoint, QUADRATURE_RULE_SCHEMA, QuadratureRule,
+    QuadratureView, SampledFamily, cell_centroid, cell_measure, exterior_facet,
+    simplex_monomial_moment,
 };
 pub use space::{
     DofId, DofMap, ElementRestriction, quadratic_simplex_dof_map, quadratic_simplex_node_points,

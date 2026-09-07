@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-09-05
+Updated: 2026-09-07
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
 (Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and
@@ -20,6 +20,11 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   proof-aware `symmetry()` (a taken `prove_symmetry` outranks the structural claim), and the
   transient all-table agreement report equal to the single-model one with a typed, named
   `RepresentationUnsupported` refusal otherwise
++ W8 lane F1 (Finitum, strictly additive): the public field sampler `finitum-field-sampler/1`
+  (`FieldSampler`, `QuadratureView`/`QuadratureRule`) -- value, physical gradient, divergence
+  and exterior-facet traces of P1/P2 Lagrange (scalar and vector), P0 and RT0 fields at
+  physical points with the crate's own bases and Piola maps, the plan's named quadrature rule
+  and a degree-exact rule selector (new degree-5 triangle and tetrahedron rules)
 
 ## Implemented
 
@@ -611,6 +616,67 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     `SystemRealizationPlan` (two instances of one model in one group) -- the id map is ready
     for it, the per-block field/constraint tables are still per-model `SymbolId`.
 
+- W8 lane F1 (2026-09-07, PLAN §6 W8 decision 4, gate G3): the public field sampler, module
+  `src/sampler.rs`, digest schema `finitum-field-sampler/1`. Strictly additive: no existing
+  public item, signature, digest value or default changed (Sinbad lane A1 built against this
+  tree concurrently).
+  - `FieldSampler<'a>`: `new(mesh, SampledFamily, values)` over the canonical DOF maps,
+    `from_realization_plan(plan, values)` (order from the plan's element basis count, the
+    plan's own `DofMap`), `from_system_plan(plan, field, solution)` (family from the system's
+    typed element requirement, mirroring `build_field_elements`' admission rule; the DOF map is
+    proven equal to `SystemOperator::dof_map(field)`), `from_mixed_space(space, field,
+    solution)`. `SampledFamily::{Lagrange { order: 1 | 2, components: 1 | dimension },
+    CellConstant, RaviartThomas0}`; anything else refuses the new typed
+    `FinitumError::SamplingUnsupported { family, reason }` (`SAMPLING_UNSUPPORTED:` message).
+    Evaluation: `value_at` / `gradient_at` (rows per component, covariant Piola `J^{-T}`) /
+    `divergence_at` / `sample_at` at physical points (inverse affine map; `cell_contains`
+    tells extrapolation), `*_at_reference` variants, `trace_at` / `trace_at_centroid` on an
+    exterior facet (`FacetTrace { value, normal (outward unit), measure, cell, local_facet }`,
+    `normal_component()`), `cell_measure`, `cell_centroid`, `facet_centroid`,
+    `exterior_facet`. RT0 evaluates `rt0_reference_basis` under `AffineMap::contravariant_piola`
+    with `CompatibleDofMaps::hdiv`'s orientation table (the same objects `crate::system`
+    executes); its per-cell gradient is `(sum_i orientation_i dof_i / det J) I`, whose trace is
+    `map_hdiv_divergence`. `conventions()` / `digest()`: `FieldSamplerConventions` (family, DOF
+    ordering, reference basis, pullback, facet convention) hashed under
+    `finitum-field-sampler/1` -- conventions only; a receipt pairs it with the realization
+    digest for the data. Free functions `cell_measure`, `cell_centroid`, `exterior_facet`
+    (dimension 1 handled here; 2/3 reuse GX-C4's `FacetGeometry`), `simplex_monomial_moment`.
+  - `QuadratureRule { id, dimension, degree, points }` with `known(dimension)`,
+    `for_degree(dimension, degree)` (smallest named rule exact to `degree`: segments
+    Gauss-Legendre to degree 15; triangles `simplex-barycenter` 1, `triangle-edge-midpoints` 2,
+    `triangle-dunavant-6` 4, `triangle-radon-7` 5; tetrahedra `simplex-barycenter` 1,
+    `tetrahedron-symmetric-4` 2, `tetrahedron-symmetric-14` 5 -- the two degree-5 rules are new
+    in `element.rs`, closed-form Radon and the positive 14-point Walkington/Yu rule; higher
+    degrees refuse typed), `from_table` (a plan's table takes its name; an unnamed table is
+    `caller-table` with a probed degree), `verified_degree(cap)` (monomials against the
+    closed-form simplex moments, `1e-13`), `identity()` under `finitum-quadrature-rule/1`.
+    `QuadratureView<'a>`: `of_realization_plan` / `of_system_plan` / `new(mesh, rule)`,
+    `rule_for_degree(d)`, `cell_points(cell)` (`PhysicalQuadraturePoint { reference, physical,
+    weight = reference weight * |det J| }`), `integrate` / `integrate_over`.
+  - Additive accessors `RealizationPlan::element()` and `RealizationPlan::dofs()`.
+  - Evidence: 13 unit tests in `src/sampler.rs` (P1 affine and P2 quadratic reproduction to
+    `1e-14` / `1e-13` in value and gradient, scalar and vector, on sheared 1-/2-/3-D meshes with
+    mixed cell orientations; RT0 constant flux through the Piola map with outward unit normals
+    and `flux . n = sign(det J) * orientation * dof / ((d-1)! |F|)` per facet DOF; every named
+    rule verifies its declared degree against the closed-form moments and integrates the
+    volume; `rule_for_degree(2)` integrates `dot(u, u)` of a P1 interpolant exactly -- on the
+    reference triangle `1/6` against the barycenter rule's `1/9`, a 33 % relative error, and on
+    the sheared mesh degree 2 equals degree 5 to `1e-14` while barycenter differs by more than
+    `1e-3` relative) and 6 integration tests in `tests/w8_field_sampler.rs` (agreement with
+    Finitum's own quadrature-point evaluation, recorded by constitutive closures inside
+    `RealizationPlan::residual` and `SystemOperator::residual`: scalar P1, scalar P2, vector P1
+    3-D elasticity, RT0 + P0 mixed Darcy and P2-vector/P1 Taylor-Hood Stokes on sheared meshes,
+    to `1e-12`..`1e-13`; the Darcy check also closes the divergence theorem between sampled
+    normal traces and the sampled divergence; each plan's `QuadratureView` names its rule and
+    reproduces the recorded points).
+  - Honest limits: affine simplices only; exterior facets only (interior facets have no
+    one-sided trace; SC-W2 interface observables need the two-sided `InterfaceMeasure` path);
+    no point location (`cell_contains` only); Hcurl, DG, P3+ and any Hdiv order above 0 refuse;
+    `from_system_plan` is keyed by per-model `SymbolId` (a composed multi-instance layout would
+    need a `SysVarId` constructor); P2 facet traces are exact here but the executable plan's
+    facet integrals still refuse P2 (unchanged); the sampler digest covers conventions, not the
+    mesh or values.
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -679,7 +745,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 172 passed, 0 failed across 28 binaries (W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 191 passed, 0 failed across 29 binaries (W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -826,6 +892,39 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    - an H(div)-norm variant of the inf-sup estimate (the typed pairing from Scientia's
      `InfSup { pair, constrained, multiplier }` is consumed by `InfSupPairing::from_obligation`;
      wiring `require_inf_sup_stable` at run time is Sinbad's).
+7. W8 lane F1 landed (2026-09-07): the public field sampler `finitum-field-sampler/1`
+   (`FieldSampler`, `QuadratureRule`/`QuadratureView`, `SampledFamily`,
+   `FinitumError::SamplingUnsupported`; see "Implemented"). Cross-repo needs / follow-ups:
+   - Sinbad 7d-1 deletes `observable.rs`'s restated conventions against it: `SystemSampler::new`
+     becomes one `FieldSampler::from_system_plan(plan, symbol, solution)` per `layout.blocks()`
+     (the plan, not just the `BlockLayout`, carries the family), `sample(cell, reference,
+     normal)` becomes `sample_at_reference` plus `exterior_facet` for the normal/measure, the
+     private `cell_measure` / `facet_measure_and_outward_normal` / `reference_facet_centroid`
+     become `cell_measure`, `exterior_facet(..).measure/normal/centroid`; `integrate_cells`
+     picks `QuadratureView::of_system_plan(plan).rule_for_degree(d)` from the integrand degree
+     (`dot(u, u)` of P1 is 2, of P2 is 4; the 17-linear-elasticity 22 % under-integration is
+     exactly the barycenter-vs-degree-2 gap the unit test records) and the receipt records
+     `rule.id`, `rule.degree` and the sampler digest. What Sinbad still needs beyond this lane:
+     (a) a `SysVarId`-keyed constructor for composed multi-instance layouts (the F1 sampler is
+     keyed by per-model `SymbolId`, as `SystemRealizationPlan` itself still is); (b) interior /
+     interface traces for the SC-W2 heat-heat case (two-sided `InterfaceMeasure` sampling, not
+     an exterior `FacetTrace`); (c) point location for point observables (`cell_contains` only
+     answers membership); (d) facet quadrature rules above the centroid (the facet trace is
+     exact at any point, but the exterior-facet functional rule is still the caller's).
+   - Slice F2 (after Sinbad A1 lands; deliberately NOT in F1 because it is non-additive):
+     fallible external-input and constitutive callbacks end to end (W8 decision 3). Proposed
+     signatures: `pub struct InputEvaluationError { pub code: String, pub origin: InputOrigin,
+     pub point: Option<Vec<f64>>, pub time: Option<f64>, pub message: String }` with
+     `pub enum InputOrigin { Slot(String), ExpressionPath(String), Provider(String), Table(String) }`;
+     `FieldSource::sampled(Fn(&[f64]) -> Result<Vec<f64>, InputEvaluationError>)`,
+     `DynamicExternalInput::new(.., value: Fn(&PointEvaluation) -> Result<Vec<f64>,
+     InputEvaluationError>, direction: Fn(&PointEvaluation, &PointEvaluation) -> Result<..>)`,
+     `SystemConstitutiveInput::new(..)` likewise, `ExternalInput::sampled(.., FnMut(CellId,
+     &[f64]) -> Result<Vec<f64>, InputEvaluationError>)`, and a carrying variant
+     `FinitumError::InputEvaluation(InputEvaluationError)` that `residual` / JVP / VJP /
+     `load_vector` / assembly return unchanged (code and origin preserved; never NaN). Changing
+     the existing closure types is the non-additive step; a parallel `*_fallible` constructor
+     pair would leave two paths and is not proposed.
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.

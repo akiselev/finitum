@@ -47,6 +47,12 @@ implementation contains:
   a versioned schema, distinct check kind, source identity/digest, complete acceptance inputs and
   outputs, and a canonical report digest. Fallible validators re-execute the owning concrete
   operation and recompute every derived field; digest equality alone is not acceptance.
+- a public field sampler (`FieldSampler`, digest `finitum-field-sampler/1`, W8 lane F1): value,
+  physical gradient, divergence and exterior-facet traces of P1/P2 Lagrange (scalar and
+  vector), P0 and RT0 fields at physical points through the crate's own bases and Piola maps,
+  plus `QuadratureView`/`QuadratureRule` exposing a plan's named cell rule and selecting the
+  smallest rule exact to a requested polynomial degree (segments to degree 15, triangles and
+  tetrahedra to degree 5). Consumers sample through it instead of restating DOF conventions.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference

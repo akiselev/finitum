@@ -450,11 +450,90 @@ pub(crate) fn triangle_degree4_quadrature() -> Vec<QuadraturePoint> {
     points
 }
 
+/// Seven-point, degree-5-exact symmetric quadrature for the reference triangle (Radon's rule;
+/// Dunavant degree 5), all weights positive, in closed form: the centroid with weight `9/40`,
+/// the orbit `b = (6 - sqrt 15) / 21` with weight `(155 - sqrt 15) / 1200`, and the orbit
+/// `b = (6 + sqrt 15) / 21` with weight `(155 + sqrt 15) / 1200` (all times the area `1/2`).
+/// Selected by [`crate::QuadratureRule::for_degree`] for degree 5 (W8 lane F1); its exactness
+/// is verified against the closed-form simplex moments in `crate::sampler`'s tests.
+pub(crate) fn triangle_degree5_quadrature() -> Vec<QuadraturePoint> {
+    const AREA: f64 = 0.5;
+    let root = 15.0_f64.sqrt();
+    let mut points = vec![QuadraturePoint {
+        coordinates: vec![1.0 / 3.0, 1.0 / 3.0],
+        weight: 9.0 / 40.0 * AREA,
+    }];
+    for (b, weight_fraction) in [
+        ((6.0 - root) / 21.0, (155.0 - root) / 1200.0),
+        ((6.0 + root) / 21.0, (155.0 + root) / 1200.0),
+    ] {
+        let a = 1.0 - 2.0 * b;
+        for coordinates in [[b, b], [a, b], [b, a]] {
+            points.push(QuadraturePoint {
+                coordinates: coordinates.to_vec(),
+                weight: weight_fraction * AREA,
+            });
+        }
+    }
+    points
+}
+
+/// Fourteen-point, degree-5-exact symmetric quadrature for the reference tetrahedron (Walkington
+/// 2000 / Yu 1984; all weights positive): two four-point orbits `(a, b, b, b)` and one six-point
+/// orbit `(a, a, b, b)` in barycentric coordinates. Selected by
+/// [`crate::QuadratureRule::for_degree`] for degrees 3 to 5 (W8 lane F1) -- the degree-4
+/// tetrahedron rule the P2 3-D path lacked; its exactness is verified against the closed-form
+/// simplex moments in `crate::sampler`'s tests rather than asserted.
+pub(crate) fn tetrahedron_degree5_quadrature() -> Vec<QuadraturePoint> {
+    const VOLUME: f64 = 1.0 / 6.0;
+    let mut points = Vec::with_capacity(14);
+    for (a, b, weight_fraction) in [
+        (
+            0.067_342_242_210_098_3_f64,
+            0.310_885_919_263_300_5_f64,
+            0.112_687_925_718_016_2_f64,
+        ),
+        (
+            0.721_794_249_067_326_4_f64,
+            0.092_735_250_310_891_2_f64,
+            0.073_493_043_116_361_9_f64,
+        ),
+    ] {
+        // Barycentric (lambda_0, lambda_1, lambda_2, lambda_3); reference coordinates are
+        // (lambda_1, lambda_2, lambda_3).
+        for coordinates in [[b, b, b], [a, b, b], [b, a, b], [b, b, a]] {
+            points.push(QuadraturePoint {
+                coordinates: coordinates.to_vec(),
+                weight: weight_fraction * VOLUME,
+            });
+        }
+    }
+    let (a, b, weight_fraction) = (
+        0.454_496_295_874_350_6_f64,
+        0.045_503_704_125_649_4_f64,
+        0.042_546_020_777_081_2_f64,
+    );
+    for coordinates in [
+        [a, a, b],
+        [a, b, a],
+        [b, a, a],
+        [a, b, b],
+        [b, a, b],
+        [b, b, a],
+    ] {
+        points.push(QuadraturePoint {
+            coordinates: coordinates.to_vec(),
+            weight: weight_fraction * VOLUME,
+        });
+    }
+    points
+}
+
 /// Four-point, degree-2-exact symmetric quadrature for the reference tetrahedron `(0,0,0),
 /// (1,0,0), (0,1,0), (0,0,1)` (volume `1/6`). This under-integrates a P2 mass-matrix-shaped
 /// (degree-4) integrand; it is a documented reference-grade limit, matching this crate's existing
 /// honesty about quadrature accuracy (compare the P1 barycenter rule).
-fn tetrahedron_degree2_quadrature() -> Vec<QuadraturePoint> {
+pub(crate) fn tetrahedron_degree2_quadrature() -> Vec<QuadraturePoint> {
     const VOLUME: f64 = 1.0 / 6.0;
     let a = (5.0 + 3.0 * 5.0_f64.sqrt()) / 20.0;
     let b = (5.0 - 5.0_f64.sqrt()) / 20.0;

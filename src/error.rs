@@ -117,6 +117,10 @@ pub enum FinitumError {
     },
     #[error("REALIZATION_TANGENT_UNAVAILABLE: {0}")]
     RealizationTangentUnavailable(String),
+    /// A field family (or element table shape) the public field sampler
+    /// ([`crate::FieldSampler`], W8 lane F1) does not reconstruct, named.
+    #[error("SAMPLING_UNSUPPORTED: field family {family} is not sampled: {reason}")]
+    SamplingUnsupported { family: String, reason: String },
     #[error("INF_SUP_UNSTABLE: {0}")]
     InfSupUnstable(String),
 }

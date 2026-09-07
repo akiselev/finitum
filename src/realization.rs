@@ -1239,6 +1239,21 @@ impl RealizationPlan {
         &self.data.mesh
     }
 
+    /// The prepared reference element (basis tables and the cell quadrature rule) this plan
+    /// integrates with -- what [`crate::FieldSampler::from_realization_plan`] and
+    /// [`crate::QuadratureView::of_realization_plan`] read (W8 lane F1; additive accessor).
+    pub fn element(&self) -> &PreparedElement {
+        &self.data.element
+    }
+
+    /// The global degree-of-freedom map this plan gathers and scatters through: local DOF `k`
+    /// of a cell's restriction is basis function `k` of [`Self::element`] (node-major with the
+    /// field's component stride for a vector block). Read by
+    /// [`crate::FieldSampler::from_realization_plan`] (W8 lane F1; additive accessor).
+    pub fn dofs(&self) -> &DofMap {
+        &self.data.dofs
+    }
+
     /// Digest of the concrete realization, including discretization, constraints, and external
     /// input descriptors. Dynamic callbacks are represented by their required caller identity.
     pub fn digest(&self) -> &Digest {
