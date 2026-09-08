@@ -352,6 +352,22 @@ pub fn check_nodal_patch(
     tolerance: ComparisonTolerance,
     mut exact: impl FnMut(&[f64]) -> Vec<f64>,
 ) -> Result<PatchCheckReport, FinitumError> {
+    try_check_nodal_patch(mesh, component_count, nodal_values, tolerance, |point| {
+        Ok(exact(point))
+    })
+}
+
+/// Nodal patch verification with a fallible exact field. The same numerical algorithm and
+/// report identity as [`check_nodal_patch`] are used. A callback's refusal retains its code
+/// and origin and is located at the sampled vertex, without inventing a cell or time; any
+/// time already carried by the callback is preserved.
+pub fn try_check_nodal_patch(
+    mesh: &Mesh,
+    component_count: usize,
+    nodal_values: &[f64],
+    tolerance: ComparisonTolerance,
+    mut exact: impl FnMut(&[f64]) -> Result<Vec<f64>, InputEvaluationError>,
+) -> Result<PatchCheckReport, FinitumError> {
     if component_count == 0 {
         return Err(invalid("patch component count must be nonzero"));
     }
@@ -368,7 +384,10 @@ pub fn check_nodal_patch(
     }
     let mut exact_values = Vec::with_capacity(expected_len);
     for (vertex, coordinates) in mesh.vertices().iter().enumerate() {
-        let values = exact(coordinates);
+        let values = exact(coordinates).map_err(|error| {
+            let time = error.time();
+            FinitumError::from(error.at(None, coordinates, time))
+        })?;
         if values.len() != component_count {
             return Err(invalid(format!(
                 "exact patch field returned {} components at vertex {vertex}, expected {component_count}",

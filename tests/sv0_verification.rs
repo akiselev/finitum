@@ -261,3 +261,58 @@ fn segment_mesh(cells: usize) -> Mesh {
     )
     .unwrap()
 }
+
+#[test]
+fn fallible_patch_preserves_the_numeric_report_and_identity() {
+    let mesh = segment_mesh(2);
+    for values in [[2.0, 3.0, 4.0], [2.0, 3.25, 4.0]] {
+        let ordinary =
+            check_nodal_patch(&mesh, 1, &values, TOLERANCE, |x| vec![2.0 + 2.0 * x[0]]).unwrap();
+        let fallible = finitum::try_check_nodal_patch(&mesh, 1, &values, TOLERANCE, |x| {
+            Ok(vec![2.0 + 2.0 * x[0]])
+        })
+        .unwrap();
+        assert_eq!(ordinary, fallible);
+        assert_eq!(
+            serde_json::to_vec(&ordinary).unwrap(),
+            serde_json::to_vec(&fallible).unwrap()
+        );
+    }
+}
+
+#[test]
+fn fallible_patch_stops_at_first_error_with_source_and_vertex_location() {
+    for known_time in [None, Some(0.7)] {
+        let mesh = segment_mesh(2);
+        let mut visited = Vec::new();
+        let result =
+            finitum::try_check_nodal_patch(&mesh, 1, &[2.0, 3.0, 4.0], TOLERANCE, |point| {
+                visited.push(point.to_vec());
+                if point[0] > 0.0 {
+                    let mut error = finitum::InputEvaluationError::new(
+                        "EXACT_FIELD_UNAVAILABLE",
+                        finitum::InputOrigin::Provider("exact".into()),
+                        "provider refused the exact value",
+                    );
+                    error.location = Some(Box::new(finitum::InputLocation {
+                        cell: Some(finitum::CellId(99)),
+                        point: vec![999.0],
+                        time: known_time,
+                    }));
+                    Err(error)
+                } else {
+                    Ok(vec![2.0])
+                }
+            })
+            .unwrap_err();
+        let finitum::FinitumError::InputEvaluation(error) = result else {
+            panic!("{result}")
+        };
+        assert_eq!(error.code, "EXACT_FIELD_UNAVAILABLE");
+        assert_eq!(error.origin, finitum::InputOrigin::Provider("exact".into()));
+        assert_eq!(error.point(), Some([0.5].as_slice()));
+        assert_eq!(error.time(), known_time);
+        assert_eq!(error.cell(), None);
+        assert_eq!(visited, vec![vec![0.0], vec![0.5]]);
+    }
+}

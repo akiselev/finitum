@@ -118,7 +118,7 @@ pub use verification::{
     ValidatedVerification, VerificationCheckKind, VerificationReportHeader, VerificationSubject,
     check_constraint_work, check_exact_sequence, check_global_transpose, check_mesh_refinement,
     check_nodal_patch, check_realization_agreement, check_system_realization_agreement,
-    check_transfer_conservation,
+    check_transfer_conservation, try_check_nodal_patch,
 };
 
 /// Compiler-kernel point evaluation and functional integration.

@@ -46,6 +46,15 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 
 ## Implemented
 
+- W8 fallible nodal-patch verification seam (2026-09-08, implemented and validated):
+  `try_check_nodal_patch` accepts the exact field as a fallible callback. Its original
+  failure code/origin survives with the actual sampled vertex, no invented cell/time, and
+  any already known callback time retained. `check_nodal_patch` delegates through `Ok` to
+  the same algorithm; both accepted and rejected reports remain identical. This explicit
+  verification convenience is outside the F3 constitutive/sampling alias deletion inventory.
+  Two new regressions cover report identity and first-failure location/order. Focused
+  verification suite passed 5/5; workspace clippy and strict rustdoc passed. A fresh full
+  owner gate follows in isolated F3 preparation; no new full count is claimed here.
 - W8 prescribed-source projection (2026-09-08, implemented and validated):
   `prescribed_values_from_system_by_variable` maps paired value/rate `FieldSource`s and
   system-keyed essential requirements to `PrescribedEssentialValue` callbacks using the

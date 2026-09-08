@@ -130,3 +130,7 @@ artifact serialization and identities are unchanged.
 owner-selected essential targets. `SystemVariablePrescribedValue` names the variable,
 requirement, two sources, and error origin; P1/P2 vector component and edge-node indexing
 remain inside Finitum. Shared targets must agree at runtime. RT0 motion is explicitly refused.
+
+`try_check_nodal_patch` accepts a fallible exact-field callback and preserves typed provider
+failures at the sampled vertex. `check_nodal_patch` delegates to the same numerical checker
+for infallible numerical fixtures, preserving report values and identity.
