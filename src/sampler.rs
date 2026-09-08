@@ -391,6 +391,24 @@ impl<'a> FieldSampler<'a> {
         field: SymbolId,
         solution: &'a [f64],
     ) -> Result<Self, FinitumError> {
+        let block = plan.layout().block(field).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "field {field} is absent or ambiguous in system layout"
+            ))
+        })?;
+        Self::from_system_plan_by_variable(plan, block.variable, solution)
+    }
+
+    /// Sample an instance-qualified system field, including repeated model instances.
+    pub fn from_system_plan_by_variable(
+        plan: &'a SystemRealizationPlan,
+        variable: crate::SysVarId,
+        solution: &'a [f64],
+    ) -> Result<Self, FinitumError> {
+        let origin = plan.system_ids().variable_origin(variable).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("system variable {variable} is absent"))
+        })?;
+        let field = origin.local;
         let layout = plan.layout();
         if solution.len() != layout.extent() {
             return Err(FinitumError::InvalidRealization(format!(
@@ -399,13 +417,14 @@ impl<'a> FieldSampler<'a> {
                 layout.extent()
             )));
         }
-        let block = layout.block(field).ok_or_else(|| {
+        let block = layout.block_by_variable(variable).ok_or_else(|| {
             FinitumError::InvalidRealization(format!("layout has no block for field {field}"))
         })?;
         let mesh = plan.mesh();
         let dimension = mesh.dimension();
         let requirement = plan
-            .system()
+            .instance_system(origin.instance)
+            .expect("system variable belongs to a realized instance")
             .blocks
             .iter()
             .flat_map(|block| block.requirements.elements.iter())

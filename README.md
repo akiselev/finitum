@@ -105,3 +105,12 @@ checker uses maximum simplex diameter and does not construct refined meshes or e
 The small linear patch and prescribed second-order error sequences in the B3 tests exercise the
 checker contracts; they are not discretization certification. The retained FC6 affine patch on a
 nonuniform sheared mesh remains the independent realization oracle.
+
+W8 functional evaluation is available in `finitum::functional`: bind Scientia point-expression
+kernels once, supply only external provider primitives, and use `CellFunctionalPlan` for
+quadrature, value/JVP/VJP accumulation and independent coefficient gradients. See
+`tests/w8_functional.rs` for executable examples and `STATUS.md` for the current boundaries.
+
+Validated on 2026-09-08: 228 workspace/all-target tests passed, including 14 functional
+evaluation tests; clippy and rustdoc with warnings denied, formatting and diff checks passed.
+Sinbad consumption and end-to-end G3 acceptance remain separate integration work.

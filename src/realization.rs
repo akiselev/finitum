@@ -97,15 +97,38 @@ impl CoefficientLayout {
         self.weights_at(mesh, element.quadrature(), cell, point)
     }
 
-    /// As [`Self::weights`] over an explicit cell quadrature table (the system path's shared
-    /// table).
-    pub(crate) fn weights_at(
+    /// Interpolation weights `(entity index, weight)` at a cell quadrature point.
+    ///
+    /// The same weights scatter a point cotangent back into this coefficient layout.
+    /// Cell and point indices and reference-coordinate shape are checked before indexing.
+    pub fn weights_at(
         self,
         mesh: &Mesh,
         quadrature: &[QuadraturePoint],
         cell: usize,
         point: usize,
     ) -> Result<Vec<(usize, f64)>, FinitumError> {
+        if cell >= mesh.cells().len() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "coefficient cell {cell} is outside mesh"
+            )));
+        }
+        let sample = quadrature.get(point).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!(
+                "coefficient quadrature point {point} is outside table"
+            ))
+        })?;
+        if sample.coordinates.len() != mesh.dimension()
+            || sample
+                .coordinates
+                .iter()
+                .any(|coordinate| !coordinate.is_finite())
+            || !sample.weight.is_finite()
+        {
+            return Err(FinitumError::InvalidRealization(
+                "coefficient quadrature point has invalid shape or nonfinite data".into(),
+            ));
+        }
         match self {
             CoefficientLayout::QuadraturePoint => Ok(vec![(cell * quadrature.len() + point, 1.0)]),
             CoefficientLayout::Cell => Ok(vec![(cell, 1.0)]),

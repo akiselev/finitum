@@ -118,3 +118,6 @@ pub use verification::{
     check_nodal_patch, check_realization_agreement, check_system_realization_agreement,
     check_transfer_conservation,
 };
+
+/// Compiler-kernel point evaluation and functional integration.
+pub mod functional;

@@ -46,6 +46,33 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 
 ## Implemented
 
+- W8 F-EVAL (2026-09-08, implemented and validated):
+  `finitum::functional::BoundPointExpression` consumes Scientia's authenticated point kernel
+  artifact and compiled argument DAG. Graph-local inputs resolve by semantic symbol/evaluation;
+  primal, state JVP/VJP, and the compiler's explicit capture VJP execute through Malleus.
+  Providers supply only primitive values and argument JVPs with explicit available/zero/frozen/
+  unavailable dispositions. Their reverse products transpose the small argument JVP exactly;
+  failures preserve original origin, cell, point and time. No scientific expression interpreter.
+  `CellFunctionalPlan` owns arbitrary validated cell quadrature, existing numerical field
+  reconstruction and transpose scatter, separate state/rate gradients, and Cell/Vertex/
+  QuadraturePoint independent-design interpolation and its transpose. Functional identities
+  cover the plan, instance, kernel/binding identities, derivative dispositions, quadrature
+  table/reason, and design layouts. `FieldSampler::from_system_plan_by_variable` supports
+  repeated instances; `CoefficientLayout::weights_at` is public and checks indices/shape.
+  Admission refuses independent provider bindings that discard argument dependencies,
+  same-module wrong-model functionals, malformed/cyclic argument graphs, and functionals
+  needing composed input-bind pullbacks (that last capability remains SC-W3).
+  Reverse arithmetic and scatter overflow refuse instead of returning nonfinite gradients.
+  Evidence: `tests/w8_functional.rs` (14 passing tests) covers exact quadratic values, gradient/state/rate products,
+  nested provider arguments, design products, repeated-instance identity, and adversarial
+  dependency/model/graph/failure cases. Sinbad still has to consume this API for G3 closure.
+  Final focused check also passes all 9 F-MI regressions; clippy with warnings denied, scoped
+  formatting, rustdoc with warnings denied and diff-check pass. Coordinator full validation
+  on the final source: `cargo test --locked --workspace --all-targets` exited 0 with 228
+  passing tests (214 pre-existing plus 14 functional tests). Sinbad consumption and its G3
+  integration gate remain separate, outstanding obligations.
+
+
 - validated 1D--3D simplex meshes with finite coordinates, bounded connectivity, and distinct
   vertices per cell;
 - deterministic global degree-of-freedom maps with nonempty, bounded, duplicate-free element
@@ -851,8 +878,7 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 - W8 lane F-MI (2026-09-07, PLAN §6 W8 lane F-MI, gate G2; the exact need of
   GX-CONTRACTS C12.9 "Sinbad `59b00af`/`ec0042f` -- W8 lane A2", items 1-4;
   `sinbad/ARCHITECTURE.md` §2.3/§2.4/§2.6/§6/§8): the multi-instance
-  `SystemRealizationPlan` over one realization group (working-tree implementation;
-  coordinator landing pending as of 2026-09-08). Additive: every existing signature,
+  `SystemRealizationPlan` over one realization group (landed at `451ae69`, 2026-09-08). Additive: every existing signature,
   default and digest value is unchanged (the 205 pre-existing tests pass unchanged; the
   bitwise fixtures of `w7_system_path_parity` are the proof that internal re-keying moved no
   one-instance value).
@@ -1063,7 +1089,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 214 passed, 0 failed across 31 binaries (W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 228 passed, 0 failed across 32 binaries (W8 F-EVAL functional evaluation, +14 integration; 214 at W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -1310,7 +1336,7 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      forms, stiffness bitwise with `Barycenter`, and the 08-style DAE's differential rows
      regular under consistent initialization (Krasis) -- about one lane-day.
 
-9. W8 lane F-MI implemented in the working tree (2026-09-08; coordinator landing pending): the multi-instance `SystemRealizationPlan` (see
+9. W8 lane F-MI landed at `451ae69` (2026-09-08): the multi-instance `SystemRealizationPlan` (see
    "Implemented"). Cross-repo needs:
    - **Sinbad, G2 completion** (`run_plan` / `coupled_run.rs`): for a declared system whose
      instances share the level mesh, build ONE realization group instead of one per instance:

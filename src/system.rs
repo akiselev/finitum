@@ -556,6 +556,15 @@ impl SystemRealizationPlan {
         self.composed.as_ref().map(|composed| &composed.operator)
     }
 
+    pub(crate) fn has_bound_input(&self, instance: InstanceId, symbol: SymbolId) -> bool {
+        self.composed.as_ref().is_some_and(|composed| {
+            composed
+                .binds
+                .iter()
+                .any(|bind| bind.consumer == instance && bind.consumer_symbol == symbol)
+        })
+    }
+
     /// The realized rows in `SysResId` order as `(row index, row, per-model block)`.
     fn rows(&self) -> impl Iterator<Item = (usize, &RealizedRow, &OperatorSystemBlock)> + '_ {
         self.rows.iter().enumerate().map(move |(index, row)| {
@@ -1157,9 +1166,9 @@ enum FieldKind {
 }
 
 #[derive(Clone, Debug)]
-struct FieldElement {
+pub(crate) struct FieldElement {
     kind: FieldKind,
-    dofs: DofMap,
+    pub(crate) dofs: DofMap,
 }
 
 /// The concrete DOF-layout component count a system field's typed requirement implies:
@@ -1220,7 +1229,7 @@ fn expected_field_components(
 /// field can legitimately reach the `Hdiv` arm below). `ElementFamilyRequirement::Hcurl`/
 /// `DiscontinuousGalerkin`, any other polynomial order, and any Hdiv order other than 0, remain
 /// refused typed.
-fn build_field_elements(
+pub(crate) fn build_field_elements(
     plan: &SystemRealizationPlan,
     quadrature: &[QuadraturePoint],
 ) -> Result<BTreeMap<SysVarId, FieldElement>, FinitumError> {
@@ -1532,7 +1541,7 @@ fn apply_rt0_divergence_adjoint(
 /// [`FieldKind`] `field` is. `reference_point` is `quadrature[point].coordinates` (the shared
 /// index convention [`build_field_elements`] documents); `cell` selects the RT0 orientation row.
 #[allow(clippy::too_many_arguments)]
-fn evaluate_field_basis_input(
+pub(crate) fn evaluate_field_basis_input(
     field: &FieldElement,
     geometry: &CellGeometry,
     affine: &AffineMap,
@@ -1572,7 +1581,7 @@ fn evaluate_field_basis_input(
 /// Dispatching adjoint: exact transpose of [`evaluate_field_basis_input`] for a *row* (test)
 /// field's cell-integral output scatter.
 #[allow(clippy::too_many_arguments)]
-fn apply_field_basis_adjoint(
+pub(crate) fn apply_field_basis_adjoint(
     field: &FieldElement,
     geometry: &CellGeometry,
     affine: &AffineMap,
