@@ -696,3 +696,162 @@ pub system Two {
         matches!(result,Err(finitum::FinitumError::UnsupportedRealization(message)) if message.contains("POINT_BOUND_FUNCTIONAL_UNSUPPORTED"))
     );
 }
+
+#[test]
+fn frozen_nested_provider_needs_no_argument_product_but_active_design_does() {
+    let source = SOURCE.replace("property first = law(u + offset);", "provider fixed() -> Dimensionless { differentiability = analytic_provided; }\n property first = law(fixed());");
+    let c = compile_semantics(&source, &UnitRegistry::si_bootstrap()).unwrap();
+    let kernels = compile_cell_functional(&c.semantic, "Example", "energy").unwrap();
+    let fixed = CaptureKey::Provider(ProviderId(1));
+    let make = |binding| {
+        BoundPointExpression::new(
+            kernels.clone(),
+            BTreeMap::from([
+                (
+                    CaptureKey::Provider(ProviderId(0)),
+                    CaptureBinding::Provider(PointProvider::new(
+                        "inverse",
+                        InputOrigin::Slot("inverse".into()),
+                        |_, args| Ok(vec![1.0 / args[0][0]]),
+                        PointDerivative::Unavailable {
+                            reason: "local inverse tangent absent".into(),
+                        },
+                    )),
+                ),
+                (fixed, binding),
+            ]),
+        )
+        .unwrap()
+    };
+    let graph = make(CaptureBinding::Provider(PointProvider::new(
+        "permeability",
+        InputOrigin::Slot("permeability".into()),
+        |_, _| Ok(vec![2.0]),
+        PointDerivative::Unavailable {
+            reason: "no local primitive derivative".into(),
+        },
+    )));
+    graph.require_derivatives().unwrap();
+    let p = point(&c, 3.0, 0.0);
+    let d = point(&c, 1.0, 0.0);
+    // nested = inverse(inverse(2))*u = 2u; energy=4u².
+    close(graph.value(&p).unwrap()[0], 36.0);
+    close(graph.jvp(&p, &d).unwrap()[0], 24.0);
+    let pull = graph.vjp(&p, &[1.0]).unwrap();
+    close(
+        pull.fields
+            .iter()
+            .find(|f| f.symbol == symbol(&c, "u"))
+            .unwrap()
+            .values[0],
+        24.0,
+    );
+    let active = make(CaptureBinding::Independent);
+    assert_eq!(
+        active.require_derivatives().unwrap_err().code(),
+        Some("POINT_TANGENT_UNAVAILABLE")
+    );
+    let mut p = p;
+    p.captures.insert(fixed, vec![2.0]);
+    let mut zero = point(&c, 0.0, 0.0);
+    zero.captures.insert(fixed, vec![0.0]);
+    assert!(active.value(&p).is_ok());
+    for result in [
+        active.jvp(&p, &zero),
+        active.vjp(&p, &[0.0]).map(|_| vec![]),
+    ] {
+        let finitum::FinitumError::InputEvaluation(error) = result.unwrap_err() else {
+            panic!()
+        };
+        assert_eq!(error.code, "POINT_TANGENT_UNAVAILABLE");
+        assert_eq!(error.origin, InputOrigin::Slot("inverse".into()));
+        assert_eq!(error.time(), Some(0.7));
+    }
+}
+
+#[test]
+fn elastic_stress_trace_accumulates_indexed_tensor_pullbacks() {
+    let source = include_str!("fixtures/corpus/17-linear-elasticity.res");
+    let c = compile_semantics(source, &UnitRegistry::si_bootstrap()).unwrap();
+    let m = &c.semantic.models[0];
+    let declaration = m.declarations.iter().find(|d| d.name == "stress").unwrap();
+    let scientia::SemanticDeclarationKind::ConstitutiveLaw { value } = declaration.kind else {
+        panic!()
+    };
+    let kernels = scientia::compile_point_expression(
+        &c.semantic,
+        &m.name,
+        declaration.id,
+        value,
+        m.domains[0].id,
+    )
+    .unwrap();
+    let bindings = kernels
+        .root
+        .captures
+        .iter()
+        .map(|capture| {
+            let id = capture.provider.unwrap();
+            let value = match m.providers[id.index()].name.as_str() {
+                "identity" => vec![1., 0., 0., 0., 1., 0., 0., 0., 1.],
+                "lame_lambda" => vec![2.],
+                "lame_mu" => vec![3.],
+                other => panic!("{other}"),
+            };
+            (
+                CaptureKey::Provider(id),
+                CaptureBinding::Provider(PointProvider::new(
+                    "constant",
+                    InputOrigin::Slot(m.providers[id.index()].name.clone()),
+                    move |_, _| Ok(value.clone()),
+                    PointDerivative::ProvablyZero {
+                        reason: "constant data".into(),
+                    },
+                )),
+            )
+        })
+        .collect();
+    let graph = BoundPointExpression::new(kernels, bindings).unwrap();
+    graph.require_derivatives().unwrap();
+    let fields = graph
+        .field_inputs()
+        .into_iter()
+        .map(|input| PointFieldValue {
+            symbol: input.binding.symbol,
+            derivative: input.binding.evaluation.derivative,
+            values: vec![1., 0., 0., 0., 2., 0., 0., 0., 3.],
+        })
+        .collect();
+    let p = PointExpressionPoint {
+        location: InputLocation {
+            cell: None,
+            point: vec![0.2, 0.3, 0.4],
+            time: Some(0.7),
+        },
+        fields,
+        captures: BTreeMap::new(),
+    };
+    assert_eq!(
+        graph.value(&p).unwrap(),
+        vec![18., 0., 0., 0., 24., 0., 0., 0., 30.]
+    );
+    let identity = vec![1., 0., 0., 0., 1., 0., 0., 0., 1.];
+    let mut d = p.clone();
+    for field in &mut d.fields {
+        field.values = identity.clone();
+    }
+    let tangent = graph.jvp(&p, &d).unwrap();
+    assert_eq!(tangent, vec![12., 0., 0., 0., 12., 0., 0., 0., 12.]);
+    let reverse = graph.vjp(&p, &identity).unwrap();
+    assert_eq!(reverse.fields.len(), 1);
+    assert_eq!(reverse.fields[0].values, tangent);
+    close(
+        reverse.fields[0]
+            .values
+            .iter()
+            .zip(&identity)
+            .map(|(a, b)| a * b)
+            .sum(),
+        tangent.iter().zip(&identity).map(|(a, b)| a * b).sum(),
+    );
+}

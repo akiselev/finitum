@@ -1,6 +1,20 @@
 # Finitum status
 
-Updated: 2026-09-07
+Updated: 2026-09-08
+Current W8 follow-up (2026-09-08): `BoundPointExpression::require_derivatives()` uses a
+construction-cached structural activity proof over the compiler argument DAG, semantic fields,
+independent captures, and Malleus primal output read proofs. Frozen/zero primitives stop the
+chain; unavailable local derivatives remain unavailable metadata, but are required only on
+active output paths. Fixed `inverse(permeability())` arguments need no state/rate tangent.
+Active field/design arguments still refuse `POINT_TANGENT_UNAVAILABLE` even for zero seeds,
+with provider origin and actual runtime location. Primal-only evaluation remains allowed.
+Indexed stress trace/shear covectors are verified to sum into one semantic tensor pullback.
+Final focused `w8_functional`: 16/16 under Malleus `9828694` and Scientia `6ab0a28`;
+clippy (all targets/features, warnings denied), rustdoc (warnings denied), scoped fmt pass.
+Full `cargo test --locked --workspace --all-targets` exited 0: 237 tests across 33 binaries.
+That full build started under Malleus `02164b3`; the final focused/check/doc gate above was
+rebuilt under its read-write-proof correction `9828694`. No full-current-tuple claim.
+
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
 (Scientia-form-driven SystemOperator with load vector, equation-sign symmetry proof, and

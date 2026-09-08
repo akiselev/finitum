@@ -10,7 +10,10 @@ use scientia::{
     DerivativeEvaluation, ExprId, InputSourceRequirement, PointExpressionKernels,
     PointExpressionNode, ProviderId, QFunctionInput, SymbolId, TensorInputId,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Identity of an external primitive or independently varied point input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -192,6 +195,7 @@ struct Node {
     source: PointExpressionNode,
     bundle: BoundBundle,
     parameter_reverse: malleus::Executable,
+    read_inputs: BTreeSet<TensorInputId>,
 }
 impl Node {
     fn parameter_cotangents(
@@ -230,12 +234,15 @@ impl Node {
         Ok(result)
     }
 }
+type DerivativeActivity = BTreeSet<(ExprId, TensorInputId)>;
+
 /// Reusable executable graph over the compiler's existing point kernels.
 #[derive(Clone, Debug)]
 pub struct BoundPointExpression {
     kernels: PointExpressionKernels,
     nodes: BTreeMap<ExprId, Node>,
     bindings: BTreeMap<CaptureKey, CaptureBinding>,
+    activity: Result<DerivativeActivity, InputEvaluationError>,
 }
 fn invalid(message: impl Into<String>) -> FinitumError {
     FinitumError::InvalidRealization(message.into())
@@ -374,10 +381,20 @@ impl BoundPointExpression {
                 .pop_first()
                 .ok_or_else(|| invalid("point node has no executable"))?
                 .1;
+            let primal = &bundle.bundle.module.kernels[bundle.bundle.primal_kernel_index];
+            let mut read_inputs = BTreeSet::new();
+            for binding in &bundle.bundle.primal_inputs {
+                if malleus::primal_output_reads_input(primal, binding.operand)
+                    .map_err(|e| FinitumError::KernelValidation(e.to_string()))?
+                {
+                    read_inputs.insert(binding.input);
+                }
+            }
             nodes.insert(
                 source.expression,
                 Node {
                     source: source.clone(),
+                    read_inputs,
                     bundle,
                     parameter_reverse: malleus::Executable::reference(
                         malleus::validate(source.parameter_vjp[0].kernel.clone())
@@ -422,11 +439,14 @@ impl BoundPointExpression {
                 &mut done,
             )?;
         }
-        Ok(Self {
+        let mut graph = Self {
             kernels,
             nodes,
             bindings,
-        })
+            activity: Ok(BTreeSet::new()),
+        };
+        graph.activity = graph.analyze_derivative_activity();
+        Ok(graph)
     }
     pub fn kernels(&self) -> &PointExpressionKernels {
         &self.kernels
@@ -483,6 +503,135 @@ impl BoundPointExpression {
             matches!(binding, CaptureBinding::Independent).then_some(*key)
         })
     }
+    /// Require every provider product on an active path to the primal output.
+    /// Activity includes field values/rates and independent captures; it never depends on
+    /// numerical directions or seeds. Frozen/zero primitives stop the chain explicitly.
+    /// The immutable structural proof is cached at construction, never rerun per point.
+    /// Primal-only evaluation remains usable when a required derivative is unavailable.
+    pub fn require_derivatives(&self) -> Result<(), FinitumError> {
+        self.derivative_activity(None).map(|_| ())
+    }
+    fn derivative_activity(
+        &self,
+        location: Option<&InputLocation>,
+    ) -> Result<&DerivativeActivity, FinitumError> {
+        self.activity.as_ref().map_err(|error| {
+            let mut error = error.clone();
+            error.location = location.cloned().map(Box::new);
+            error.into()
+        })
+    }
+    fn analyze_derivative_activity(&self) -> Result<DerivativeActivity, InputEvaluationError> {
+        fn active(
+            graph: &BoundPointExpression,
+            id: ExprId,
+            memo: &mut BTreeMap<ExprId, bool>,
+        ) -> bool {
+            if let Some(value) = memo.get(&id) {
+                return *value;
+            }
+            let node = &graph.nodes[&id];
+            let value = node.source.factorization.integrals[0]
+                .primal
+                .inputs
+                .iter()
+                .any(|input| {
+                    if !node.read_inputs.contains(&input.id) {
+                        return false;
+                    }
+                    if input.source == InputSourceRequirement::Basis {
+                        return true;
+                    }
+                    let capture = node
+                        .source
+                        .captures
+                        .iter()
+                        .find(|c| c.input == input.id)
+                        .expect("validated capture");
+                    match &graph.bindings[&key(capture)] {
+                        CaptureBinding::Independent => true,
+                        CaptureBinding::Provider(provider) => {
+                            !matches!(
+                                provider.derivative,
+                                PointDerivative::Frozen { .. }
+                                    | PointDerivative::ProvablyZero { .. }
+                            ) && capture
+                                .arguments
+                                .iter()
+                                .any(|arg| active(graph, *arg, memo))
+                        }
+                    }
+                });
+            memo.insert(id, value);
+            value
+        }
+        fn visit(
+            graph: &BoundPointExpression,
+            id: ExprId,
+            memo: &mut BTreeMap<ExprId, bool>,
+            required: &mut BTreeSet<(ExprId, TensorInputId)>,
+        ) -> Result<(), InputEvaluationError> {
+            let node = &graph.nodes[&id];
+            for input in &node.source.factorization.integrals[0].primal.inputs {
+                if !node.read_inputs.contains(&input.id) {
+                    continue;
+                }
+                if input.source == InputSourceRequirement::Basis {
+                    required.insert((id, input.id));
+                    continue;
+                }
+                let capture = node
+                    .source
+                    .captures
+                    .iter()
+                    .find(|c| c.input == input.id)
+                    .expect("validated capture");
+                match &graph.bindings[&key(capture)] {
+                    CaptureBinding::Independent => {
+                        required.insert((id, input.id));
+                    }
+                    CaptureBinding::Provider(provider) => {
+                        if matches!(
+                            provider.derivative,
+                            PointDerivative::Frozen { .. } | PointDerivative::ProvablyZero { .. }
+                        ) {
+                            continue;
+                        }
+                        let args = capture
+                            .arguments
+                            .iter()
+                            .copied()
+                            .filter(|arg| active(graph, *arg, memo))
+                            .collect::<Vec<_>>();
+                        if args.is_empty() {
+                            continue;
+                        }
+                        if let PointDerivative::Unavailable { reason } = &provider.derivative {
+                            let failure = InputEvaluationError::new(
+                                "POINT_TANGENT_UNAVAILABLE",
+                                provider.origin.clone(),
+                                reason,
+                            );
+                            return Err(failure);
+                        }
+                        required.insert((id, input.id));
+                        for arg in args {
+                            visit(graph, arg, memo, required)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut required = BTreeSet::new();
+        visit(
+            self,
+            self.kernels.expression,
+            &mut BTreeMap::new(),
+            &mut required,
+        )?;
+        Ok(required)
+    }
     fn forward(
         &self,
         id: ExprId,
@@ -490,6 +639,7 @@ impl BoundPointExpression {
         direction: Option<&PointExpressionPoint>,
         tape: &mut BTreeMap<ExprId, Tape>,
         order: &mut Vec<ExprId>,
+        activity: Option<&BTreeSet<(ExprId, TensorInputId)>>,
     ) -> Result<(), FinitumError> {
         if tape.contains_key(&id) {
             return Ok(());
@@ -543,7 +693,7 @@ impl BoundPointExpression {
                     }
                     CaptureBinding::Provider(provider) => {
                         for argument in &capture.arguments {
-                            self.forward(*argument, point, direction, tape, order)?;
+                            self.forward(*argument, point, direction, tape, order, activity)?;
                         }
                         let args = capture
                             .arguments
@@ -552,7 +702,7 @@ impl BoundPointExpression {
                             .collect::<Vec<_>>();
                         let value = (provider.value)(&point.location, &args)
                             .map_err(|e| located(e, &point.location))?;
-                        let tangent = if direction.is_some() {
+                        let tangent = if activity.is_some_and(|a| a.contains(&(id, input.id))) {
                             let ds = capture
                                 .arguments
                                 .iter()
@@ -598,6 +748,7 @@ impl BoundPointExpression {
             None,
             &mut tape,
             &mut Vec::new(),
+            None,
         )?;
         Ok(tape.remove(&self.kernels.expression).unwrap().value)
     }
@@ -606,6 +757,7 @@ impl BoundPointExpression {
         point: &PointExpressionPoint,
         direction: &PointExpressionPoint,
     ) -> Result<Vec<f64>, FinitumError> {
+        let activity = self.derivative_activity(Some(&point.location))?;
         let mut tape = BTreeMap::new();
         self.forward(
             self.kernels.expression,
@@ -613,6 +765,7 @@ impl BoundPointExpression {
             Some(direction),
             &mut tape,
             &mut Vec::new(),
+            Some(activity),
         )?;
         Ok(tape.remove(&self.kernels.expression).unwrap().direction)
     }
@@ -623,7 +776,15 @@ impl BoundPointExpression {
     ) -> Result<PointPullback, FinitumError> {
         let mut tape = BTreeMap::new();
         let mut order = Vec::new();
-        self.forward(self.kernels.expression, point, None, &mut tape, &mut order)?;
+        let activity = self.derivative_activity(Some(&point.location))?;
+        self.forward(
+            self.kernels.expression,
+            point,
+            None,
+            &mut tape,
+            &mut order,
+            None,
+        )?;
         check_values(seed, tape[&self.kernels.expression].value.len())?;
         let mut seeds = BTreeMap::from([(self.kernels.expression, seed.to_vec())]);
         let mut result = PointPullback::default();
@@ -639,6 +800,9 @@ impl BoundPointExpression {
                 add(cotangents.entry(input).or_default(), &contribution)?;
             }
             for input in &node.source.factorization.integrals[0].primal.inputs {
+                if !activity.contains(&(id, input.id)) {
+                    continue;
+                }
                 let Some(cotangent) = cotangents.get(&input.id) else {
                     continue;
                 };
@@ -683,6 +847,9 @@ impl BoundPointExpression {
                                 provider.direction(&point.location, &args, &ds, cotangent.len())?;
                             }
                             for (arg_index, arg_id) in capture.arguments.iter().enumerate() {
+                                if !activity.iter().any(|(node, _)| node == arg_id) {
+                                    continue;
+                                }
                                 let mut contribution = vec![0.0; args[arg_index].len()];
                                 for (component, value) in contribution.iter_mut().enumerate() {
                                     ds[arg_index][component] = 1.0;
