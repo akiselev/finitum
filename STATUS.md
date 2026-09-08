@@ -29,8 +29,11 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   callbacks -- `InputEvaluationError { code, origin: InputOrigin, message, location }`,
   `FinitumError::InputEvaluation` with `code()` returning the producer's own code, `try_new` on
   `DynamicExternalInput` / `SystemConstitutiveInput` (the infallible `new` is a thin wrapper),
-  every Methodus boundary mapping it to `NumericError::Evaluation` verbatim; the infallible
-  forms are deleted by slice F3 after Sinbad 7d-2 migrates
+  every Methodus boundary mapping it to `NumericError::Evaluation` verbatim; stored-table
+  builders `try_sampled[_at]`, `FieldSource::fallible(|x, t| ..)`, the `_at(time)` forms of
+  `external_inputs_from` and both essential-constraint samplers; Finitum's own kernel / table
+  closures refuse typed (`REALIZATION_PROPERTY_UNAVAILABLE`) instead of NaN or a panic; the
+  infallible forms are deleted by slice F3 after Sinbad 7d-2 migrates
 
 ## Implemented
 
@@ -752,6 +755,28 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     `Sampled`). A `Fallible` Dirichlet refusal is located at the node (no cell) and `time`,
     origin untouched. `system_constitutive_from_sources` binds a `Fallible` source as a
     `try_new` closure at the runtime point's coordinates and time (zero direction).
+  - Finitum's own bound property closures are typed too: `system_constitutive_from_sources`
+    (`Kernel` / `Table` sources, state-free and state-dependent) and `external_inputs_from[_at]`
+    (state-dependent `Kernel` / `Table` bindings) build `try_new` closures. A table axis point
+    outside the table's range, a kernel execution failure, a table axis that is neither a
+    coordinate nor the bound active input, or an evaluation point without the active input's
+    value is `InputEvaluationError { code: REALIZATION_PROPERTY_UNAVAILABLE (new, exported
+    constant), origin: ExpressionPath("<model>.<equation>[<integral>].<symbol>") on the system
+    path and `"<model>[<integral>].<symbol>"` on the single-model path (its factorization
+    carries no equation name), message: the underlying Finitum error }`; a tangent the kernel
+    declines at a point is `REALIZATION_TANGENT_UNAVAILABLE` (the build-time refusal's code).
+    Before this lane the system path returned NaN placeholders that `validate_finite` reported
+    as "constitutive input contains a non-finite value" and the single-model path panicked on
+    `.expect("validated at build time")` -- both what decision 3 forbids.
+  - Honest limits: `check_global_transpose` (caller-supplied Methodus operators) recovers code
+    and origin typed but the location only as message text, and a `Slot` / `ExpressionPath`
+    origin round-trips as `Slot`; `essential_constraints_from_system[_at]` still refuses
+    `Table` / `Kernel` sources (unchanged); a stored table is sampled at one time -- a
+    transient consumer rebuilds it (and the constraint set) per step, there is no per-point
+    time; `FieldSource::Fallible`'s identity is its `Arc` address, like `Sampled`'s;
+    `InputEvaluationError` is not serialized (`FinitumError` never was); no
+    `last_evaluation_failure()` record exists because nothing needed one -- if a future
+    Methodus trait method returns no `Result`, that is where it would go.
   - Carrying mechanism, per entry point: **propagated everywhere, nothing recorded**. Every
     Methodus operator trait entry point returns `Result<(), NumericError>` and
     `NumericError::Evaluation` carries the typed payload, so no `last_evaluation_failure()`
@@ -805,6 +830,11 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     cell, while `system_constitutive_from_sources` binds it at the runtime time (the residual
     is affine in `t` through `fa = t`) and a refusal is located through the operator action
     (`fallible_field_sources_feed_time_sampled_tables_and_runtime_time_constitutive_inputs`).
+    Finitum's own tables: `ka` tabulated over `b` on `[0, 1]` evaluates at `b = 0.5` and at
+    `b = 5` refuses `REALIZATION_PROPERTY_UNAVAILABLE at Coupled.ea[0].ka`, cell 0, `t = 0.1`,
+    from residual and JVP, never "non-finite"; the single-model `k` over `u` likewise at
+    `TransientNonlinear[<integral>].k` where the dynamic binding used to panic
+    (`finitum_s_own_bound_property_table_refuses_typed_at_runtime_instead_of_nan_or_a_panic`).
     The pre-existing 191 tests are unchanged and pass, which is the proof that the wrappers
     change no behaviour and that none of `finitum-system-realization/2`,
     `finitum-system-operator/2`, `finitum-field-sampler/1` moved.
@@ -877,7 +907,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 204 passed, 0 failed across 30 binaries (W8 F2 fallible callbacks, +5 unit +8 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 205 passed, 0 failed across 30 binaries (W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -1085,10 +1115,39 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      the transient path (`coupled_run.rs`) rebuilds `essential_constraints_from_system_at(..,
      time)` / `reduced(..)` per step so `g(t)` stops being frozen at `t = 0`;
      `derivative_campaign.rs` / `advanced.rs` / `artifacts.rs` table builders take the `try_`
-     forms. (c) **Krasis K1 (addition)** -- `initial.rs` matches `FieldSource::Sampled` by
-     payload; add a `FieldSource::Fallible(sampler)` arm evaluating `sampler(x, t0)` at the
-     initial time and mapping the `InputEvaluationError` typed (today the wildcard arm refuses
-     it as an unsupported source).
+     forms; `RUN_*` codes flow through unchanged, and Finitum's own
+     `REALIZATION_PROPERTY_UNAVAILABLE` / `REALIZATION_TANGENT_UNAVAILABLE` join the refusal
+     vocabulary (C12). (c) **Krasis K1 (addition)** -- `initial.rs` matches
+     `FieldSource::Sampled` by payload; add a `FieldSource::Fallible(sampler)` arm evaluating
+     `sampler(x, t0)` at the initial time and mapping the `InputEvaluationError` typed (today
+     the wildcard arm refuses it as an unsupported source).
+   - **P1 mass option on `SystemQuadrature::Barycenter` (recorded, not built; the F2 brief's
+     item 6).** Need: a DAE structure with an unconstrained differential field (08 on 3x3)
+     cannot take the migration rule under Krasis consistent initialization because the
+     barycenter rule integrates the P1 mass `phi_i phi_j` (a degree-2 integrand) to a rank-one
+     local block, so the differential rows are singular; Sinbad keeps `Richest` for any
+     structure with an algebraic field row. Design: a *per-integral* rule, not a per-plan one.
+     The mass term is the factorization integral whose active input carries
+     `DerivativeEvaluation::TimeDerivative` against a value-kind test output; that integral
+     alone is integrated on a second rule while every other integral (stiffness, sources,
+     reactions) keeps the barycenter rule bitwise with the single-model default: **consistent**
+     = the degree-2 rule (`PreparedElement::linear_simplex_with_degree(d, 2)`, exact for
+     `phi_i phi_j`, the closed-form `|K| (1 + delta_ij) / ((d + 1)(d + 2))`); **lumped** = the
+     vertex rule (points at the `d + 1` vertices, weights `|K| / (d + 1)`), exact for degree
+     1, whose `phi_i(v_k) = delta_ik` gives the diagonal `|K| / (d + 1)` lumped mass through
+     the same point kernels -- both are quadrature rules, so no lumping code path is needed.
+     Shape: additive, `SystemQuadrature::BarycenterWithMass { mass: P1Mass::{Consistent,
+     Lumped} }` beside `Barycenter` (`Richest` unchanged). Mechanism and cost: the "every
+     Lagrange field's basis is tabulated at the same shared quadrature points" invariant
+     becomes per-integral (`SystemOperator::quadrature` gains a `quadrature_for(residual,
+     integral)`), the stored tables of the mass integral (`SystemExternalInput`,
+     `ExternalInput::from_coefficient_at`) sample on that integral's rule, the plan digest
+     `finitum-system-realization/2` records the per-integral rule and therefore moves to `/3`
+     for the new variant only (`Barycenter` and `Richest` digests unchanged); the parity gate
+     (bitwise with the single model) holds for `Barycenter` proper and, for the stiffness
+     alone, for the new variant; tests: consistent and lumped P1 mass against the closed
+     forms, stiffness bitwise with `Barycenter`, and the 08-style DAE's differential rows
+     regular under consistent initialization (Krasis) -- about one lane-day.
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.

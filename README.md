@@ -61,9 +61,10 @@ implementation contains:
   `FinitumError::code()` returns the producer's code. Stored-table builders have `try_sampled`
   / `try_sampled_at(time)` forms that refuse at construction with a `Table` origin, and
   `FieldSource::fallible(|x, t| ..)` with the `_at(time)` forms of `external_inputs_from` and
-  both essential-constraint samplers stop transient data being frozen at `t = 0`. The
-  infallible constructors are thin wrappers, scheduled for deletion (slice F3) once Sinbad has
-  migrated.
+  both essential-constraint samplers stop transient data being frozen at `t = 0`. Finitum's
+  own bound `Kernel` / `Table` sources refuse typed at a runtime point
+  (`REALIZATION_PROPERTY_UNAVAILABLE`) instead of a NaN placeholder or a panic. The infallible
+  constructors are thin wrappers, scheduled for deletion (slice F3) once Sinbad has migrated.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference

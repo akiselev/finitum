@@ -27,11 +27,11 @@ use finitum::{
     AffineConstraint, BlockLayout, Cell, CellId, ConstraintSet, DofId, DofMap,
     DynamicExternalInput, ElementRestriction, ExternalInput, FieldSource, FinitumError,
     InputEvaluationError, InputLocation, InputOrigin, Mesh, MeshProfile, PointEvaluation,
-    PreparedElement, QuadratureView, RealizationPlan, ReducedSystemOperator, RegionMap,
-    RegionTagId, SysResId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
-    SystemExternalInput, SystemOperator, SystemQuadrature, SystemRealizationPlan, TaggedMesh,
-    VertexId, cell_centroid, check_realization_agreement, essential_constraints_from,
-    essential_constraints_from_at, essential_constraints_from_system,
+    PreparedElement, QuadratureView, REALIZATION_PROPERTY_UNAVAILABLE, RealizationPlan,
+    ReducedSystemOperator, RegionMap, RegionTagId, SysResId, SystemConstitutiveInput,
+    SystemEssentialConstraintRequirement, SystemExternalInput, SystemOperator, SystemQuadrature,
+    SystemRealizationPlan, TaggedMesh, VertexId, cell_centroid, check_realization_agreement,
+    essential_constraints_from, essential_constraints_from_at, essential_constraints_from_system,
     essential_constraints_from_system_at, external_inputs_from, external_inputs_from_at, realize,
     system_constitutive_from_sources, vector_nodal_dof_map,
 };
@@ -40,10 +40,11 @@ use methodus::{
     LinearOperator, NewtonConfig, NumericError, SolveError, bdf_step,
 };
 use quantitas::UnitRegistry;
+use scientia::scientific::{Interpolation, OutOfValidityPolicy, TableAxis};
 use scientia::{
-    DerivativeEvaluation, InputSourceRequirement, OperatorSystem, SemanticModel, SymbolId,
-    TensorInputRole, compile_operator_system, compile_semantics, derive_variational_form,
-    factor_operator, infer_form_requirements, lower_operator_kernels,
+    DerivativeEvaluation, InputSourceRequirement, OperatorSystem, PropertyTable, SemanticModel,
+    SymbolId, TableDerivativePolicy, TensorInputRole, compile_operator_system, compile_semantics,
+    derive_variational_form, factor_operator, infer_form_requirements, lower_operator_kernels,
 };
 
 const TRANSIENT_NONLINEAR: &str = r#"
@@ -1396,4 +1397,136 @@ fn fallible_field_sources_feed_time_sampled_tables_and_runtime_time_constitutive
     assert_eq!(failure.cell(), Some(expected_cell));
     assert!(close(failure.point().unwrap(), &expected_point));
     assert_eq!(failure.time(), Some(0.7));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Finitum's own bound property sources.
+// ---------------------------------------------------------------------------------------------
+
+/// A linear table over `axis` on `[0, 1]` that refuses outside its range.
+fn unit_table(axis: &str) -> FieldSource {
+    FieldSource::table(PropertyTable {
+        axes: vec![TableAxis {
+            name: axis.into(),
+            points: vec![0.0, 1.0],
+        }],
+        values: vec![1.0, 2.0],
+        interpolation: Interpolation::Linear,
+        derivative_policy: TableDerivativePolicy::PiecewiseConstantSlope,
+        out_of_range: OutOfValidityPolicy::Error,
+    })
+    .unwrap()
+}
+
+#[test]
+fn finitum_s_own_bound_property_table_refuses_typed_at_runtime_instead_of_nan_or_a_panic() {
+    // System path: `ka` tabulated over `b` on [0, 1]; a state with b = 5 leaves the table.
+    let compiled = compile_coupled();
+    let tagged = unit_square(3);
+    let m = &compiled.model;
+    let sources = vec![
+        (symbol(m, "ka"), unit_table("b")),
+        (symbol(m, "kb"), FieldSource::constant([1.0])),
+        (symbol(m, "ca"), FieldSource::constant([1.0])),
+        (symbol(m, "fa"), FieldSource::constant([1.0])),
+        (symbol(m, "fb"), FieldSource::constant([0.5])),
+    ];
+    let constitutive = system_constitutive_from_sources(&compiled.system, m, &sources).unwrap();
+    let (operator, _) = coupled_operators(&compiled, &tagged, constitutive);
+    let dimension = operator.dimension();
+    let b_block = operator.layout().block(symbol(m, "b")).unwrap().offset;
+    let vertex_count = tagged.mesh.vertices().len();
+    let mut state = vec![0.0; dimension];
+    let rate = vec![0.0; dimension];
+    let mut output = vec![0.0; dimension];
+    for vertex in 0..vertex_count {
+        state[b_block + vertex] = 0.5;
+    }
+    operator.residual(0.1, &state, &rate, &mut output).unwrap();
+    for vertex in 0..vertex_count {
+        state[b_block + vertex] = 5.0;
+    }
+    let error = operator
+        .residual(0.1, &state, &rate, &mut output)
+        .unwrap_err();
+    let FinitumError::InputEvaluation(failure) = &error else {
+        panic!("expected a typed input failure, got {error}");
+    };
+    assert_eq!(failure.code, REALIZATION_PROPERTY_UNAVAILABLE);
+    let InputOrigin::ExpressionPath(path) = &failure.origin else {
+        panic!(
+            "expected an expression-path origin, got {:?}",
+            failure.origin
+        );
+    };
+    assert!(
+        path.starts_with("Coupled.ea[") && path.ends_with("].ka"),
+        "{path}"
+    );
+    assert_eq!(failure.cell(), Some(CellId(0)));
+    assert_eq!(failure.time(), Some(0.1));
+    assert_eq!(error.code(), Some(REALIZATION_PROPERTY_UNAVAILABLE));
+    assert!(!error.to_string().contains("non-finite"), "{error}");
+    let direction = probe_vector(dimension, 1.1, 1.0);
+    let error = operator
+        .jacobian_vector_product(0.1, &state, &rate, &direction, &rate, &mut output)
+        .unwrap_err();
+    assert_eq!(error.code(), Some(REALIZATION_PROPERTY_UNAVAILABLE));
+
+    // Single-model path: `k` tabulated over `u`; the dynamic binding used to panic here.
+    let compilation =
+        compile_semantics(TRANSIENT_NONLINEAR, &UnitRegistry::si_bootstrap()).unwrap();
+    let model = &compilation.semantic.models[0];
+    let form =
+        derive_variational_form(&compilation.semantic, "TransientNonlinear", "evolution").unwrap();
+    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let kernels = lower_operator_kernels(&factorization).unwrap();
+    let (mesh, dofs, constraints) = square_discretization(2);
+    let element = PreparedElement::linear_simplex(2).unwrap();
+    let sources = vec![
+        (symbol(model, "capacity"), FieldSource::constant([1.0])),
+        (symbol(model, "k"), unit_table("u")),
+        (symbol(model, "f"), FieldSource::constant([0.0])),
+    ];
+    let (stored, dynamic) =
+        external_inputs_from(&factorization, model, &mesh, &element, &sources).unwrap();
+    assert_eq!(dynamic.len(), 1);
+    let plan = RealizationPlan::new_stateful(
+        requirements,
+        factorization,
+        kernels,
+        mesh,
+        element,
+        dofs,
+        constraints,
+        stored,
+        dynamic,
+    )
+    .unwrap();
+    let dimension = plan.dimension();
+    let rate = vec![0.0; dimension];
+    let mut output = vec![0.0; dimension];
+    plan.residual(0.2, &vec![0.5; dimension], &rate, &mut output)
+        .unwrap();
+    let error = plan
+        .residual(0.2, &vec![5.0; dimension], &rate, &mut output)
+        .unwrap_err();
+    let FinitumError::InputEvaluation(failure) = &error else {
+        panic!("expected a typed input failure, got {error}");
+    };
+    assert_eq!(failure.code, REALIZATION_PROPERTY_UNAVAILABLE);
+    let InputOrigin::ExpressionPath(path) = &failure.origin else {
+        panic!(
+            "expected an expression-path origin, got {:?}",
+            failure.origin
+        );
+    };
+    assert!(
+        path.starts_with("TransientNonlinear[") && path.ends_with("].k"),
+        "{path}"
+    );
+    assert_eq!(failure.cell(), Some(CellId(0)));
+    assert_eq!(failure.time(), Some(0.2));
+    assert!(!error.to_string().contains("non-finite"), "{error}");
 }

@@ -72,9 +72,9 @@ pub use realization::{
     DistributedCoefficient, DynamicExternalInput, ExternalInput, ExternalSensitivityInput,
     GeometryParameterSensitivity, LinearizedOperator, MatrixFreeOperator, PointActiveInput,
     PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
-    RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
-    RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from,
-    external_inputs_from_at,
+    REALIZATION_PROPERTY_UNAVAILABLE, RealizationArtifact, RealizationCapability,
+    RealizationExternalInput, RealizationPlan, RealizationReceipt, RepresentationKind,
+    SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from, external_inputs_from_at,
 };
 pub use sampler::{
     ExteriorFacet, FIELD_SAMPLER_SCHEMA, FacetTrace, FieldSample, FieldSampler,

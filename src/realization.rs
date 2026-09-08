@@ -191,6 +191,92 @@ pub(crate) fn locate_failure(
         .into()
 }
 
+/// The refusal code of a bound property source ([`FieldSource::Kernel`] / [`FieldSource::Table`])
+/// whose value cannot be evaluated at a runtime point: a table axis point outside its range, a
+/// kernel execution failure, an evaluation point without the active input's value. Carried in
+/// an [`InputEvaluationError`] whose origin is the expression path
+/// `<model>[.<equation>][<integral>].<symbol>`, never as a non-finite placeholder (W8 lane F2).
+pub const REALIZATION_PROPERTY_UNAVAILABLE: &str = "REALIZATION_PROPERTY_UNAVAILABLE";
+
+/// The typed failure of one of Finitum's own bound property closures at a runtime point.
+pub(crate) fn property_unavailable(origin: &str, error: FinitumError) -> InputEvaluationError {
+    InputEvaluationError::new(
+        REALIZATION_PROPERTY_UNAVAILABLE,
+        crate::InputOrigin::ExpressionPath(origin.to_owned()),
+        error.to_string(),
+    )
+}
+
+/// The typed failure of a bound property whose tangent for `input` is not available at a
+/// runtime point (the build-time check admitted the tangent; the kernel declined here).
+pub(crate) fn tangent_unavailable(origin: &str, input: &str) -> InputEvaluationError {
+    InputEvaluationError::new(
+        "REALIZATION_TANGENT_UNAVAILABLE",
+        crate::InputOrigin::ExpressionPath(origin.to_owned()),
+        format!(
+            "the bound property has no tangent for its state-dependent input {input:?} at this \
+             point"
+        ),
+    )
+}
+
+/// The active input's values at `point` by identity, or the typed failure of a point that does
+/// not carry them.
+pub(crate) fn active_values<'a>(
+    origin: &str,
+    point: &'a PointEvaluation,
+    input: TensorInputId,
+) -> Result<&'a [f64], InputEvaluationError> {
+    point.input_values(input).ok_or_else(|| {
+        InputEvaluationError::new(
+            REALIZATION_PROPERTY_UNAVAILABLE,
+            crate::InputOrigin::ExpressionPath(origin.to_owned()),
+            format!("the evaluation point carries no value for active input {input:?}"),
+        )
+    })
+}
+
+/// As [`active_values`], by evaluation kind (the single-model path's binding).
+fn active_values_of<'a>(
+    origin: &str,
+    point: &'a PointEvaluation,
+    derivative: DerivativeEvaluation,
+) -> Result<&'a [f64], InputEvaluationError> {
+    point.values(derivative).ok_or_else(|| {
+        InputEvaluationError::new(
+            REALIZATION_PROPERTY_UNAVAILABLE,
+            crate::InputOrigin::ExpressionPath(origin.to_owned()),
+            format!("the evaluation point carries no {derivative:?} active input"),
+        )
+    })
+}
+
+/// A property table's axis point from the named inputs, or the typed failure of an axis that
+/// is neither a coordinate/time name nor the bound active input.
+pub(crate) fn table_axis_point(
+    origin: &str,
+    table: &scientia::PropertyTable,
+    named: &BTreeMap<String, f64>,
+) -> Result<Vec<f64>, InputEvaluationError> {
+    table
+        .axes
+        .iter()
+        .map(|axis| {
+            named.get(&axis.name).copied().ok_or_else(|| {
+                InputEvaluationError::new(
+                    REALIZATION_PROPERTY_UNAVAILABLE,
+                    crate::InputOrigin::ExpressionPath(origin.to_owned()),
+                    format!(
+                        "property table axis {:?} is neither a coordinate/time name nor the \
+                         bound active input",
+                        axis.name
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 /// A non-basis QFunction input evaluated from the current point state.
 ///
 /// The callbacks are supplied by the consuming product or material implementation. Finitum
@@ -770,6 +856,12 @@ pub fn external_inputs_from_at(
                 ))
             })?;
             let components = component_count(&input.shape)?;
+            let origin = format!(
+                "{}[{}].{}",
+                model.name,
+                integral.integral_index,
+                model.symbols[symbol.index()].name
+            );
             match source {
                 FieldSource::Kernel { kernel, executable } => {
                     let state_names = kernel
@@ -831,30 +923,26 @@ pub fn external_inputs_from_at(
                     let direction_kernel = kernel.clone();
                     let direction_executable = executable.clone();
                     let direction_active_name = active_name.clone();
-                    dynamic.push(DynamicExternalInput::new(
+                    let value_origin = origin.clone();
+                    let direction_origin = origin.clone();
+                    dynamic.push(DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         identity,
                         move |point: &PointEvaluation| {
                             let mut named = named_coordinate_inputs(&point.coordinates, point.time);
-                            let active_value = point
-                                .values(active_derivative)
-                                .expect("active input was declared on this integral")[0];
+                            let active_value =
+                                active_values_of(&value_origin, point, active_derivative)?[0];
                             named.insert(value_active_name.clone(), active_value);
-                            vec![
-                                evaluate_kernel_value(&value_kernel, &value_executable, &named)
-                                    .expect(
-                                        "kernel value was validated at external_inputs_from build time",
-                                    ),
-                            ]
+                            evaluate_kernel_value(&value_kernel, &value_executable, &named)
+                                .map(|value| vec![value])
+                                .map_err(|error| property_unavailable(&value_origin, error))
                         },
                         move |point: &PointEvaluation, direction: &PointEvaluation| {
-                            let mut named =
-                                named_coordinate_inputs(&point.coordinates, point.time);
-                            let active_value = point
-                                .values(active_derivative)
-                                .expect("active input was declared on this integral")[0];
+                            let mut named = named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value =
+                                active_values_of(&direction_origin, point, active_derivative)?[0];
                             named.insert(direction_active_name.clone(), active_value);
                             let partial = evaluate_kernel_partial(
                                 &direction_kernel,
@@ -862,12 +950,14 @@ pub fn external_inputs_from_at(
                                 &named,
                                 &direction_active_name,
                             )
-                            .expect("kernel tangent was validated at external_inputs_from build time")
-                            .expect("kernel tangent availability was validated at build time");
-                            let active_direction = direction
-                                .values(active_derivative)
-                                .expect("active direction was declared on this integral")[0];
-                            vec![partial * active_direction]
+                            .map_err(|error| property_unavailable(&direction_origin, error))?
+                            .ok_or_else(|| {
+                                tangent_unavailable(&direction_origin, &direction_active_name)
+                            })?;
+                            let active_direction =
+                                active_values_of(&direction_origin, direction, active_derivative)?
+                                    [0];
+                            Ok(vec![partial * active_direction])
                         },
                     )?);
                 }
@@ -943,47 +1033,34 @@ pub fn external_inputs_from_at(
                     let value_active_name = active_name.clone();
                     let slope_table = table.clone();
                     let slope_active_name = active_name.clone();
-                    dynamic.push(DynamicExternalInput::new(
+                    let value_origin = origin.clone();
+                    let slope_origin = origin.clone();
+                    dynamic.push(DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         identity,
                         move |point: &PointEvaluation| {
-                            let mut named =
-                                named_coordinate_inputs(&point.coordinates, point.time);
-                            let active_value = point
-                                .values(active_derivative)
-                                .expect("active input was declared on this integral")[0];
+                            let mut named = named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value =
+                                active_values_of(&value_origin, point, active_derivative)?[0];
                             named.insert(value_active_name.clone(), active_value);
-                            let axis_point = value_table
-                                .axes
-                                .iter()
-                                .map(|axis| named[&axis.name])
-                                .collect::<Vec<_>>();
-                            vec![evaluate_table_value(&value_table, &axis_point).expect(
-                                "table axis point was validated at external_inputs_from build time",
-                            )]
+                            let axis_point = table_axis_point(&value_origin, &value_table, &named)?;
+                            evaluate_table_value(&value_table, &axis_point)
+                                .map(|value| vec![value])
+                                .map_err(|error| property_unavailable(&value_origin, error))
                         },
                         move |point: &PointEvaluation, direction: &PointEvaluation| {
-                            let mut named =
-                                named_coordinate_inputs(&point.coordinates, point.time);
-                            let active_value = point
-                                .values(active_derivative)
-                                .expect("active input was declared on this integral")[0];
+                            let mut named = named_coordinate_inputs(&point.coordinates, point.time);
+                            let active_value =
+                                active_values_of(&slope_origin, point, active_derivative)?[0];
                             named.insert(slope_active_name.clone(), active_value);
-                            let axis_point = slope_table
-                                .axes
-                                .iter()
-                                .map(|axis| named[&axis.name])
-                                .collect::<Vec<_>>();
+                            let axis_point = table_axis_point(&slope_origin, &slope_table, &named)?;
                             let slope = evaluate_table_slope(&slope_table, &axis_point, axis_index)
-                                .expect(
-                                    "table axis point was validated at external_inputs_from build time",
-                                );
-                            let active_direction = direction
-                                .values(active_derivative)
-                                .expect("active direction was declared on this integral")[0];
-                            vec![slope * active_direction]
+                                .map_err(|error| property_unavailable(&slope_origin, error))?;
+                            let active_direction =
+                                active_values_of(&slope_origin, direction, active_derivative)?[0];
+                            Ok(vec![slope * active_direction])
                         },
                     )?);
                 }

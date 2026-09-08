@@ -18,10 +18,11 @@ use crate::realization::{
     BoundBundle, CapabilityElement, CellGeometry, ConstraintKind, DerivativeProduct,
     DistributedCoefficient, ExternalInput, FacetGeometry, PointActiveInput, PointEvaluation,
     RealizationCapability, RealizationExternalInput, RealizationReceipt, RepresentationKind,
-    active_probe_inputs, apply_basis_adjoint, bind_kernels, build_capability, component_count,
-    evaluate_basis_input, execute_jvp_values, execute_parameter_jvp_values, execute_primal_values,
-    execute_vjp_values, gather_test_adjoint, locate_failure, point_parameter_cotangents,
-    probe_direction_evaluation, transpose_scatter_shape, validate_finite,
+    active_probe_inputs, active_values, apply_basis_adjoint, bind_kernels, build_capability,
+    component_count, evaluate_basis_input, execute_jvp_values, execute_parameter_jvp_values,
+    execute_primal_values, execute_vjp_values, gather_test_adjoint, locate_failure,
+    point_parameter_cotangents, probe_direction_evaluation, property_unavailable, table_axis_point,
+    tangent_unavailable, transpose_scatter_shape, validate_finite,
 };
 use crate::space::{
     DofMap, ElementRestriction, cell_constant_dof_map, quadratic_simplex_dof_map,
@@ -4680,6 +4681,13 @@ pub fn system_constitutive_from_sources(
                     ))
                 })?;
                 let components = component_count(&input.shape)?;
+                let origin = format!(
+                    "{}.{}[{}].{}",
+                    model.name,
+                    block.equation,
+                    integral.integral_index,
+                    model.symbols[symbol.index()].name
+                );
                 let built = match source {
                     FieldSource::Kernel { kernel, executable } => {
                         let names = kernel
@@ -4698,7 +4706,8 @@ pub fn system_constitutive_from_sources(
                                 }
                                 let kernel = kernel.clone();
                                 let executable = executable.clone();
-                                SystemConstitutiveInput::new(
+                                let origin = origin.clone();
+                                SystemConstitutiveInput::try_new(
                                     block.equation.clone(),
                                     integral.integral_index,
                                     input.id,
@@ -4710,12 +4719,11 @@ pub fn system_constitutive_from_sources(
                                     move |point: &PointEvaluation| {
                                         let named =
                                             named_coordinate_inputs(&point.coordinates, point.time);
-                                        vec![
-                                            evaluate_kernel_value(&kernel, &executable, &named)
-                                                .unwrap_or(f64::NAN),
-                                        ]
+                                        evaluate_kernel_value(&kernel, &executable, &named)
+                                            .map(|value| vec![value])
+                                            .map_err(|error| property_unavailable(&origin, error))
                                     },
-                                    |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                                    |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                                 )?
                             }
                             Some((name, active_id)) => {
@@ -4741,7 +4749,9 @@ pub fn system_constitutive_from_sources(
                                 let direction_kernel = kernel.clone();
                                 let direction_executable = executable.clone();
                                 let direction_name = name.clone();
-                                SystemConstitutiveInput::new(
+                                let value_origin = origin.clone();
+                                let direction_origin = origin.clone();
+                                SystemConstitutiveInput::try_new(
                                     block.equation.clone(),
                                     integral.integral_index,
                                     input.id,
@@ -4753,41 +4763,38 @@ pub fn system_constitutive_from_sources(
                                     move |point: &PointEvaluation| {
                                         let mut named =
                                             named_coordinate_inputs(&point.coordinates, point.time);
-                                        let Some(active) = point.input_values(active_id) else {
-                                            return vec![f64::NAN];
-                                        };
+                                        let active =
+                                            active_values(&value_origin, point, active_id)?;
                                         named.insert(value_name.clone(), active[0]);
-                                        vec![
-                                            evaluate_kernel_value(
-                                                &value_kernel,
-                                                &value_executable,
-                                                &named,
-                                            )
-                                            .unwrap_or(f64::NAN),
-                                        ]
+                                        evaluate_kernel_value(
+                                            &value_kernel,
+                                            &value_executable,
+                                            &named,
+                                        )
+                                        .map(|value| vec![value])
+                                        .map_err(|error| property_unavailable(&value_origin, error))
                                     },
                                     move |point: &PointEvaluation, direction: &PointEvaluation| {
                                         let mut named =
                                             named_coordinate_inputs(&point.coordinates, point.time);
-                                        let (Some(active), Some(active_direction)) = (
-                                            point.input_values(active_id),
-                                            direction.input_values(active_id),
-                                        ) else {
-                                            return vec![f64::NAN];
-                                        };
+                                        let active =
+                                            active_values(&direction_origin, point, active_id)?;
+                                        let active_direction =
+                                            active_values(&direction_origin, direction, active_id)?;
                                         named.insert(direction_name.clone(), active[0]);
                                         let partial = evaluate_kernel_partial(
                                             &direction_kernel,
                                             &direction_executable,
                                             &named,
                                             &direction_name,
-                                        );
-                                        match partial {
-                                            Ok(Some(partial)) => {
-                                                vec![partial * active_direction[0]]
-                                            }
-                                            _ => vec![f64::NAN],
-                                        }
+                                        )
+                                        .map_err(|error| {
+                                            property_unavailable(&direction_origin, error)
+                                        })?
+                                        .ok_or_else(|| {
+                                            tangent_unavailable(&direction_origin, &direction_name)
+                                        })?;
+                                        Ok(vec![partial * active_direction[0]])
                                     },
                                 )?
                             }
@@ -4813,7 +4820,8 @@ pub fn system_constitutive_from_sources(
                         match resolve_state_dependence(model, &active_inputs, &names)? {
                             None => {
                                 let table = table.clone();
-                                SystemConstitutiveInput::new(
+                                let origin = origin.clone();
+                                SystemConstitutiveInput::try_new(
                                     block.equation.clone(),
                                     integral.integral_index,
                                     input.id,
@@ -4822,20 +4830,12 @@ pub fn system_constitutive_from_sources(
                                     move |point: &PointEvaluation| {
                                         let named =
                                             named_coordinate_inputs(&point.coordinates, point.time);
-                                        let axis_point = table
-                                            .axes
-                                            .iter()
-                                            .map(|axis| named.get(&axis.name).copied())
-                                            .collect::<Option<Vec<_>>>();
-                                        vec![
-                                            axis_point
-                                                .and_then(|point| {
-                                                    evaluate_table_value(&table, &point).ok()
-                                                })
-                                                .unwrap_or(f64::NAN),
-                                        ]
+                                        let axis_point = table_axis_point(&origin, &table, &named)?;
+                                        evaluate_table_value(&table, &axis_point)
+                                            .map(|value| vec![value])
+                                            .map_err(|error| property_unavailable(&origin, error))
                                     },
-                                    |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                                    |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                                 )?
                             }
                             Some((name, active_id)) => {
@@ -4857,7 +4857,9 @@ pub fn system_constitutive_from_sources(
                                 let value_name = name.clone();
                                 let slope_table = table.clone();
                                 let slope_name = name.clone();
-                                SystemConstitutiveInput::new(
+                                let value_origin = origin.clone();
+                                let slope_origin = origin.clone();
+                                SystemConstitutiveInput::try_new(
                                     block.equation.clone(),
                                     integral.integral_index,
                                     input.id,
@@ -4866,52 +4868,36 @@ pub fn system_constitutive_from_sources(
                                     move |point: &PointEvaluation| {
                                         let mut named =
                                             named_coordinate_inputs(&point.coordinates, point.time);
-                                        let Some(active) = point.input_values(active_id) else {
-                                            return vec![f64::NAN];
-                                        };
+                                        let active =
+                                            active_values(&value_origin, point, active_id)?;
                                         named.insert(value_name.clone(), active[0]);
-                                        let axis_point = value_table
-                                            .axes
-                                            .iter()
-                                            .map(|axis| named.get(&axis.name).copied())
-                                            .collect::<Option<Vec<_>>>();
-                                        vec![
-                                            axis_point
-                                                .and_then(|point| {
-                                                    evaluate_table_value(&value_table, &point).ok()
-                                                })
-                                                .unwrap_or(f64::NAN),
-                                        ]
+                                        let axis_point =
+                                            table_axis_point(&value_origin, &value_table, &named)?;
+                                        evaluate_table_value(&value_table, &axis_point)
+                                            .map(|value| vec![value])
+                                            .map_err(|error| {
+                                                property_unavailable(&value_origin, error)
+                                            })
                                     },
                                     move |point: &PointEvaluation, direction: &PointEvaluation| {
                                         let mut named =
                                             named_coordinate_inputs(&point.coordinates, point.time);
-                                        let (Some(active), Some(active_direction)) = (
-                                            point.input_values(active_id),
-                                            direction.input_values(active_id),
-                                        ) else {
-                                            return vec![f64::NAN];
-                                        };
+                                        let active =
+                                            active_values(&slope_origin, point, active_id)?;
+                                        let active_direction =
+                                            active_values(&slope_origin, direction, active_id)?;
                                         named.insert(slope_name.clone(), active[0]);
-                                        let axis_point = slope_table
-                                            .axes
-                                            .iter()
-                                            .map(|axis| named.get(&axis.name).copied())
-                                            .collect::<Option<Vec<_>>>();
-                                        vec![
-                                            axis_point
-                                                .and_then(|point| {
-                                                    evaluate_table_slope(
-                                                        &slope_table,
-                                                        &point,
-                                                        axis_index,
-                                                    )
-                                                    .ok()
-                                                })
-                                                .map_or(f64::NAN, |slope| {
-                                                    slope * active_direction[0]
-                                                }),
-                                        ]
+                                        let axis_point =
+                                            table_axis_point(&slope_origin, &slope_table, &named)?;
+                                        let slope = evaluate_table_slope(
+                                            &slope_table,
+                                            &axis_point,
+                                            axis_index,
+                                        )
+                                        .map_err(|error| {
+                                            property_unavailable(&slope_origin, error)
+                                        })?;
+                                        Ok(vec![slope * active_direction[0]])
                                     },
                                 )?
                             }
