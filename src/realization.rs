@@ -142,6 +142,19 @@ pub struct PointActiveInput {
     pub values: Vec<f64>,
 }
 
+/// One bound input of the evaluation point's instance on a composed plan (W8 lane F-MI,
+/// `sinbad/ARCHITECTURE.md` §6): the producer output's value at this point on a same-mesh
+/// `bind`, keyed by the consumer's local input-field symbol and the consumer slot it closes.
+/// In a direction evaluation, `values` is the output's directional derivative along the
+/// direction (its tangent to the producer's fields), so a consumer law such as `sigma(T)`
+/// chains it exactly as it chains an active input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointBoundInput {
+    pub symbol: SymbolId,
+    pub slot: String,
+    pub values: Vec<f64>,
+}
+
 /// Runtime point data supplied to a state-dependent external input.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointEvaluation {
@@ -149,9 +162,27 @@ pub struct PointEvaluation {
     pub cell: CellId,
     pub coordinates: Vec<f64>,
     pub active: Vec<PointActiveInput>,
+    /// The instance's bound inputs at this point (empty on every one-instance realization).
+    pub bound: Vec<PointBoundInput>,
 }
 
 impl PointEvaluation {
+    /// The bound input closing the consumer's input field `symbol`, by identity (W8 F-MI).
+    pub fn bound_values(&self, symbol: SymbolId) -> Option<&[f64]> {
+        self.bound
+            .iter()
+            .find(|input| input.symbol == symbol)
+            .map(|input| input.values.as_slice())
+    }
+
+    /// The bound input closing the consumer `slot` (`<instance>/input/<name>`).
+    pub fn bound_slot_values(&self, slot: &str) -> Option<&[f64]> {
+        self.bound
+            .iter()
+            .find(|input| input.slot == slot)
+            .map(|input| input.values.as_slice())
+    }
+
     /// Return the first active binding with the requested evaluation kind.
     pub fn values(&self, derivative: DerivativeEvaluation) -> Option<&[f64]> {
         self.active
@@ -3200,6 +3231,7 @@ impl RealizationPlan {
             cell: geometry.cell,
             coordinates: geometry.physical_centroid.clone(),
             active,
+            bound: Vec::new(),
         };
         for input in &integral.primal.inputs {
             if input.source == InputSourceRequirement::Basis {
@@ -3257,6 +3289,7 @@ impl RealizationPlan {
             cell: geometry.cell,
             coordinates: evaluation.coordinates.clone(),
             active,
+            bound: Vec::new(),
         };
         for input in &integral.primal.inputs {
             if input.source == InputSourceRequirement::Basis {
@@ -3458,6 +3491,7 @@ impl RealizationPlan {
             coordinates: geometry
                 .physical_point(&self.data.element.quadrature()[point].coordinates),
             active,
+            bound: Vec::new(),
         };
         for input in &integral.primal.inputs {
             if input.source == InputSourceRequirement::Basis {
@@ -3515,6 +3549,7 @@ impl RealizationPlan {
             cell: CellId(cell),
             coordinates: evaluation.coordinates.clone(),
             active,
+            bound: Vec::new(),
         };
         for input in &integral.primal.inputs {
             if input.source == InputSourceRequirement::Basis {
@@ -4160,6 +4195,7 @@ pub(crate) fn probe_direction_evaluation(
         cell: evaluation.cell,
         coordinates: evaluation.coordinates.clone(),
         active,
+        bound: Vec::new(),
     })
 }
 

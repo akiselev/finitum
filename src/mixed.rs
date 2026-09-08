@@ -23,6 +23,7 @@ use crate::element::{simplex_basis, simplex_basis_count, simplex_quadrature};
 use crate::mapping::AffineMap;
 use crate::mesh::{CellId, Mesh};
 use crate::space::{DofId, DofMap, quadratic_simplex_dof_map, vector_nodal_dof_map};
+use crate::system_ids::SysVarId;
 use crate::{AffineConstraint, ConstraintSet, FinitumError, QuadraturePoint};
 use methodus::{
     BlockLinearOperator, ConstantModeProjector, CsrMatrix, EvaluationContext, LinearOperator,
@@ -215,30 +216,66 @@ pub fn essential_constraints_for_blocks(
     layout: &BlockLayout,
     values: impl IntoIterator<Item = BlockEssentialValue>,
 ) -> Result<ConstraintSet, FinitumError> {
+    let keyed = values
+        .into_iter()
+        .map(|value| {
+            let block = layout.block(value.block).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "essential value names block {} which is absent from the layout",
+                    value.block
+                ))
+            })?;
+            Ok(BlockVariableEssentialValue {
+                variable: block.variable,
+                entity: value.entity,
+                component: value.component,
+                value: value.value,
+            })
+        })
+        .collect::<Result<Vec<_>, FinitumError>>()?;
+    essential_constraints_for_variables(layout, keyed)
+}
+
+/// [`BlockEssentialValue`] keyed by system variable (W8 lane F-MI): unambiguous on a
+/// composed layout where several instances share a per-model symbol.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockVariableEssentialValue {
+    pub variable: SysVarId,
+    pub entity: usize,
+    pub component: usize,
+    pub value: f64,
+}
+
+/// [`essential_constraints_for_blocks`] over variable-keyed values.
+pub fn essential_constraints_for_variables(
+    layout: &BlockLayout,
+    values: impl IntoIterator<Item = BlockVariableEssentialValue>,
+) -> Result<ConstraintSet, FinitumError> {
     let mut constraints = Vec::new();
     for value in values {
-        let block = layout.block(value.block).ok_or_else(|| {
+        let block = layout.block_by_variable(value.variable).ok_or_else(|| {
             FinitumError::InvalidRealization(format!(
                 "essential value names block {} which is absent from the layout",
-                value.block
+                value.variable
             ))
         })?;
+        let name = block.symbol;
         if value.entity >= block.entity_count {
             return Err(FinitumError::InvalidRealization(format!(
                 "essential value entity {} is outside block {}'s {} entities",
-                value.entity, value.block, block.entity_count
+                value.entity, name, block.entity_count
             )));
         }
         if value.component >= block.component_count {
             return Err(FinitumError::InvalidRealization(format!(
                 "essential value component {} is outside block {}'s {} components",
-                value.component, value.block, block.component_count
+                value.component, name, block.component_count
             )));
         }
         if !value.value.is_finite() {
             return Err(FinitumError::InvalidRealization(format!(
                 "essential value for block {} entity {} component {} is not finite",
-                value.block, value.entity, value.component
+                name, value.entity, value.component
             )));
         }
         let target = DofId(block.offset + value.entity * block.component_count + value.component);

@@ -65,6 +65,14 @@ implementation contains:
   own bound `Kernel` / `Table` sources refuse typed at a runtime point
   (`REALIZATION_PROPERTY_UNAVAILABLE`) instead of a NaN placeholder or a panic. The infallible
   constructors are thin wrappers, scheduled for deletion (slice F3) once Sinbad has migrated.
+- a multi-instance `SystemRealizationPlan::composed` (W8 lane F-MI) over Scientia's
+  `scientia-operator-system/2`: rows keyed by `SysResId`, fields by `SysVarId` (two instances of
+  one model realize as distinct blocks), same-mesh `bind` chains realized at bind time -- the
+  producer output kernel feeds a consumer operand through the Malleus `BindComposition`
+  (kernel-input path) or reaches the consumer's closures as `PointEvaluation::bound`
+  (provider-input path) -- with the cross blocks by the chain rule of local point kernels (JVP
+  and exact VJP), keyed essential constraints, and a `finitum-system-realization/3` identity;
+  one-instance plans and their digests are unchanged. Cross-mesh binds remain Krasis's.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference

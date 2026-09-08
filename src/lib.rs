@@ -53,9 +53,10 @@ pub use method::{
     ParticleRealization, RadialPairPolynomial,
 };
 pub use mixed::{
-    BlockCoupling, BlockEssentialValue, BlockNullspaceCandidate, BlockNullspaceMode, CouplingKind,
-    FieldSpec, MixedOperator, MixedSpace, NullspaceModeKind, ReducedMixedOperator,
-    essential_constraints_for_blocks,
+    BlockCoupling, BlockEssentialValue, BlockNullspaceCandidate, BlockNullspaceMode,
+    BlockVariableEssentialValue, CouplingKind, FieldSpec, MixedOperator, MixedSpace,
+    NullspaceModeKind, ReducedMixedOperator, essential_constraints_for_blocks,
+    essential_constraints_for_variables,
 };
 pub use optimized::{
     AcceleratorLayout, CellBatchLayout, ElementAssemblyOperator, PartialAssemblyOperator,
@@ -71,7 +72,7 @@ pub use realization::{
     AssembledOperator, CapabilityElement, CoefficientLayout, ConstraintKind, DerivativeProduct,
     DistributedCoefficient, DynamicExternalInput, ExternalInput, ExternalSensitivityInput,
     GeometryParameterSensitivity, LinearizedOperator, MatrixFreeOperator, PointActiveInput,
-    PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
+    PointBoundInput, PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
     REALIZATION_PROPERTY_UNAVAILABLE, RealizationArtifact, RealizationCapability,
     RealizationExternalInput, RealizationPlan, RealizationReceipt, RepresentationKind,
     SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from, external_inputs_from_at,
@@ -87,13 +88,15 @@ pub use space::{
     vector_nodal_dof_map,
 };
 pub use system::{
-    LinearizedSystemOperator, ReducedSystemOperator, SYSTEM_OPERATOR_DIGEST_SCHEMA,
-    SYSTEM_REALIZATION_ARTIFACT_SCHEMA, SystemBlockOperator, SystemBlockReceipt,
-    SystemConstitutiveInput, SystemDistributedCoefficient, SystemEssentialConstraintRequirement,
-    SystemExternalInput, SystemFieldArtifact, SystemOperator, SystemPartialAssemblyOperator,
-    SystemQuadrature, SystemRealizationArtifact, SystemRealizationExternalInput,
-    SystemRealizationPlan, essential_constraints_from_system, essential_constraints_from_system_at,
-    system_constitutive_from_sources,
+    BindPath, LinearizedSystemOperator, ReducedSystemOperator, SYSTEM_OPERATOR_DIGEST_SCHEMA,
+    SYSTEM_REALIZATION_ARTIFACT_SCHEMA, SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA,
+    SystemBindReceipt, SystemBlockOperator, SystemBlockReceipt, SystemConstitutiveInput,
+    SystemDistributedCoefficient, SystemEssentialConstraintRequirement, SystemExternalInput,
+    SystemFieldArtifact, SystemOperator, SystemPartialAssemblyOperator, SystemQuadrature,
+    SystemRealizationArtifact, SystemRealizationExternalInput, SystemRealizationPlan,
+    SystemVariableEssentialConstraint, essential_constraints_from_system,
+    essential_constraints_from_system_at, essential_constraints_from_system_by_variable,
+    essential_constraints_from_system_by_variable_at, system_constitutive_from_sources,
 };
 pub use system_ids::{
     InstanceId, InstanceRecord, SYSTEM_ID_MAP_SCHEMA, SysRes, SysResId, SysVar, SysVarId,

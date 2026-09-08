@@ -6,7 +6,7 @@ use crate::element::{
 };
 use crate::mesh::CellId;
 use crate::mixed::{
-    BlockEssentialValue, BlockNullspaceCandidate, essential_constraints_for_blocks,
+    BlockNullspaceCandidate, BlockVariableEssentialValue, essential_constraints_for_variables,
     solver_block_layout,
 };
 use crate::optimized::ElementAssemblyOperator;
@@ -16,19 +16,19 @@ use crate::profile::{
 };
 use crate::realization::{
     BoundBundle, CapabilityElement, CellGeometry, ConstraintKind, DerivativeProduct,
-    DistributedCoefficient, ExternalInput, FacetGeometry, PointActiveInput, PointEvaluation,
-    RealizationCapability, RealizationExternalInput, RealizationReceipt, RepresentationKind,
-    active_probe_inputs, active_values, apply_basis_adjoint, bind_kernels, build_capability,
-    component_count, evaluate_basis_input, execute_jvp_values, execute_parameter_jvp_values,
-    execute_primal_values, execute_vjp_values, gather_test_adjoint, locate_failure,
-    point_parameter_cotangents, probe_direction_evaluation, property_unavailable, table_axis_point,
-    tangent_unavailable, transpose_scatter_shape, validate_finite,
+    DistributedCoefficient, ExternalInput, FacetGeometry, PointActiveInput, PointBoundInput,
+    PointEvaluation, RealizationCapability, RealizationExternalInput, RealizationReceipt,
+    RepresentationKind, active_probe_inputs, active_values, apply_basis_adjoint, bind_kernels,
+    build_capability, component_count, evaluate_basis_input, execute_jvp_values,
+    execute_parameter_jvp_values, execute_primal_values, execute_vjp_values, gather_test_adjoint,
+    locate_failure, point_parameter_cotangents, probe_direction_evaluation, property_unavailable,
+    table_axis_point, tangent_unavailable, transpose_scatter_shape, validate_finite,
 };
 use crate::space::{
     DofMap, ElementRestriction, cell_constant_dof_map, quadratic_simplex_dof_map,
     vector_nodal_dof_map,
 };
-use crate::system_ids::{SysResId, SysVarId, SystemIdMap};
+use crate::system_ids::{InstanceId, SysResId, SysVarId, SystemIdMap};
 use crate::{
     AffineMap, BlockLayout, CompatibleDofMaps, ConstraintSet, ExactSequence, FacetId,
     FacetTopology, FieldBlock, FieldSource, FinitumError, Mesh, PreparedElement, QuadraturePoint,
@@ -82,17 +82,45 @@ impl SystemQuadrature {
     }
 }
 
-/// Digest-bound concrete ownership plan for an FC8 mixed operator system.
+/// One realized equation row of a realization group (W8 lane F-MI): the instance it belongs
+/// to and its per-model `OperatorSystemBlock`, by index into that instance's `/1` artifact.
+/// Rows are ordered by [`SysResId`]; for a one-instance plan the row index is the block index
+/// of the model's `OperatorSystem`, which keeps every `(block index, integral, input)` key of
+/// the one-instance operator (and its digest payload) exactly as before.
+#[derive(Clone, Debug)]
+struct RealizedRow {
+    residual: SysResId,
+    instance: InstanceId,
+    /// Index into `instances[instance].blocks`.
+    block: usize,
+    /// Display path (§2.4): the bare equation name on a one-instance plan, `<instance>.<equation>`
+    /// otherwise.
+    path: String,
+}
+
+/// Digest-bound concrete ownership plan for an FC8 mixed operator system -- one realization
+/// group (`sinbad/ARCHITECTURE.md` §8): one instance of one model ([`Self::with_quadrature`]),
+/// or several instances of one or more models on one mesh composed through their same-mesh
+/// binds ([`Self::composed`], W8 lane F-MI).
 #[derive(Clone, Debug)]
 pub struct SystemRealizationPlan {
+    /// The first instance's per-model `/1` artifact (the only one of a one-instance plan).
     system: Arc<OperatorSystem>,
+    /// Every instance's per-model `/1` artifact, by [`InstanceId`] index (§2.2: referenced
+    /// verbatim, two instances of one model share one artifact).
+    instances: Vec<Arc<OperatorSystem>>,
+    /// Every equation row in [`SysResId`] order.
+    rows: Vec<RealizedRow>,
+    /// The `/2` operator, output kernels and bind compositions of a composed plan; `None` on
+    /// a one-instance plan built by [`Self::with_quadrature`].
+    composed: Option<Arc<ComposedSystem>>,
     mesh: Mesh,
     layout: BlockLayout,
     facets: FacetTopology,
     compatible_dofs: Option<CompatibleDofMaps>,
     exact_sequence: Option<ExactSequence>,
-    /// SC-W1: the system-level ids of this (one-instance) realization group and their
-    /// per-model origins; the layout's blocks are keyed by the same `SysVarId`s.
+    /// SC-W1: the system-level ids of this realization group and their per-model origins;
+    /// the layout's blocks are keyed by the same `SysVarId`s.
     system_ids: SystemIdMap,
     /// The shared cell quadrature rule every field is integrated with (part of
     /// `artifact_digest`).
@@ -213,8 +241,23 @@ impl SystemRealizationPlan {
             (None, None)
         };
         let artifact_digest = digest_plan(&system, &mesh, &layout, &facets, quadrature);
+        let rows = system
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| RealizedRow {
+                residual: SysResId(u32::try_from(index).expect("block count fits u32")),
+                instance: InstanceId(0),
+                block: index,
+                path: block.equation.clone(),
+            })
+            .collect();
+        let system = Arc::new(system);
         Ok(Self {
-            system: Arc::new(system),
+            instances: vec![system.clone()],
+            system,
+            rows,
+            composed: None,
             mesh,
             layout,
             facets,
@@ -226,8 +269,316 @@ impl SystemRealizationPlan {
         })
     }
 
+    /// W8 lane F-MI: the multi-instance realization group of a declared system
+    /// (`sinbad/ARCHITECTURE.md` §2.6, §6, §8) over one mesh -- Scientia's
+    /// `scientia-operator-system/2` `SystemOperator` with its per-instance `/1` artifacts,
+    /// output kernels and bind compositions, exactly as `compile_system_operator` produced
+    /// them. Rows are keyed by [`SysResId`] and fields by [`SysVarId`] from
+    /// [`SystemIdMap::from_scientia`], so two instances of one model (colliding per-model
+    /// `SymbolId`s) realize as distinct blocks; `layout` must be keyed by the same variables
+    /// ([`BlockLayout::new_keyed`]). Every same-mesh `bind` (`BoundChain::Composed`) is
+    /// realized at bind time ([`Self::bind_kernels_with_inputs`]): on the `kernel_input` path
+    /// the producer's output kernel feeds the consumer kernel's operand through the Malleus
+    /// [`scientia::BindComposition`], on the `provider_input` path the output's value (and
+    /// tangent) reaches the consumer's constitutive closures as
+    /// [`crate::PointEvaluation::bound`]. Cross-mesh binds (`Transferred`) are Krasis's and are
+    /// not represented here. An algebraic loop among bound outputs (an output reading a bound
+    /// input whose producer reads the first output) is refused typed. The plan's identity is
+    /// `finitum-system-realization/3` (it covers the `/2` identity, the per-instance `/1`
+    /// artifacts and the composition digests); one-instance plans built by
+    /// [`Self::with_quadrature`] keep `/2` bitwise.
+    pub fn composed(
+        compilation: &scientia::SystemOperatorCompilation,
+        mesh: Mesh,
+        layout: BlockLayout,
+        quadrature: SystemQuadrature,
+    ) -> Result<Self, FinitumError> {
+        let operator = &compilation.operator;
+        if operator.schema != scientia::SYSTEM_OPERATOR_SCHEMA {
+            return Err(FinitumError::ArtifactMismatch(format!(
+                "composed realization expects a `{}` artifact, got `{}`",
+                scientia::SYSTEM_OPERATOR_SCHEMA,
+                operator.schema
+            )));
+        }
+        let system_ids = SystemIdMap::from_scientia(operator)?;
+        // Per-instance `/1` artifacts, by instance index, checked against the `/2` receipts.
+        let mut instances = Vec::with_capacity(operator.instances.len());
+        for (index, record) in operator.instances.iter().enumerate() {
+            if record.instance.index() != index {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "system operator instance records are not dense (record {index} is instance \
+                     {})",
+                    record.instance
+                )));
+            }
+            let (_, model_system) = compilation
+                .model_systems
+                .iter()
+                .find(|(instance, _)| *instance == record.instance)
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "system operator compilation carries no `/1` artifact for instance {} \
+                         (`{}`)",
+                        record.instance, record.model_name
+                    ))
+                })?;
+            let expected = &system_ids.instances()[index].artifact_digest;
+            if &model_system.artifact_digest != expected {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "instance {} (`{}`) `/1` artifact digest {} does not match the `/2` receipt {}",
+                    record.instance,
+                    record.model_name,
+                    model_system.artifact_digest.hex,
+                    expected.hex
+                )));
+            }
+            if model_system.source_semantic_digest != record.semantic_digest {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "instance {} (`{}`) `/1` artifact was compiled from semantic digest {}, the \
+                     `/2` record names {}",
+                    record.instance,
+                    record.model_name,
+                    model_system.source_semantic_digest.hex,
+                    record.semantic_digest.hex
+                )));
+            }
+            instances.push(Arc::new(model_system.clone()));
+        }
+        if instances.is_empty() {
+            return Err(FinitumError::InvalidRealization(
+                "a composed realization needs at least one instance".into(),
+            ));
+        }
+        // Rows in `SysResId` order, each the per-model block its `/2` residual references.
+        let mut rows = Vec::with_capacity(operator.residuals.len());
+        for (index, residual) in operator.residuals.iter().enumerate() {
+            if residual.id.index() != index {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "system operator residuals are not dense (entry {index} is {})",
+                    residual.id
+                )));
+            }
+            let scientia::ResidualOrigin::Equation { instance, name, .. } = &residual.origin;
+            let instance_id = InstanceId(instance.0);
+            let system = instances.get(instance.index()).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "residual {} names instance {instance} which the operator does not declare",
+                    residual.id
+                ))
+            })?;
+            let block = system
+                .blocks
+                .iter()
+                .position(|block| &block.equation == name)
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "residual {} names equation `{name}` which instance {instance}'s `/1` \
+                         artifact does not carry",
+                        residual.id
+                    ))
+                })?;
+            let block_digest = scientia::block_digest(&system.blocks[block]);
+            if block_digest != residual.block || system.artifact_digest != residual.model_system {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "residual {} (`{name}`) references block {} of artifact {}, the instance's \
+                     `/1` artifact carries block {} of {}",
+                    residual.id,
+                    residual.block.hex,
+                    residual.model_system.hex,
+                    block_digest.hex,
+                    system.artifact_digest.hex
+                )));
+            }
+            if system.blocks[block].row != residual.row {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "residual {} row symbol {} disagrees with its block's row {}",
+                    residual.id, residual.row, system.blocks[block].row
+                )));
+            }
+            let residual_id = SysResId(residual.id.0);
+            let path = system_ids
+                .residual_path(residual_id)
+                .expect("from_scientia recorded every residual");
+            rows.push(RealizedRow {
+                residual: residual_id,
+                instance: instance_id,
+                block,
+                path,
+            });
+        }
+        if rows.is_empty() {
+            return Err(FinitumError::InvalidRealization(
+                "a composed realization needs at least one residual row".into(),
+            ));
+        }
+        // The layout is keyed by the group's variables, each carrying its per-model symbol.
+        for variable in system_ids.variables() {
+            match layout.block_by_variable(variable.id) {
+                Some(block) if block.symbol == variable.local => {}
+                _ => {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "layout block for field {} of {} is not keyed by its system variable {}",
+                        variable.local, variable.instance, variable.id
+                    )));
+                }
+            }
+        }
+        if layout.blocks().len() != system_ids.variables().len() {
+            return Err(FinitumError::ArtifactMismatch(format!(
+                "layout has {} blocks, the system has {} variables",
+                layout.blocks().len(),
+                system_ids.variables().len()
+            )));
+        }
+        // Per-instance shape checks, exactly `with_quadrature`'s, through the instance's ids.
+        for (instance_index, system) in instances.iter().enumerate() {
+            let instance = InstanceId(u32::try_from(instance_index).expect("fits u32"));
+            let variable_of = |symbol: SymbolId| system_ids.variable(instance, symbol);
+            for symbol in &system.field_order {
+                if variable_of(*symbol).is_none() {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "system has no variable for field {symbol} of {instance}"
+                    )));
+                }
+            }
+            for block in &system.blocks {
+                if block.form.source_semantic_digest != system.source_semantic_digest
+                    || block.factorization.receipt.source_form_digest != block.form.artifact_digest
+                    || block.kernels.source_factorization_digest
+                        != block.factorization.artifact_digest
+                {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "equation `{}` of {instance} has a broken form/factorization/kernel \
+                         receipt chain",
+                        block.equation
+                    )));
+                }
+                for coordinate in &block.coordinates {
+                    if variable_of(coordinate.row).is_none()
+                        || variable_of(coordinate.column).is_none()
+                    {
+                        return Err(FinitumError::ArtifactMismatch(format!(
+                            "coordinate ({}, {}) of {instance} is absent from the system's \
+                             variables",
+                            coordinate.row, coordinate.column
+                        )));
+                    }
+                }
+            }
+            if quadrature == SystemQuadrature::Barycenter {
+                for block in &system.blocks {
+                    for element in &block.requirements.elements {
+                        let lagrange = matches!(
+                            element.family,
+                            ElementFamilyRequirement::H1 | ElementFamilyRequirement::L2
+                        );
+                        if !lagrange || element.polynomial_order > 1 {
+                            return Err(FinitumError::UnsupportedRealization(format!(
+                                "the barycenter quadrature rule is admitted for order-0/1 \
+                                 Lagrange (H1/L2) fields only; equation `{}` of {instance} \
+                                 requires {:?}(order={}) for field {}",
+                                block.equation,
+                                element.family,
+                                element.polynomial_order,
+                                element.symbol
+                            )));
+                        }
+                    }
+                }
+            }
+            validate_components_keyed(system, &layout, &variable_of)?;
+        }
+        let facets = FacetTopology::from_mesh(&mesh)?;
+        let all_blocks = || instances.iter().flat_map(|system| system.blocks.iter());
+        let uses_facets = all_blocks().any(|block| {
+            block
+                .factorization
+                .integrals
+                .iter()
+                .any(|integral| !matches!(integral.measure, SemanticMeasure::Cell { .. }))
+        });
+        if uses_facets && facets.facets().is_empty() {
+            return Err(FinitumError::InvalidRealization(
+                "facet operator system requires a nonempty facet topology".into(),
+            ));
+        }
+        let uses_compatible = all_blocks().any(|block| {
+            block.requirements.elements.iter().any(|element| {
+                matches!(
+                    element.family,
+                    ElementFamilyRequirement::Hcurl | ElementFamilyRequirement::Hdiv
+                )
+            })
+        });
+        let (compatible_dofs, exact_sequence) = if uses_compatible {
+            (
+                Some(CompatibleDofMaps::simplex(&mesh, &facets)?),
+                Some(ExactSequence::simplex(&mesh, &facets)?),
+            )
+        } else {
+            (None, None)
+        };
+        let composed = ComposedSystem::new(compilation, &system_ids, &instances, &rows)?;
+        let artifact_digest =
+            digest_plan_composed(&composed, &system_ids, &mesh, &layout, &facets, quadrature);
+        Ok(Self {
+            system: instances[0].clone(),
+            instances,
+            rows,
+            composed: Some(Arc::new(composed)),
+            mesh,
+            layout,
+            facets,
+            compatible_dofs,
+            exact_sequence,
+            system_ids,
+            quadrature,
+            artifact_digest,
+        })
+    }
+
+    /// The first instance's per-model `scientia-operator-system/1` artifact -- the whole
+    /// system of a one-instance plan; on a composed plan use [`Self::instance_system`] for the
+    /// others and [`Self::system_ids`] for the rows.
     pub fn system(&self) -> &OperatorSystem {
         &self.system
+    }
+
+    /// The per-model `/1` artifact an instance of this group reuses verbatim (§2.2).
+    pub fn instance_system(&self, instance: InstanceId) -> Option<&OperatorSystem> {
+        self.instances.get(instance.0 as usize).map(Arc::as_ref)
+    }
+
+    /// The `scientia-operator-system/2` artifact a composed plan was built from
+    /// ([`Self::composed`]); `None` on a one-instance plan.
+    pub fn system_operator(&self) -> Option<&scientia::SystemOperator> {
+        self.composed.as_ref().map(|composed| &composed.operator)
+    }
+
+    /// The realized rows in `SysResId` order as `(row index, row, per-model block)`.
+    fn rows(&self) -> impl Iterator<Item = (usize, &RealizedRow, &OperatorSystemBlock)> + '_ {
+        self.rows.iter().enumerate().map(move |(index, row)| {
+            (
+                index,
+                row,
+                &self.instances[row.instance.0 as usize].blocks[row.block],
+            )
+        })
+    }
+
+    /// One realized row by index.
+    fn row(&self, index: usize) -> (&RealizedRow, &OperatorSystemBlock) {
+        let row = &self.rows[index];
+        (
+            row,
+            &self.instances[row.instance.0 as usize].blocks[row.block],
+        )
+    }
+
+    /// The row index of a system residual.
+    fn row_index(&self, residual: SysResId) -> Option<usize> {
+        self.rows.iter().position(|row| row.residual == residual)
     }
 
     /// SC-W1: the system-level ids (`SysVarId`/`SysResId`) of this realization group with
@@ -362,6 +713,415 @@ fn digest_plan(
     }
 }
 
+/// [`validate_components`] through an instance's `symbol -> SysVarId` map (composed plans).
+fn validate_components_keyed(
+    system: &OperatorSystem,
+    layout: &BlockLayout,
+    variable_of: &dyn Fn(SymbolId) -> Option<SysVarId>,
+) -> Result<(), FinitumError> {
+    for block in &system.blocks {
+        for space in &block.requirements.spaces {
+            let Some(concrete) =
+                variable_of(space.symbol).and_then(|v| layout.block_by_variable(v))
+            else {
+                continue;
+            };
+            let expected = match space.space.family {
+                scientia::scientific::SpaceFamily::HDiv
+                | scientia::scientific::SpaceFamily::HCurl => 1,
+                _ => match space.value_shape {
+                    ValueShape::Scalar => 1,
+                    ValueShape::Vector(extent) => usize::from(extent),
+                    ValueShape::Tensor { rows, cols } => usize::from(rows) * usize::from(cols),
+                    ValueShape::SymmetricTensor(extent) => {
+                        usize::from(extent) * usize::from(extent)
+                    }
+                },
+            };
+            if concrete.component_count != expected {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "field {} ({}) has {} concrete components, typed space requires {expected}",
+                    space.symbol, concrete.variable, concrete.component_count
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Which way a same-mesh bind reaches its consumer (`scientia::ComposedPath`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindPath {
+    /// The consumer's residual kernels read the bound input as an external operand: the
+    /// producer's output kernel feeds it through the Malleus `BindComposition`s.
+    KernelInput,
+    /// The consumer reads the bound input only inside its properties / constitutive laws: the
+    /// producer's output value and tangent reach the consumer's closures as
+    /// [`crate::PointEvaluation::bound`].
+    ProviderInput,
+}
+
+/// One same-mesh bind of a composed plan, resolved to the group's ids.
+#[derive(Clone, Debug)]
+struct RealizedBind {
+    /// Index into `ScientificSystem::binds`.
+    index: usize,
+    consumer: InstanceId,
+    /// The consumer's local input-field symbol the bind closes.
+    consumer_symbol: SymbolId,
+    consumer_slot: String,
+    producer: InstanceId,
+    output: scientia::OutputId,
+    /// Display path `<producer>.<output>`.
+    output_path: String,
+    path: BindPath,
+    /// Indices into `ComposedSystem::compositions` (kernel-input path).
+    compositions: Vec<usize>,
+}
+
+/// The `/2` operator artifact and the per-bind payloads a composed plan realizes (W8 lane
+/// F-MI): Scientia's `SystemOperator`, every output kernel chain, every Malleus
+/// `BindComposition`, and the binds in dependency order (a producer output that reads a
+/// bound input of its own instance comes after the bind supplying it).
+#[derive(Debug)]
+struct ComposedSystem {
+    operator: scientia::SystemOperator,
+    /// By `OutputId` index.
+    outputs: Vec<scientia::OutputKernels>,
+    compositions: Vec<scientia::BindComposition>,
+    /// Dependency order: every bind after the binds its producer's output kernel reads.
+    binds: Vec<RealizedBind>,
+}
+
+impl ComposedSystem {
+    fn new(
+        compilation: &scientia::SystemOperatorCompilation,
+        system_ids: &SystemIdMap,
+        instances: &[Arc<OperatorSystem>],
+        rows: &[RealizedRow],
+    ) -> Result<Self, FinitumError> {
+        let system = &compilation.system;
+        let operator = &compilation.operator;
+        let mut outputs = Vec::with_capacity(compilation.output_kernels.len());
+        for (index, kernels) in compilation.output_kernels.iter().enumerate() {
+            let declared = system.outputs.get(index).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "output kernels entry {index} has no declared system output"
+                ))
+            })?;
+            if kernels.output.index() != index || declared.id.index() != index {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "system outputs are not dense (entry {index} is output {})",
+                    kernels.output
+                )));
+            }
+            let record = operator
+                .outputs
+                .iter()
+                .find(|record| record.output == kernels.output)
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "the `/2` operator records no kernel chain for output {}",
+                        kernels.output
+                    ))
+                })?;
+            if record.form != kernels.form.artifact_digest
+                || record.requirements != kernels.requirements.artifact_digest
+                || record.factorization != kernels.factorization.artifact_digest
+                || record.kernels != kernels.kernels.artifact_digest
+                || kernels.factorization.receipt.source_form_digest != kernels.form.artifact_digest
+                || kernels.kernels.source_factorization_digest
+                    != kernels.factorization.artifact_digest
+            {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "output `{}` has a broken form/factorization/kernel receipt chain",
+                    declared.name
+                )));
+            }
+            let [integral] = kernels.factorization.integrals.as_slice() else {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "output `{}` factorizes into {} integrals; an output is one point function",
+                    declared.name,
+                    kernels.factorization.integrals.len()
+                )));
+            };
+            if !matches!(integral.measure, SemanticMeasure::Cell { .. })
+                || integral.primal.outputs.len() != 1
+                || kernels.kernels.bundles.len() != 1
+            {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "output `{}` is not one cell-measure point function with one kernel bundle",
+                    declared.name
+                )));
+            }
+            outputs.push(kernels.clone());
+        }
+        let compositions = compilation.compositions.clone();
+        let mut binds = Vec::with_capacity(system.binds.len());
+        for (index, bind) in system.binds.iter().enumerate() {
+            let scientia::BoundChain::Composed = bind.chain;
+            let declared = system.outputs.get(bind.producer.index()).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "bind `{}` names output {} which the system does not declare",
+                    bind.consumer_slot, bind.producer
+                ))
+            })?;
+            if outputs.len() <= bind.producer.index() {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "bind `{}` names output {} which has no kernel chain",
+                    bind.consumer_slot, bind.producer
+                )));
+            }
+            let consumer = InstanceId(bind.consumer.0);
+            let producer = InstanceId(declared.instance.0);
+            if instances.get(consumer.0 as usize).is_none()
+                || instances.get(producer.0 as usize).is_none()
+            {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "bind `{}` names an instance the operator does not declare",
+                    bind.consumer_slot
+                )));
+            }
+            let bind_compositions = compositions
+                .iter()
+                .enumerate()
+                .filter(|(_, composition)| composition.bind == index)
+                .map(|(position, composition)| {
+                    let row = rows
+                        .iter()
+                        .position(|row| row.residual == SysResId(composition.row.0))
+                        .ok_or_else(|| {
+                            FinitumError::ArtifactMismatch(format!(
+                                "bind `{}` composition names residual {} which the plan has no \
+                                 row for",
+                                bind.consumer_slot, composition.row
+                            ))
+                        })?;
+                    if rows[row].instance != consumer {
+                        return Err(FinitumError::ArtifactMismatch(format!(
+                            "bind `{}` composition names residual {} of another instance",
+                            bind.consumer_slot, composition.row
+                        )));
+                    }
+                    Ok(position)
+                })
+                .collect::<Result<Vec<_>, FinitumError>>()?;
+            let path = if bind_compositions.is_empty() {
+                BindPath::ProviderInput
+            } else {
+                BindPath::KernelInput
+            };
+            for block in &operator.blocks {
+                let scientia::BlockConstruction::Composed {
+                    bind: block_bind,
+                    path: block_path,
+                    ..
+                } = &block.construction
+                else {
+                    continue;
+                };
+                if *block_bind != index {
+                    continue;
+                }
+                let agrees = match block_path {
+                    scientia::ComposedPath::KernelInput { compositions, .. } => {
+                        path == BindPath::KernelInput
+                            && compositions.len() == bind_compositions.len()
+                            && bind_compositions.iter().all(|&i| {
+                                compositions.contains(&compilation.compositions[i].digest)
+                            })
+                    }
+                    scientia::ComposedPath::ProviderInput { .. } => path == BindPath::ProviderInput,
+                };
+                if !agrees {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "bind `{}` is recorded as a {block_path:?} block but the compilation \
+                         carries {} compositions for it",
+                        bind.consumer_slot,
+                        bind_compositions.len()
+                    )));
+                }
+            }
+            let producer_name = &system_ids.instances()[producer.0 as usize].name;
+            binds.push(RealizedBind {
+                index,
+                consumer,
+                consumer_symbol: bind.consumer_symbol,
+                consumer_slot: bind.consumer_slot.clone(),
+                producer,
+                output: bind.producer,
+                output_path: format!("{producer_name}.{}", declared.name),
+                path,
+                compositions: bind_compositions,
+            });
+        }
+        // Dependency order: bind `i`'s producer output kernel reads every provider-path bound
+        // input of the producer instance (inside its properties) and every kernel-path bound
+        // input its own integral names as a non-basis operand.
+        let reads = |i: usize, j: usize| -> bool {
+            let (this, other) = (&binds[i], &binds[j]);
+            if other.consumer != this.producer {
+                return false;
+            }
+            match other.path {
+                BindPath::ProviderInput => outputs[this.output.index()].factorization.integrals[0]
+                    .primal
+                    .inputs
+                    .iter()
+                    .any(|input| input.source != InputSourceRequirement::Basis),
+                BindPath::KernelInput => outputs[this.output.index()].factorization.integrals[0]
+                    .primal
+                    .inputs
+                    .iter()
+                    .any(|input| {
+                        input.source != InputSourceRequirement::Basis
+                            && input.binding.symbol == other.consumer_symbol
+                    }),
+            }
+        };
+        let mut order = Vec::with_capacity(binds.len());
+        let mut placed = vec![false; binds.len()];
+        while order.len() < binds.len() {
+            let next = (0..binds.len())
+                .find(|&i| !placed[i] && (0..binds.len()).all(|j| placed[j] || !reads(i, j)));
+            match next {
+                Some(i) => {
+                    placed[i] = true;
+                    order.push(i);
+                }
+                None => {
+                    let cycle = binds
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !placed[*i])
+                        .map(|(_, bind)| {
+                            format!("`{}` <- {}", bind.consumer_slot, bind.output_path)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "the bound outputs form an algebraic loop at the quadrature point \
+                         ({cycle}); a same-mesh bind chain must be acyclic among outputs"
+                    )));
+                }
+            }
+        }
+        let binds = order.into_iter().map(|i| binds[i].clone()).collect();
+        Ok(Self {
+            operator: operator.clone(),
+            outputs,
+            compositions,
+            binds,
+        })
+    }
+}
+
+/// Schema of a composed plan's [`SystemRealizationPlan::artifact_digest`] payload (W8 lane
+/// F-MI): the `/2` operator identity, every instance's `/1` artifact, the layout keyed by
+/// system variable, and every bind's composition digests. One-instance plans built by
+/// [`SystemRealizationPlan::with_quadrature`] keep `finitum-system-realization/2` bitwise.
+pub const SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA: &str = "finitum-system-realization/3";
+
+fn digest_plan_composed(
+    composed: &ComposedSystem,
+    system_ids: &SystemIdMap,
+    mesh: &Mesh,
+    layout: &BlockLayout,
+    facets: &FacetTopology,
+    quadrature: SystemQuadrature,
+) -> Digest {
+    #[derive(Serialize)]
+    struct InstanceIdentity<'a> {
+        name: &'a str,
+        model: &'a str,
+        artifact: &'a Digest,
+    }
+    #[derive(Serialize)]
+    struct BlockIdentity {
+        variable: u32,
+        symbol: u32,
+        entity_count: usize,
+        component_count: usize,
+        offset: usize,
+    }
+    #[derive(Serialize)]
+    struct BindIdentity<'a> {
+        consumer_slot: &'a str,
+        output: &'a str,
+        path: BindPath,
+        compositions: Vec<&'a Digest>,
+        jvp_compositions: Vec<&'a Digest>,
+    }
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        schema: &'static str,
+        system: &'a Digest,
+        instances: Vec<InstanceIdentity<'a>>,
+        dimension: usize,
+        vertices: &'a [Vec<f64>],
+        cells: Vec<Vec<usize>>,
+        blocks: Vec<BlockIdentity>,
+        facet_count: usize,
+        quadrature: SystemQuadrature,
+        binds: Vec<BindIdentity<'a>>,
+    }
+    let bytes = serde_json::to_vec(&Payload {
+        schema: SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA,
+        system: &composed.operator.identity,
+        instances: system_ids
+            .instances()
+            .iter()
+            .map(|record| InstanceIdentity {
+                name: &record.name,
+                model: &record.model,
+                artifact: &record.artifact_digest,
+            })
+            .collect(),
+        dimension: mesh.dimension(),
+        vertices: mesh.vertices(),
+        cells: mesh
+            .cells()
+            .iter()
+            .map(|cell| cell.vertices.iter().map(|vertex| vertex.0).collect())
+            .collect(),
+        blocks: layout
+            .blocks()
+            .iter()
+            .map(|block| BlockIdentity {
+                variable: block.variable.0,
+                symbol: block.symbol.0,
+                entity_count: block.entity_count,
+                component_count: block.component_count,
+                offset: block.offset,
+            })
+            .collect(),
+        facet_count: facets.facets().len(),
+        quadrature,
+        binds: composed
+            .binds
+            .iter()
+            .map(|bind| BindIdentity {
+                consumer_slot: &bind.consumer_slot,
+                output: &bind.output_path,
+                path: bind.path,
+                compositions: bind
+                    .compositions
+                    .iter()
+                    .map(|&i| &composed.compositions[i].digest)
+                    .collect(),
+                jvp_compositions: bind
+                    .compositions
+                    .iter()
+                    .map(|&i| &composed.compositions[i].jvp_digest)
+                    .collect(),
+            })
+            .collect(),
+    })
+    .expect("composed system realization identity is serializable");
+    Digest::blake3(&bytes)
+}
+
 // ---------------------------------------------------------------------------------------------
 // SV2-B4 continuation: executable Scientia-form/Malleus-kernel-driven mixed realization.
 //
@@ -461,158 +1221,175 @@ fn expected_field_components(
 /// `DiscontinuousGalerkin`, any other polynomial order, and any Hdiv order other than 0, remain
 /// refused typed.
 fn build_field_elements(
-    system: &OperatorSystem,
-    mesh: &Mesh,
-    layout: &BlockLayout,
+    plan: &SystemRealizationPlan,
     quadrature: &[QuadraturePoint],
-    compatible: Option<&CompatibleDofMaps>,
-) -> Result<BTreeMap<SymbolId, FieldElement>, FinitumError> {
+) -> Result<BTreeMap<SysVarId, FieldElement>, FinitumError> {
+    let mesh = &plan.mesh;
+    let layout = &plan.layout;
+    let compatible = plan.compatible_dofs.as_ref();
+    let ids = &plan.system_ids;
     let mut fields = BTreeMap::new();
-    for &symbol in &system.field_order {
-        let mut found: Option<&scientia::ElementRequirement> = None;
-        for block in &system.blocks {
-            for requirement in &block.requirements.elements {
-                if requirement.symbol != symbol {
-                    continue;
-                }
-                match found {
-                    None => found = Some(requirement),
-                    Some(existing) => {
-                        if existing != requirement {
-                            return Err(FinitumError::ArtifactMismatch(format!(
-                                "system field {symbol} has inconsistent element requirements \
+    for (instance_index, system) in plan.instances.iter().enumerate() {
+        let instance = InstanceId(u32::try_from(instance_index).expect("fits u32"));
+        for &local in &system.field_order {
+            let variable = ids.variable(instance, local).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "system has no variable for field {local} of {instance}"
+                ))
+            })?;
+            // Display: the bare symbol on a one-instance plan (every existing message), the
+            // system variable with its instance otherwise.
+            let symbol = if plan.instances.len() == 1 {
+                local.to_string()
+            } else {
+                format!("{local} ({variable} of {instance})")
+            };
+            let mut found: Option<&scientia::ElementRequirement> = None;
+            for block in &system.blocks {
+                for requirement in &block.requirements.elements {
+                    if requirement.symbol != local {
+                        continue;
+                    }
+                    match found {
+                        None => found = Some(requirement),
+                        Some(existing) => {
+                            if existing != requirement {
+                                return Err(FinitumError::ArtifactMismatch(format!(
+                                    "system field {symbol} has inconsistent element requirements \
                                  across blocks"
-                            )));
+                                )));
+                            }
                         }
                     }
                 }
             }
-        }
-        let requirement = found.ok_or_else(|| {
-            FinitumError::ArtifactMismatch(format!(
-                "system field {symbol} has no element requirement in any block"
-            ))
-        })?;
-        if requirement.topological_dimension as usize != mesh.dimension() {
-            return Err(FinitumError::UnsupportedRealization(format!(
-                "system field {symbol} requires topological dimension {}, mesh has dimension {}",
-                requirement.topological_dimension,
-                mesh.dimension()
-            )));
-        }
-        let components = expected_field_components(
-            requirement.family,
-            &requirement.value_shape,
-            mesh.dimension(),
-        )?;
-        let block = layout.block(symbol).ok_or_else(|| {
-            FinitumError::InvalidRealization(format!(
-                "layout has no block for system field {symbol}"
-            ))
-        })?;
-        if block.component_count != components {
-            return Err(FinitumError::ArtifactMismatch(format!(
-                "system field {symbol} has {} concrete layout components, typed requirement \
+            let requirement = found.ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "system field {symbol} has no element requirement in any block"
+                ))
+            })?;
+            if requirement.topological_dimension as usize != mesh.dimension() {
+                return Err(FinitumError::UnsupportedRealization(format!(
+                    "system field {symbol} requires topological dimension {}, mesh has dimension {}",
+                    requirement.topological_dimension,
+                    mesh.dimension()
+                )));
+            }
+            let components = expected_field_components(
+                requirement.family,
+                &requirement.value_shape,
+                mesh.dimension(),
+            )?;
+            let block = layout.block_by_variable(variable).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "layout has no block for system field {symbol}"
+                ))
+            })?;
+            if block.component_count != components {
+                return Err(FinitumError::ArtifactMismatch(format!(
+                    "system field {symbol} has {} concrete layout components, typed requirement \
                  needs {components}",
-                block.component_count
-            )));
-        }
-        let field = match (requirement.family, requirement.polynomial_order) {
-            (ElementFamilyRequirement::H1 | ElementFamilyRequirement::L2, order @ (1 | 2)) => {
-                let basis_count = simplex_basis_count(mesh.dimension(), order);
-                let mut basis_values = Vec::with_capacity(quadrature.len() * basis_count);
-                let mut basis_gradients =
-                    Vec::with_capacity(quadrature.len() * basis_count * mesh.dimension());
-                for point in quadrature {
-                    let (values, gradients) =
-                        simplex_basis(mesh.dimension(), order, &point.coordinates)?;
-                    basis_values.extend(values);
-                    for gradient in gradients {
-                        basis_gradients.extend(gradient);
+                    block.component_count
+                )));
+            }
+            let field = match (requirement.family, requirement.polynomial_order) {
+                (ElementFamilyRequirement::H1 | ElementFamilyRequirement::L2, order @ (1 | 2)) => {
+                    let basis_count = simplex_basis_count(mesh.dimension(), order);
+                    let mut basis_values = Vec::with_capacity(quadrature.len() * basis_count);
+                    let mut basis_gradients =
+                        Vec::with_capacity(quadrature.len() * basis_count * mesh.dimension());
+                    for point in quadrature {
+                        let (values, gradients) =
+                            simplex_basis(mesh.dimension(), order, &point.coordinates)?;
+                        basis_values.extend(values);
+                        for gradient in gradients {
+                            basis_gradients.extend(gradient);
+                        }
+                    }
+                    let element = PreparedElement::new(
+                        mesh.dimension(),
+                        basis_count,
+                        quadrature.to_vec(),
+                        basis_values,
+                        basis_gradients,
+                    )?;
+                    let dofs = match order {
+                        1 => vector_nodal_dof_map(mesh, components)?,
+                        2 => quadratic_simplex_dof_map(mesh, components)?,
+                        _ => unreachable!("polynomial order matched above"),
+                    };
+                    FieldElement {
+                        kind: FieldKind::Lagrange(element),
+                        dofs,
                     }
                 }
-                let element = PreparedElement::new(
-                    mesh.dimension(),
-                    basis_count,
-                    quadrature.to_vec(),
-                    basis_values,
-                    basis_gradients,
-                )?;
-                let dofs = match order {
-                    1 => vector_nodal_dof_map(mesh, components)?,
-                    2 => quadratic_simplex_dof_map(mesh, components)?,
-                    _ => unreachable!("polynomial order matched above"),
-                };
-                FieldElement {
-                    kind: FieldKind::Lagrange(element),
-                    dofs,
+                (ElementFamilyRequirement::L2, 0) => {
+                    let dofs = cell_constant_dof_map(mesh)?;
+                    let basis_values = vec![1.0; quadrature.len()];
+                    let basis_gradients = vec![0.0; quadrature.len() * mesh.dimension()];
+                    let element = PreparedElement::new(
+                        mesh.dimension(),
+                        1,
+                        quadrature.to_vec(),
+                        basis_values,
+                        basis_gradients,
+                    )?;
+                    FieldElement {
+                        kind: FieldKind::Lagrange(element),
+                        dofs,
+                    }
                 }
-            }
-            (ElementFamilyRequirement::L2, 0) => {
-                let dofs = cell_constant_dof_map(mesh)?;
-                let basis_values = vec![1.0; quadrature.len()];
-                let basis_gradients = vec![0.0; quadrature.len() * mesh.dimension()];
-                let element = PreparedElement::new(
-                    mesh.dimension(),
-                    1,
-                    quadrature.to_vec(),
-                    basis_values,
-                    basis_gradients,
-                )?;
-                FieldElement {
-                    kind: FieldKind::Lagrange(element),
-                    dofs,
-                }
-            }
-            (ElementFamilyRequirement::Hdiv, 0) => {
-                let compatible = compatible.ok_or_else(|| {
-                    FinitumError::ArtifactMismatch(format!(
-                        "system field {symbol} requires Hdiv(order=0) but no compatible DOF \
+                (ElementFamilyRequirement::Hdiv, 0) => {
+                    let compatible = compatible.ok_or_else(|| {
+                        FinitumError::ArtifactMismatch(format!(
+                            "system field {symbol} requires Hdiv(order=0) but no compatible DOF \
                          maps were computed by SystemRealizationPlan::new"
-                    ))
-                })?;
-                if block.entity_count != compatible.hdiv_dof_count {
-                    return Err(FinitumError::ArtifactMismatch(format!(
-                        "system field {symbol} has {} concrete layout entities, RT0's compatible \
+                        ))
+                    })?;
+                    if block.entity_count != compatible.hdiv_dof_count {
+                        return Err(FinitumError::ArtifactMismatch(format!(
+                            "system field {symbol} has {} concrete layout entities, RT0's compatible \
                          DOF map needs {} (one per mesh facet)",
-                        block.entity_count, compatible.hdiv_dof_count
-                    )));
-                }
-                if compatible.hdiv.len() != mesh.cells().len() {
-                    return Err(FinitumError::ArtifactMismatch(
-                        "RT0 compatible DOF map has a different cell count than the mesh".into(),
-                    ));
-                }
-                let mut dof_restrictions = Vec::with_capacity(mesh.cells().len());
-                let mut orientations = Vec::with_capacity(mesh.cells().len());
-                for restriction in &compatible.hdiv {
-                    if restriction.dofs.len() != rt0_basis_count(mesh.dimension()) {
+                            block.entity_count, compatible.hdiv_dof_count
+                        )));
+                    }
+                    if compatible.hdiv.len() != mesh.cells().len() {
                         return Err(FinitumError::ArtifactMismatch(
-                            "RT0 compatible DOF map cell restriction has the wrong facet count"
+                            "RT0 compatible DOF map has a different cell count than the mesh"
                                 .into(),
                         ));
                     }
-                    dof_restrictions.push(ElementRestriction {
-                        dofs: restriction.dofs.clone(),
-                    });
-                    orientations.push(restriction.orientations.clone());
+                    let mut dof_restrictions = Vec::with_capacity(mesh.cells().len());
+                    let mut orientations = Vec::with_capacity(mesh.cells().len());
+                    for restriction in &compatible.hdiv {
+                        if restriction.dofs.len() != rt0_basis_count(mesh.dimension()) {
+                            return Err(FinitumError::ArtifactMismatch(
+                                "RT0 compatible DOF map cell restriction has the wrong facet count"
+                                    .into(),
+                            ));
+                        }
+                        dof_restrictions.push(ElementRestriction {
+                            dofs: restriction.dofs.clone(),
+                        });
+                        orientations.push(restriction.orientations.clone());
+                    }
+                    let dofs = DofMap::new(compatible.hdiv_dof_count, dof_restrictions)?;
+                    FieldElement {
+                        kind: FieldKind::Hdiv0 { orientations },
+                        dofs,
+                    }
                 }
-                let dofs = DofMap::new(compatible.hdiv_dof_count, dof_restrictions)?;
-                FieldElement {
-                    kind: FieldKind::Hdiv0 { orientations },
-                    dofs,
-                }
-            }
-            _ => {
-                return Err(FinitumError::UnsupportedRealization(format!(
-                    "system realization admits scalar or dimension-vector Lagrange fields of \
+                _ => {
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "system realization admits scalar or dimension-vector Lagrange fields of \
                      order 1 or 2 (H1 or L2), piecewise-constant fields (L2(order=0)), or RT0 \
                      fields (Hdiv(order=0)) in the mesh's own topological dimension only; field \
                      {symbol} requires {requirement:?}"
-                )));
-            }
-        };
-        fields.insert(symbol, field);
+                    )));
+                }
+            };
+            fields.insert(variable, field);
+        }
     }
     Ok(fields)
 }
@@ -919,13 +1696,28 @@ type SystemPointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) 
 /// infallible form.
 #[derive(Clone)]
 pub struct SystemConstitutiveInput {
+    /// The equation the closure binds to (display only for a keyed target -- see `target`).
     pub equation: String,
     pub integral_index: usize,
     pub input: TensorInputId,
     component_count: usize,
     identity: String,
+    target: ConstitutiveTarget,
     value: Arc<SystemPointValueEvaluator>,
     direction: Arc<SystemPointDirectionEvaluator>,
+}
+
+/// What a [`SystemConstitutiveInput`] binds to (W8 lane F-MI): an equation by name (the
+/// one-instance form; on a composed plan the name must be unique across instances), a
+/// residual row by [`SysResId`], or a producer output kernel of a same-mesh bind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConstitutiveTarget {
+    Equation,
+    Residual(SysResId),
+    Output {
+        instance: InstanceId,
+        output: scientia::OutputId,
+    },
 }
 
 impl std::fmt::Debug for SystemConstitutiveInput {
@@ -1006,9 +1798,82 @@ impl SystemConstitutiveInput {
             input,
             component_count,
             identity,
+            target: ConstitutiveTarget::Equation,
             value: Arc::new(value),
             direction: Arc::new(direction),
         })
+    }
+
+    /// W8 lane F-MI: [`Self::try_new`] keyed by a residual row of the plan's
+    /// [`SystemIdMap`] instead of an equation name -- unambiguous on a composed plan where two
+    /// instances of one model carry the same equation names. `equation` displays as the
+    /// residual id.
+    pub fn try_new_for_residual(
+        residual: SysResId,
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: impl Into<String>,
+        value: impl Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<Self, FinitumError> {
+        let mut built = Self::try_new(
+            residual.to_string(),
+            integral_index,
+            input,
+            component_count,
+            identity,
+            value,
+            direction,
+        )?;
+        built.target = ConstitutiveTarget::Residual(residual);
+        Ok(built)
+    }
+
+    /// W8 lane F-MI: a closure for a non-basis input of a producer **output** kernel of a
+    /// composed plan (`integral_index` is that output's single integral, `input` one of its
+    /// non-basis `QFunction` inputs), evaluated at every consumer quadrature point the bind
+    /// reads the output at; its [`PointEvaluation`] carries the producer instance's own
+    /// active inputs and bound inputs. `equation` displays as `output#<id>`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_for_output(
+        instance: InstanceId,
+        output: scientia::OutputId,
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: impl Into<String>,
+        value: impl Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<Self, FinitumError> {
+        let mut built = Self::try_new(
+            format!("{instance}/output#{output}"),
+            integral_index,
+            input,
+            component_count,
+            identity,
+            value,
+            direction,
+        )?;
+        built.target = ConstitutiveTarget::Output { instance, output };
+        Ok(built)
+    }
+
+    /// The caller-declared identity of this closure (covered by the operator digest).
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
 
     /// The value callback at `evaluation`, a failure located there.
@@ -1056,39 +1921,172 @@ pub struct SystemDistributedCoefficient {
     pub coefficient: DistributedCoefficient,
 }
 
+/// The producer output's value at one quadrature point for one same-mesh bind (W8 lane
+/// F-MI), with everything the transpose needs to chain back through the producer kernel.
+#[derive(Clone, Debug)]
+struct BoundPointValue {
+    /// Index into `SystemOperatorData::binds`.
+    bind: usize,
+    values: Vec<f64>,
+    /// The output's directional derivative along the current direction (JVP actions only).
+    direction: Option<Vec<f64>>,
+    /// The producer output kernel's gathered point inputs and its evaluation point.
+    producer_inputs: BTreeMap<TensorInputId, Vec<f64>>,
+    producer_evaluation: PointEvaluation,
+}
+
+/// The bound inputs visible to one instance at one quadrature point.
+#[derive(Clone, Copy)]
+struct BoundTable<'a> {
+    binds: &'a [BoundBind],
+    values: &'a [BoundPointValue],
+    instance: InstanceId,
+}
+
+impl<'a> BoundTable<'a> {
+    fn entries(&self) -> impl Iterator<Item = (&'a RealizedBind, &'a BoundPointValue)> + 'a {
+        let (binds, instance) = (self.binds, self.instance);
+        self.values
+            .iter()
+            .map(move |value| (&binds[value.bind].bind, value))
+            .filter(move |(bind, _)| bind.consumer == instance)
+    }
+
+    fn get(&self, symbol: SymbolId) -> Option<&'a BoundPointValue> {
+        self.entries()
+            .find(|(bind, _)| bind.consumer_symbol == symbol)
+            .map(|(_, value)| value)
+    }
+
+    /// The point's bound inputs as the consumer's closures see them (values).
+    fn point_inputs(&self) -> Vec<PointBoundInput> {
+        self.entries()
+            .map(|(bind, value)| PointBoundInput {
+                symbol: bind.consumer_symbol,
+                slot: bind.consumer_slot.clone(),
+                values: value.values.clone(),
+            })
+            .collect()
+    }
+
+    /// The point's bound inputs' directions (zero where no direction was evaluated).
+    fn point_directions(&self) -> Vec<PointBoundInput> {
+        self.entries()
+            .map(|(bind, value)| PointBoundInput {
+                symbol: bind.consumer_symbol,
+                slot: bind.consumer_slot.clone(),
+                values: value
+                    .direction
+                    .clone()
+                    .unwrap_or_else(|| vec![0.0; value.values.len()]),
+            })
+            .collect()
+    }
+}
+
 /// One resolved non-basis input binding of a system operator.
 enum SystemInputBinding<'a> {
     Stored(&'a ExternalInput),
     Constitutive(&'a SystemConstitutiveInput),
+    /// A same-mesh bind's producer output (kernel-input path).
+    Bound(&'a BoundPointValue),
+}
+
+/// Whose closures and tables a point evaluation resolves against: one residual row of the
+/// operator, or one producer output kernel of a bind.
+#[derive(Clone, Copy)]
+enum InputScope<'a> {
+    Row {
+        row: usize,
+        constitutive: &'a BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
+        stored: &'a BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
+    },
+    Output {
+        constitutive: &'a BTreeMap<TensorInputId, SystemConstitutiveInput>,
+    },
 }
 
 /// The non-basis input bindings every point evaluation of a system operator resolves against:
-/// the closure-based constitutive inputs and the stored tables, keyed by
-/// `(block index, integral index, input)`, plus the shared quadrature's point count the stored
-/// tables are indexed with.
+/// the scope's closure-based constitutive inputs and stored tables, the instance's bound
+/// inputs at the point, plus the shared quadrature's point count the stored tables are
+/// indexed with.
+#[derive(Clone, Copy)]
 struct SystemInputBindings<'a> {
-    constitutive: &'a BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
-    stored: &'a BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
+    scope: InputScope<'a>,
+    bound: BoundTable<'a>,
     point_count: usize,
 }
 
-impl SystemInputBindings<'_> {
+impl<'a> SystemInputBindings<'a> {
     fn resolve(
         &self,
-        key: (usize, usize, TensorInputId),
-    ) -> Result<SystemInputBinding<'_>, FinitumError> {
-        if let Some(stored) = self.stored.get(&key) {
-            return Ok(SystemInputBinding::Stored(stored));
+        integral_index: usize,
+        input: &QFunctionInput,
+    ) -> Result<SystemInputBinding<'a>, FinitumError> {
+        if let Some(bound) = self.bound.get(input.binding.symbol) {
+            return Ok(SystemInputBinding::Bound(bound));
         }
-        self.constitutive
-            .get(&key)
-            .map(SystemInputBinding::Constitutive)
-            .ok_or_else(|| {
-                FinitumError::ArtifactMismatch(format!(
-                    "integral {} input {:?} has no bound constitutive or stored input",
-                    key.1, key.2
-                ))
-            })
+        match self.scope {
+            InputScope::Row {
+                row,
+                constitutive,
+                stored,
+            } => {
+                let key = (row, integral_index, input.id);
+                if let Some(stored) = stored.get(&key) {
+                    return Ok(SystemInputBinding::Stored(stored));
+                }
+                constitutive
+                    .get(&key)
+                    .map(SystemInputBinding::Constitutive)
+                    .ok_or_else(|| {
+                        FinitumError::ArtifactMismatch(format!(
+                            "integral {integral_index} input {:?} has no bound constitutive or \
+                             stored input",
+                            input.id
+                        ))
+                    })
+            }
+            InputScope::Output { constitutive } => constitutive
+                .get(&input.id)
+                .map(SystemInputBinding::Constitutive)
+                .ok_or_else(|| {
+                    FinitumError::ArtifactMismatch(format!(
+                        "output integral {integral_index} input {:?} has no bound constitutive \
+                         input",
+                        input.id
+                    ))
+                }),
+        }
+    }
+}
+
+/// One instance's view of the operator's realized fields: every field by system variable,
+/// and the instance's own `symbol -> variable` map (W8 lane F-MI: two instances of one model
+/// share symbols, so a kernel input's `binding.symbol` resolves through its instance).
+#[derive(Clone, Copy)]
+struct InstanceFields<'a> {
+    fields: &'a BTreeMap<SysVarId, FieldElement>,
+    variables: &'a BTreeMap<SymbolId, SysVarId>,
+}
+
+impl<'a> InstanceFields<'a> {
+    fn variable(&self, symbol: SymbolId) -> Result<SysVarId, FinitumError> {
+        self.variables.get(&symbol).copied().ok_or_else(|| {
+            FinitumError::ArtifactMismatch(format!(
+                "field {symbol} is not a variable of this instance"
+            ))
+        })
+    }
+
+    fn field(&self, symbol: SymbolId) -> Result<(SysVarId, &'a FieldElement), FinitumError> {
+        let variable = self.variable(symbol)?;
+        let field = self.fields.get(&variable).ok_or_else(|| {
+            FinitumError::ArtifactMismatch(format!(
+                "field {symbol} ({variable}) has not been realized by the system operator"
+            ))
+        })?;
+        Ok((variable, field))
     }
 }
 
@@ -1167,6 +2165,7 @@ fn system_operator_digest(
     stored: &BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
     equation_sign: &BTreeMap<usize, f64>,
     facet_regions: &BTreeMap<RegionId, Vec<FacetId>>,
+    binds: &[BoundBind],
 ) -> Digest {
     #[derive(Serialize)]
     struct ConstitutiveIdentity<'a> {
@@ -1184,6 +2183,16 @@ fn system_operator_digest(
         component_count: usize,
         values: &'a [f64],
     }
+    /// A closure bound to a producer output kernel of a composed plan (W8 F-MI); absent from
+    /// the payload of every plan without binds, so one-instance digests are unchanged.
+    #[derive(Serialize)]
+    struct OutputConstitutiveIdentity<'a> {
+        consumer_slot: &'a str,
+        output: &'a str,
+        input: TensorInputId,
+        component_count: usize,
+        identity: &'a str,
+    }
     #[derive(Serialize)]
     struct Payload<'a> {
         schema: &'static str,
@@ -1192,6 +2201,8 @@ fn system_operator_digest(
         stored: Vec<StoredIdentity<'a>>,
         equation_sign: &'a BTreeMap<usize, f64>,
         facet_regions: BTreeMap<u32, Vec<usize>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<OutputConstitutiveIdentity<'a>>,
     }
     let payload = Payload {
         schema: SYSTEM_OPERATOR_DIGEST_SCHEMA,
@@ -1225,6 +2236,20 @@ fn system_operator_digest(
             .iter()
             .map(|(region, facets)| (region.0, facets.iter().map(|facet| facet.0).collect()))
             .collect(),
+        outputs: binds
+            .iter()
+            .flat_map(|bind| {
+                bind.constitutive
+                    .iter()
+                    .map(move |(&input, binding)| OutputConstitutiveIdentity {
+                        consumer_slot: &bind.bind.consumer_slot,
+                        output: &bind.bind.output_path,
+                        input,
+                        component_count: binding.component_count,
+                        identity: &binding.identity,
+                    })
+            })
+            .collect(),
     };
     let bytes =
         serde_json::to_vec(&payload).expect("system operator digest payload is serializable");
@@ -1232,6 +2257,40 @@ fn system_operator_digest(
         algorithm: "blake3".into(),
         hex: blake3::hash(&bytes).to_hex().to_string(),
     }
+}
+
+/// The Methodus block layout of a system operator: `field_<symbol>` per block on a
+/// one-instance plan (unchanged), `<instance>/field_<symbol>` on a composed plan (the
+/// partition names Sinbad's transient runner records per instance).
+fn solver_block_layout_keyed(
+    layout: &BlockLayout,
+    ids: &SystemIdMap,
+) -> Result<methodus::BlockLayout, FinitumError> {
+    if ids.instances().len() == 1 {
+        return solver_block_layout(layout);
+    }
+    let specifications = layout
+        .blocks()
+        .iter()
+        .map(|block| {
+            let instance = ids
+                .variable_origin(block.variable)
+                .and_then(|origin| {
+                    ids.instances()
+                        .iter()
+                        .find(|record| record.instance == origin.instance)
+                })
+                .map(|record| record.name.as_str())
+                .unwrap_or("?");
+            methodus::BlockSpec {
+                name: format!("{instance}/field_{}", block.symbol.0),
+                length: block.extent,
+                residual_scale: 1.0,
+            }
+        })
+        .collect();
+    methodus::BlockLayout::new(specifications)
+        .map_err(|error| FinitumError::InvalidRealization(error.to_string()))
 }
 
 impl SystemRealizationPlan {
@@ -1312,7 +2371,7 @@ impl SystemRealizationPlan {
         equation_sign: BTreeMap<String, f64>,
         facet_regions: BTreeMap<RegionId, Vec<FacetId>>,
     ) -> Result<SystemOperator, FinitumError> {
-        for block in &self.system.blocks {
+        for (_, row, block) in self.rows() {
             for integral in &block.factorization.integrals {
                 match &integral.measure {
                     SemanticMeasure::Cell { .. } => {
@@ -1321,7 +2380,7 @@ impl SystemRealizationPlan {
                                 return Err(FinitumError::UnsupportedRealization(format!(
                                     "system realization realizes cell evaluation sites only; \
                                      equation `{}` integral {} has an output at site {:?}",
-                                    block.equation,
+                                    row.path,
                                     integral.integral_index,
                                     output.binding.evaluation.site
                                 )));
@@ -1342,7 +2401,7 @@ impl SystemRealizationPlan {
                                 "system realization admits exterior-facet integrals with no \
                                  primal input at all (RT0's own normal-trace closed form only); \
                                  equation `{}` integral {} declares {} input(s)",
-                                block.equation,
+                                row.path,
                                 integral.integral_index,
                                 integral.primal.inputs.len()
                             )));
@@ -1357,7 +2416,7 @@ impl SystemRealizationPlan {
                                     "system realization admits exterior-facet integrals only for \
                                      an Hdiv(order=0) row field's Value/ExteriorTrace/Normal \
                                      trace; equation `{}` integral {} has evaluation {evaluation:?}",
-                                    block.equation, integral.integral_index
+                                    row.path, integral.integral_index
                                 )));
                             }
                         }
@@ -1367,37 +2426,45 @@ impl SystemRealizationPlan {
                             "system realization admits SemanticMeasure::Cell integrals, or a \
                              narrowly-scoped Hdiv(order=0) SemanticMeasure::ExteriorFacet normal \
                              trace, only; equation `{}` integral {} has measure {other:?}",
-                            block.equation, integral.integral_index
+                            row.path, integral.integral_index
                         )));
                     }
                 }
             }
         }
         let quadrature = self.quadrature()?;
-        let fields = build_field_elements(
-            &self.system,
-            &self.mesh,
-            &self.layout,
-            &quadrature,
-            self.compatible_dofs.as_ref(),
-        )?;
-        for block in &self.system.blocks {
+        let fields = build_field_elements(self, &quadrature)?;
+        let instance_variables = (0..self.instances.len())
+            .map(|index| {
+                let instance = InstanceId(u32::try_from(index).expect("fits u32"));
+                self.system_ids
+                    .variables()
+                    .iter()
+                    .filter(|variable| variable.instance == instance)
+                    .map(|variable| (variable.local, variable.id))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        for (_, row, block) in self.rows() {
             let has_exterior_facet =
                 block.factorization.integrals.iter().any(|integral| {
                     matches!(integral.measure, SemanticMeasure::ExteriorFacet { .. })
                 });
             if has_exterior_facet {
-                let row_field = fields.get(&block.row).ok_or_else(|| {
-                    FinitumError::ArtifactMismatch(format!(
-                        "equation `{}` row field {} was not realized",
-                        block.equation, block.row
-                    ))
-                })?;
+                let row_field = instance_variables[row.instance.0 as usize]
+                    .get(&block.row)
+                    .and_then(|variable| fields.get(variable))
+                    .ok_or_else(|| {
+                        FinitumError::ArtifactMismatch(format!(
+                            "equation `{}` row field {} was not realized",
+                            row.path, block.row
+                        ))
+                    })?;
                 if !matches!(row_field.kind, FieldKind::Hdiv0 { .. }) {
                     return Err(FinitumError::UnsupportedRealization(format!(
                         "equation `{}` has an exterior-facet integral but row field {} is not \
                          Hdiv(order=0)",
-                        block.equation, block.row
+                        row.path, block.row
                     )));
                 }
             }
@@ -1424,26 +2491,102 @@ impl SystemRealizationPlan {
             }
         }
         let mut bindings = BTreeMap::new();
-        for (index, block) in self.system.blocks.iter().enumerate() {
+        for (index, _, block) in self.rows() {
             bindings.insert(
                 index,
                 bind_kernels(&block.factorization, block.kernels.clone())?,
             );
         }
+        // The consumer-side bound symbols of every instance (same-mesh binds).
+        let bound_symbols = |instance: InstanceId| -> Vec<(SymbolId, &str)> {
+            self.composed
+                .as_ref()
+                .map(|composed| {
+                    composed
+                        .binds
+                        .iter()
+                        .filter(|bind| bind.consumer == instance)
+                        .map(|bind| (bind.consumer_symbol, bind.consumer_slot.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let mut constitutive_by_key = BTreeMap::new();
+        let mut output_constitutive: BTreeMap<
+            (InstanceId, scientia::OutputId),
+            BTreeMap<TensorInputId, SystemConstitutiveInput>,
+        > = BTreeMap::new();
         for input in constitutive {
-            let block_index = self
-                .system
-                .blocks
-                .iter()
-                .position(|block| block.equation == input.equation)
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(format!(
-                        "constitutive input names equation `{}` which is absent from the system",
-                        input.equation
-                    ))
-                })?;
-            let key = (block_index, input.integral_index, input.input);
+            let row_index = match input.target.clone() {
+                ConstitutiveTarget::Equation => {
+                    let matches = self
+                        .rows()
+                        .filter(|(_, row, block)| {
+                            block.equation == input.equation || row.path == input.equation
+                        })
+                        .map(|(index, _, _)| index)
+                        .collect::<Vec<_>>();
+                    match matches.as_slice() {
+                        [] => {
+                            return Err(FinitumError::InvalidRealization(format!(
+                                "constitutive input names equation `{}` which is absent from \
+                                 the system",
+                                input.equation
+                            )));
+                        }
+                        [index] => *index,
+                        _ => {
+                            return Err(FinitumError::InvalidRealization(format!(
+                                "constitutive input names equation `{}` which {} instances of \
+                                 this composed plan carry; key it by residual \
+                                 (`SystemConstitutiveInput::try_new_for_residual`) or by its \
+                                 display path",
+                                input.equation,
+                                matches.len()
+                            )));
+                        }
+                    }
+                }
+                ConstitutiveTarget::Residual(residual) => {
+                    self.row_index(residual).ok_or_else(|| {
+                        FinitumError::InvalidRealization(format!(
+                            "constitutive input names residual {residual} which the system does \
+                             not carry"
+                        ))
+                    })?
+                }
+                ConstitutiveTarget::Output { instance, output } => {
+                    let composed = self.composed.as_ref().ok_or_else(|| {
+                        FinitumError::InvalidRealization(format!(
+                            "constitutive input `{}` names output {output} of {instance}, but \
+                             this plan has no same-mesh binds (build it with \
+                             `SystemRealizationPlan::composed`)",
+                            input.identity
+                        ))
+                    })?;
+                    if !composed
+                        .binds
+                        .iter()
+                        .any(|bind| bind.producer == instance && bind.output == output)
+                    {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "constitutive input `{}` names output {output} of {instance}, which \
+                             no bind of this plan reads",
+                            input.identity
+                        )));
+                    }
+                    let inputs = output_constitutive.entry((instance, output)).or_default();
+                    let id = input.input;
+                    if inputs.insert(id, input).is_some() {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "constitutive input for output {output} of {instance} input {id:?} \
+                             is bound more than once"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let key = (row_index, input.integral_index, input.input);
             if constitutive_by_key.insert(key, input).is_some() {
                 return Err(FinitumError::InvalidRealization(format!(
                     "constitutive input for equation index {}, integral {}, input {:?} is bound \
@@ -1454,27 +2597,13 @@ impl SystemRealizationPlan {
         }
         let mut stored_by_key = BTreeMap::new();
         for table in stored {
-            let origin = self
-                .system_ids
-                .residual_origin(table.residual)
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(format!(
-                        "stored input names residual {} which the system does not carry",
-                        table.residual
-                    ))
-                })?;
-            let block_index = self
-                .system
-                .blocks
-                .iter()
-                .position(|block| block.equation == origin.equation)
-                .ok_or_else(|| {
-                    FinitumError::ArtifactMismatch(format!(
-                        "residual {} names equation `{}` which the system does not carry",
-                        table.residual, origin.equation
-                    ))
-                })?;
-            let block = &self.system.blocks[block_index];
+            let row_index = self.row_index(table.residual).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "stored input names residual {} which the system does not carry",
+                    table.residual
+                ))
+            })?;
+            let (row, block) = self.row(row_index);
             let integral = block
                 .factorization
                 .integrals
@@ -1483,14 +2612,14 @@ impl SystemRealizationPlan {
                 .ok_or_else(|| {
                     FinitumError::InvalidRealization(format!(
                         "stored input names absent integral {} of equation `{}`",
-                        table.input.integral_index, block.equation
+                        table.input.integral_index, row.path
                     ))
                 })?;
             if !matches!(integral.measure, SemanticMeasure::Cell { .. }) {
                 return Err(FinitumError::UnsupportedRealization(format!(
                     "stored system inputs are realized on cell integrals only; equation `{}` \
                      integral {} has measure {:?}",
-                    block.equation, integral.integral_index, integral.measure
+                    row.path, integral.integral_index, integral.measure
                 )));
             }
             let input = integral
@@ -1501,13 +2630,13 @@ impl SystemRealizationPlan {
                 .ok_or_else(|| {
                     FinitumError::InvalidRealization(format!(
                         "stored input names undeclared input {:?} of equation `{}` integral {}",
-                        table.input.input, block.equation, integral.integral_index
+                        table.input.input, row.path, integral.integral_index
                     ))
                 })?;
             if input.source == InputSourceRequirement::Basis {
                 return Err(FinitumError::InvalidRealization(format!(
                     "equation `{}` integral {} input {:?} is a basis input, not an external one",
-                    block.equation, integral.integral_index, input.id
+                    row.path, integral.integral_index, input.id
                 )));
             }
             let components = component_count(&input.shape)?;
@@ -1518,7 +2647,7 @@ impl SystemRealizationPlan {
                     "stored input for equation `{}` integral {} input {:?} has {} components \
                      and {} values; the realization expects {components} components over {} \
                      cells x {} quadrature points ({expected} values)",
-                    block.equation,
+                    row.path,
                     integral.integral_index,
                     input.id,
                     table.input.component_count(),
@@ -1527,36 +2656,52 @@ impl SystemRealizationPlan {
                     quadrature.len()
                 )));
             }
-            let key = (block_index, integral.integral_index, input.id);
+            let key = (row_index, integral.integral_index, input.id);
             if constitutive_by_key.contains_key(&key) {
                 return Err(FinitumError::InvalidRealization(format!(
                     "equation `{}` integral {} input {:?} is bound both as a constitutive \
                      closure and as a stored table",
-                    block.equation, integral.integral_index, input.id
+                    row.path, integral.integral_index, input.id
                 )));
             }
             if stored_by_key.insert(key, table.input).is_some() {
                 return Err(FinitumError::InvalidRealization(format!(
                     "stored input for equation `{}` integral {} input {:?} is bound more than \
                      once",
-                    block.equation, integral.integral_index, input.id
+                    row.path, integral.integral_index, input.id
                 )));
             }
         }
-        for (block_index, block) in self.system.blocks.iter().enumerate() {
+        for (row_index, row, block) in self.rows() {
+            let bound = bound_symbols(row.instance);
             for integral in &block.factorization.integrals {
                 for input in &integral.primal.inputs {
                     if input.source == InputSourceRequirement::Basis {
                         continue;
                     }
-                    let key = (block_index, integral.integral_index, input.id);
-                    if !constitutive_by_key.contains_key(&key) && !stored_by_key.contains_key(&key)
+                    let key = (row_index, integral.integral_index, input.id);
+                    let closed =
+                        constitutive_by_key.contains_key(&key) || stored_by_key.contains_key(&key);
+                    if let Some((_, slot)) = bound
+                        .iter()
+                        .find(|(symbol, _)| *symbol == input.binding.symbol)
                     {
+                        if closed {
+                            return Err(FinitumError::InvalidRealization(format!(
+                                "equation `{}` integral {} input {:?} is closed by the bind on \
+                                 `{slot}`; it must not also be bound as a closure or a stored \
+                                 table",
+                                row.path, integral.integral_index, input.id
+                            )));
+                        }
+                        continue;
+                    }
+                    if !closed {
                         return Err(FinitumError::UnsupportedRealization(format!(
                             "equation `{}` integral {} input {:?} requires a caller-supplied \
                              SystemConstitutiveInput closure or a stored SystemExternalInput \
                              table (regional external tensor tables remain future work)",
-                            block.equation, integral.integral_index, input.id
+                            row.path, integral.integral_index, input.id
                         )));
                     }
                 }
@@ -1564,17 +2709,27 @@ impl SystemRealizationPlan {
         }
         let mut equation_sign_by_block = BTreeMap::new();
         for (equation, sign) in &equation_sign {
-            let block_index = self
-                .system
-                .blocks
-                .iter()
-                .position(|block| &block.equation == equation)
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(format!(
+            let matches = self
+                .rows()
+                .filter(|(_, row, block)| &block.equation == equation || &row.path == equation)
+                .map(|(index, _, _)| index)
+                .collect::<Vec<_>>();
+            let block_index = match matches.as_slice() {
+                [] => {
+                    return Err(FinitumError::InvalidRealization(format!(
                         "equation sign names equation `{equation}` which is absent from the \
                          system"
-                    ))
-                })?;
+                    )));
+                }
+                [index] => *index,
+                _ => {
+                    return Err(FinitumError::InvalidRealization(format!(
+                        "equation sign names equation `{equation}` which {} instances of this \
+                         composed plan carry; name it by its display path `<instance>.<equation>`",
+                        matches.len()
+                    )));
+                }
+            };
             if *sign != 1.0 && *sign != -1.0 {
                 return Err(FinitumError::InvalidRealization(format!(
                     "equation `{equation}` sign must be exactly 1.0 or -1.0 (a solution-\
@@ -1583,22 +2738,47 @@ impl SystemRealizationPlan {
             }
             equation_sign_by_block.insert(block_index, *sign);
         }
-        let structure = derive_operator_structure_for_system(&self.system, None)
-            .map_err(|error| FinitumError::ArtifactMismatch(error.to_string()))?;
-        validate_structure_matches_system(&self.system, &structure)?;
-        let nullspace_candidates = derive_nullspace_candidates(&structure)?;
-        let solver_layout = solver_block_layout(&self.layout)?;
+        let mut structures = Vec::with_capacity(self.instances.len());
+        let mut nullspace_candidates = Vec::new();
+        for system in &self.instances {
+            let structure = derive_operator_structure_for_system(system, None)
+                .map_err(|error| FinitumError::ArtifactMismatch(error.to_string()))?;
+            validate_structure_matches_system(system, &structure)?;
+            for candidate in derive_nullspace_candidates(&structure)? {
+                if self.layout.block(candidate.block).is_none() {
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "structural nullspace candidate for field {} names a symbol several \
+                         instances of this composed plan carry; `BlockNullspaceCandidate` is \
+                         keyed by per-model symbol",
+                        candidate.block
+                    )));
+                }
+                nullspace_candidates.push(candidate);
+            }
+            structures.push(structure);
+        }
+        let structure = structures[0].clone();
+        let binds = self.bind_outputs(&fields, &instance_variables, &mut output_constitutive)?;
+        if let Some(((instance, output), _)) = output_constitutive.iter().next() {
+            return Err(FinitumError::InvalidRealization(format!(
+                "constitutive inputs are bound to output {output} of {instance}, which no bind \
+                 of this plan reads"
+            )));
+        }
+        let solver_layout = solver_block_layout_keyed(&self.layout, &self.system_ids)?;
         let digest = system_operator_digest(
             self,
             &constitutive_by_key,
             &stored_by_key,
             &equation_sign_by_block,
             &facet_regions,
+            &binds,
         );
         Ok(SystemOperator {
             data: Arc::new(SystemOperatorData {
                 plan: self.clone(),
                 fields,
+                instance_variables,
                 quadrature,
                 bindings,
                 constitutive: constitutive_by_key,
@@ -1607,29 +2787,259 @@ impl SystemRealizationPlan {
                 facet_regions,
                 facet_geometries,
                 structure,
+                structures,
                 nullspace_candidates,
                 solver_layout,
                 digest,
                 symmetry_proof: std::sync::OnceLock::new(),
+                binds,
             }),
         })
     }
+
+    /// W8 lane F-MI: binds every same-mesh bind's producer output kernel (its single bundle,
+    /// its non-basis inputs' closures from `output_constitutive`, and -- on the kernel-input
+    /// path -- every Malleus composition Scientia emitted for it, validated and
+    /// digest-checked, with its JVP composition rebuilt and checked against the recorded
+    /// `jvp_digest`).
+    fn bind_outputs(
+        &self,
+        fields: &BTreeMap<SysVarId, FieldElement>,
+        instance_variables: &[BTreeMap<SymbolId, SysVarId>],
+        output_constitutive: &mut BTreeMap<
+            (InstanceId, scientia::OutputId),
+            BTreeMap<TensorInputId, SystemConstitutiveInput>,
+        >,
+    ) -> Result<Vec<BoundBind>, FinitumError> {
+        let Some(composed) = self.composed.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut binds = Vec::with_capacity(composed.binds.len());
+        for bind in &composed.binds {
+            let kernels = &composed.outputs[bind.output.index()];
+            let integral = kernels.factorization.integrals[0].clone();
+            let mut bound = bind_kernels(&kernels.factorization, kernels.kernels.clone())?;
+            let bundle = bound.remove(&(integral.integral_index, 0)).ok_or_else(|| {
+                FinitumError::ArtifactMismatch(format!(
+                    "output `{}` has no bound kernel for its integral",
+                    bind.output_path
+                ))
+            })?;
+            let producer_bound = composed
+                .binds
+                .iter()
+                .filter(|other| other.consumer == bind.producer)
+                .map(|other| (other.consumer_symbol, other.consumer_slot.as_str()))
+                .collect::<Vec<_>>();
+            let constitutive = output_constitutive
+                .get(&(bind.producer, bind.output))
+                .cloned()
+                .unwrap_or_default();
+            for input in &integral.primal.inputs {
+                if input.source == InputSourceRequirement::Basis {
+                    if input.binding.evaluation.site != EvaluationSite::Cell {
+                        return Err(FinitumError::UnsupportedRealization(format!(
+                            "output `{}` reads its field {} at site {:?}; a bound output is a \
+                             cell point function",
+                            bind.output_path, input.binding.symbol, input.binding.evaluation.site
+                        )));
+                    }
+                    let realized = instance_variables[bind.producer.0 as usize]
+                        .get(&input.binding.symbol)
+                        .is_some_and(|variable| fields.contains_key(variable));
+                    if !realized {
+                        return Err(FinitumError::ArtifactMismatch(format!(
+                            "output `{}` reads field {} which its instance {} has not realized",
+                            bind.output_path, input.binding.symbol, bind.producer
+                        )));
+                    }
+                    continue;
+                }
+                let closed = constitutive.contains_key(&input.id);
+                if let Some((_, slot)) = producer_bound
+                    .iter()
+                    .find(|(symbol, _)| *symbol == input.binding.symbol)
+                {
+                    if closed {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "output `{}` input {:?} is closed by the bind on `{slot}`; it must \
+                             not also be bound as a closure",
+                            bind.output_path, input.id
+                        )));
+                    }
+                    continue;
+                }
+                if !closed {
+                    return Err(FinitumError::UnsupportedRealization(format!(
+                        "output `{}` (read by the bind on `{}`) input {:?} requires a \
+                         caller-supplied SystemConstitutiveInput closure \
+                         (`SystemConstitutiveInput::try_new_for_output`)",
+                        bind.output_path, bind.consumer_slot, input.id
+                    )));
+                }
+            }
+            for (id, closure) in &constitutive {
+                let declared = integral.primal.inputs.iter().find(|input| input.id == *id);
+                match declared {
+                    Some(input)
+                        if input.source != InputSourceRequirement::Basis
+                            && closure.integral_index == integral.integral_index => {}
+                    _ => {
+                        return Err(FinitumError::InvalidRealization(format!(
+                            "constitutive input `{}` names integral {} input {id:?}, which \
+                             output `{}` does not declare as a non-basis input",
+                            closure.identity, closure.integral_index, bind.output_path
+                        )));
+                    }
+                }
+            }
+            let mut compositions = Vec::with_capacity(bind.compositions.len());
+            for &index in &bind.compositions {
+                let composition = &composed.compositions[index];
+                let row = self
+                    .row_index(SysResId(composition.row.0))
+                    .expect("checked by ComposedSystem::new");
+                let (row_record, block) = self.row(row);
+                let consumer_bundle = block
+                    .kernels
+                    .bundles
+                    .iter()
+                    .find(|bundle| {
+                        bundle.integral_index == composition.consumer_integral_index
+                            && bundle.output_index == composition.consumer_output_index
+                    })
+                    .ok_or_else(|| {
+                        FinitumError::ArtifactMismatch(format!(
+                            "bind `{}` composition names integral {} output {} which equation \
+                             `{}` has no kernel bundle for",
+                            bind.consumer_slot,
+                            composition.consumer_integral_index,
+                            composition.consumer_output_index,
+                            row_record.path
+                        ))
+                    })?;
+                let digest = malleus::composition_digest(&composition.composition);
+                let recorded = &composition.digest;
+                if digest.hex != recorded.hex {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "bind `{}` composition digest {} does not match its recorded digest {}",
+                        bind.consumer_slot, digest.hex, recorded.hex
+                    )));
+                }
+                let validated = malleus::validate_composition(composition.composition.clone())
+                    .map_err(|error| FinitumError::KernelValidation(error.to_string()))?;
+                // The recorded JVP composition (Scientia's request: the producer's active basis
+                // operands -> the consumer output), rebuilt and checked; see
+                // `SystemOperator::apply_block_cell` for why it is not the executed tangent.
+                let producer_program = &kernels.factorization.integrals[0].primal;
+                let independent = bundle
+                    .bundle
+                    .primal_inputs
+                    .iter()
+                    .filter(|binding| {
+                        producer_program.inputs.iter().any(|input| {
+                            input.id == binding.input && input.role == TensorInputRole::Active
+                        })
+                    })
+                    .map(|binding| malleus::StageOperand::new(0, binding.operand))
+                    .collect::<Vec<_>>();
+                let jvp = malleus::differentiate_composition(
+                    &composition.composition,
+                    &malleus::CompositionDerivativeRequest {
+                        mode: malleus::DerivativeMode::Jvp,
+                        independent_operands: independent,
+                        dependent_operands: vec![malleus::StageOperand::new(
+                            1,
+                            consumer_bundle.primal_output,
+                        )],
+                    },
+                )
+                .map_err(|error| FinitumError::KernelValidation(error.to_string()))?;
+                let jvp_digest = malleus::composition_digest(&jvp.composition);
+                if jvp_digest.hex != composition.jvp_digest.hex {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "bind `{}` JVP composition digest {} does not match its recorded digest \
+                         {}",
+                        bind.consumer_slot, jvp_digest.hex, composition.jvp_digest.hex
+                    )));
+                }
+                if composition.producer_operand
+                    != malleus::StageOperand::new(0, bundle.bundle.primal_output)
+                {
+                    return Err(FinitumError::ArtifactMismatch(format!(
+                        "bind `{}` composition shares stage-0 operand {:?}, the producer output \
+                         is operand {:?}",
+                        bind.consumer_slot,
+                        composition.producer_operand,
+                        bundle.bundle.primal_output
+                    )));
+                }
+                compositions.push(BoundComposition {
+                    row,
+                    integral_index: composition.consumer_integral_index,
+                    output_index: composition.consumer_output_index,
+                    composition: composition.clone(),
+                    executable: malleus::ExecutableComposition::reference(validated),
+                });
+            }
+            binds.push(BoundBind {
+                bind: bind.clone(),
+                integral,
+                bound: bundle,
+                constitutive,
+                compositions,
+            });
+        }
+        // An output can feed several consumers. Its closures must remain available while
+        // every outgoing bind is built, then be removed once from the admission map.
+        for bind in &composed.binds {
+            output_constitutive.remove(&(bind.producer, bind.output));
+        }
+        Ok(binds)
+    }
+}
+
+/// One same-mesh bind bound to executable kernels (W8 lane F-MI): the producer output's
+/// single integral and bundle, its closures, and its kernel-input compositions.
+#[derive(Debug)]
+struct BoundBind {
+    bind: RealizedBind,
+    integral: IntegralOperatorFactorization,
+    bound: BoundBundle,
+    constitutive: BTreeMap<TensorInputId, SystemConstitutiveInput>,
+    compositions: Vec<BoundComposition>,
+}
+
+/// One validated Malleus `BindComposition`, keyed by the consumer row/integral/output it
+/// realizes.
+#[derive(Debug)]
+struct BoundComposition {
+    row: usize,
+    integral_index: usize,
+    output_index: usize,
+    composition: scientia::BindComposition,
+    executable: malleus::ExecutableComposition,
 }
 
 #[derive(Debug)]
 struct SystemOperatorData {
     plan: SystemRealizationPlan,
-    fields: BTreeMap<SymbolId, FieldElement>,
+    /// Every realized field by system variable (W8 F-MI); `SysVarId(symbol.0)` on a
+    /// one-instance plan, so the iteration order is the per-model symbol order it always was.
+    fields: BTreeMap<SysVarId, FieldElement>,
+    /// Per instance, its `symbol -> variable` map.
+    instance_variables: Vec<BTreeMap<SymbolId, SysVarId>>,
     /// Shared quadrature table every field's basis is tabulated at (or, for an RT0 field,
     /// evaluated at directly -- see [`build_field_elements`]'s doc comment); the per-cell
     /// per-block integration loop indexes into this rather than any one field's own table, since
     /// an RT0 [`FieldElement`] carries no [`PreparedElement`] of its own.
     quadrature: Vec<QuadraturePoint>,
+    /// Keyed by row index (the block index of a one-instance plan).
     bindings: BTreeMap<usize, BTreeMap<(usize, usize), BoundBundle>>,
     constitutive: BTreeMap<(usize, usize, TensorInputId), SystemConstitutiveInput>,
     /// Stored quadrature-point tables (SC-W1 system-path parity), keyed like `constitutive`.
     stored: BTreeMap<(usize, usize, TensorInputId), ExternalInput>,
-    /// Per-block-index equation orientation (`1.0` or `-1.0`, absent means `1.0`); see
+    /// Per-row equation orientation (`1.0` or `-1.0`, absent means `1.0`); see
     /// `SystemRealizationPlan::bind_kernels`'s `equation_sign` parameter.
     equation_sign: BTreeMap<usize, f64>,
     /// Mission item 2's exterior-facet extension: caller-resolved region -> facet-id lists (see
@@ -1638,13 +3048,18 @@ struct SystemOperatorData {
     /// unchanged).
     facet_regions: BTreeMap<RegionId, Vec<FacetId>>,
     facet_geometries: BTreeMap<FacetId, FacetGeometry>,
+    /// The first instance's structure (the whole structure of a one-instance plan).
     structure: OperatorStructure,
+    /// Every instance's structure, by instance index.
+    structures: Vec<OperatorStructure>,
     nullspace_candidates: Vec<BlockNullspaceCandidate>,
     solver_layout: methodus::BlockLayout,
     digest: Digest,
     /// Lazily proven, then cached, symmetry declaration used only when `equation_sign` is
     /// nontrivial (mirrors `RealizationPlan`'s own `symmetry_proof` cache).
     symmetry_proof: std::sync::OnceLock<OperatorSymmetry>,
+    /// The same-mesh binds in dependency order (empty on a one-instance plan).
+    binds: Vec<BoundBind>,
 }
 
 /// Executable, Scientia-form/Malleus-kernel-driven realization of an entire
@@ -1694,6 +3109,13 @@ impl SystemOperator {
         &self.data.structure
     }
 
+    /// W8 F-MI: the structural `OperatorStructure` of one instance of a composed plan (the
+    /// per-model structure the instance's `/1` artifact derives); [`Self::structure`] is
+    /// instance 0's.
+    pub fn instance_structure(&self, instance: InstanceId) -> Option<&OperatorStructure> {
+        self.data.structures.get(instance.0 as usize)
+    }
+
     /// Auto-derived nullspace candidates (mission item 9): representation-only declarations, not
     /// yet resolved against a concrete essential-constraint set. Resolve one against
     /// [`Self::layout`] via [`BlockNullspaceCandidate::resolve`].
@@ -1701,8 +3123,62 @@ impl SystemOperator {
         &self.data.nullspace_candidates
     }
 
+    /// The DOF map of a realized field by per-model symbol; `None` on a composed plan when
+    /// several instances carry the symbol (use [`Self::dof_map_by_variable`]).
     pub fn dof_map(&self, field: SymbolId) -> Option<&DofMap> {
-        self.data.fields.get(&field).map(|field| &field.dofs)
+        let variable = self.layout().block(field)?.variable;
+        self.dof_map_by_variable(variable)
+    }
+
+    /// The DOF map of a realized field by system variable (W8 F-MI).
+    pub fn dof_map_by_variable(&self, variable: SysVarId) -> Option<&DofMap> {
+        self.data.fields.get(&variable).map(|field| &field.dofs)
+    }
+
+    /// W8 F-MI: every same-mesh bind this operator realizes, in dependency order (empty on a
+    /// one-instance plan).
+    pub fn binds(&self) -> Vec<SystemBindReceipt> {
+        let Some(composed) = self.data.plan.composed.as_ref() else {
+            return Vec::new();
+        };
+        self.data
+            .binds
+            .iter()
+            .map(|bound| {
+                let bind = &bound.bind;
+                let mut rows = BTreeSet::new();
+                let mut columns = BTreeSet::new();
+                for block in &composed.operator.blocks {
+                    if let scientia::BlockConstruction::Composed { bind: index, .. } =
+                        &block.construction
+                    {
+                        if *index == bind.index {
+                            rows.insert(SysResId(block.row.0));
+                            columns.insert(SysVarId(block.column.0));
+                        }
+                    }
+                }
+                SystemBindReceipt {
+                    consumer_slot: bind.consumer_slot.clone(),
+                    consumer: bind.consumer,
+                    producer: bind.producer,
+                    output: bind.output_path.clone(),
+                    path: bind.path,
+                    rows: rows.into_iter().collect(),
+                    columns: columns.into_iter().collect(),
+                    compositions: bound
+                        .compositions
+                        .iter()
+                        .map(|composition| composition.composition.digest.clone())
+                        .collect(),
+                    jvp_compositions: bound
+                        .compositions
+                        .iter()
+                        .map(|composition| composition.composition.jvp_digest.clone())
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// Matrix-free monolithic action `output = A * input` at the zero linearization point
@@ -1945,32 +3421,16 @@ impl SystemOperator {
     ) -> Result<(), FinitumError> {
         let geometry = CellGeometry::new(self.data.plan.mesh(), CellId(cell))?;
         let affine = AffineMap::from_cell(self.data.plan.mesh(), CellId(cell))?;
-        for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
-            if only_block.is_some_and(|only| only != block_index) {
+        for (row_index, row, block) in self.data.plan.rows() {
+            if only_block.is_some_and(|only| only != row_index) {
                 continue;
             }
             self.apply_block_cell(
-                block_index,
-                block,
-                cell,
-                &geometry,
-                &affine,
-                time,
-                state,
-                state_rate,
-                action,
+                row_index, row, block, cell, &geometry, &affine, time, state, state_rate, action,
                 output,
             )?;
         }
         Ok(())
-    }
-
-    fn input_bindings(&self) -> SystemInputBindings<'_> {
-        SystemInputBindings {
-            constitutive: &self.data.constitutive,
-            stored: &self.data.stored,
-            point_count: self.data.quadrature.len(),
-        }
     }
 
     /// The shared cell quadrature table every field of this operator is integrated with
@@ -1979,29 +3439,6 @@ impl SystemOperator {
     /// laid out over it.
     pub fn quadrature(&self) -> &[QuadraturePoint] {
         &self.data.quadrature
-    }
-
-    /// Per-cell gather of every realized field's local DOF values from a layout-wide vector.
-    fn gather_local(&self, cell: usize, vector: &[f64]) -> BTreeMap<SymbolId, Vec<f64>> {
-        let layout = self.layout();
-        self.data
-            .fields
-            .iter()
-            .map(|(&symbol, field)| {
-                let field_block = layout
-                    .block(symbol)
-                    .expect("realized field implies a layout block");
-                let restriction = &field.dofs.restrictions()[cell];
-                (
-                    symbol,
-                    restriction
-                        .dofs
-                        .iter()
-                        .map(|dof| vector[field_block.offset + dof.0])
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect()
     }
 
     /// The layout-wide DOFs each cell touches: every realized field's cell restriction, offset
@@ -2015,9 +3452,9 @@ impl SystemOperator {
                     .data
                     .fields
                     .iter()
-                    .flat_map(|(&symbol, field)| {
+                    .flat_map(|(&variable, field)| {
                         let offset = layout
-                            .block(symbol)
+                            .block_by_variable(variable)
                             .expect("realized field implies a layout block")
                             .offset;
                         field.dofs.restrictions()[cell]
@@ -2037,27 +3474,18 @@ impl SystemOperator {
         &self,
         coefficient: &SystemDistributedCoefficient,
     ) -> Result<(usize, &IntegralOperatorFactorization, &ExternalInput), FinitumError> {
-        let origin = self
-            .system_ids()
-            .residual_origin(coefficient.residual)
+        let block_index = self
+            .data
+            .plan
+            .row_index(coefficient.residual)
             .ok_or_else(|| {
                 FinitumError::InvalidRealization(format!(
                     "distributed coefficient names residual {} which the system does not carry",
                     coefficient.residual
                 ))
             })?;
-        let system = self.data.plan.system();
-        let block_index = system
-            .blocks
-            .iter()
-            .position(|block| block.equation == origin.equation)
-            .ok_or_else(|| {
-                FinitumError::ArtifactMismatch(format!(
-                    "residual {} names equation `{}` which the system does not carry",
-                    coefficient.residual, origin.equation
-                ))
-            })?;
-        let integral = system.blocks[block_index]
+        let (_, block) = self.data.plan.row(block_index);
+        let integral = block
             .factorization
             .integrals
             .iter()
@@ -2136,11 +3564,12 @@ impl SystemOperator {
             )));
         }
         validate_finite("coefficient direction", direction)?;
-        let block = &self.data.plan.system().blocks[block_index];
-        let row_field = &self.data.fields[&block.row];
+        let (row, block) = self.data.plan.row(block_index);
+        let fields = self.instance_fields(row.instance);
+        let (row_variable, row_field) = fields.field(block.row)?;
         let row_block = self
             .layout()
-            .block(block.row)
+            .block_by_variable(row_variable)
             .expect("row field implies a layout block");
         let sign = self
             .data
@@ -2154,8 +3583,8 @@ impl SystemOperator {
         for cell in 0..mesh.cells().len() {
             let geometry = CellGeometry::new(mesh, CellId(cell))?;
             let affine = AffineMap::from_cell(mesh, CellId(cell))?;
-            let local_state = self.gather_local(cell, state);
-            let local_rate = self.gather_local(cell, state_rate);
+            let local_state = self.gather_cell(cell, state);
+            let local_rate = self.gather_cell(cell, state_rate);
             let row_restriction = &row_field.dofs.restrictions()[cell];
             let mut local_output = vec![0.0; row_restriction.dofs.len()];
             for (point, quadrature_point) in self.data.quadrature.iter().enumerate() {
@@ -2177,8 +3606,20 @@ impl SystemOperator {
                             .sum::<f64>()
                     })
                     .collect::<Vec<_>>();
+                let bound_values = self.bound_point_values(
+                    cell,
+                    point,
+                    &geometry,
+                    &affine,
+                    reference_point,
+                    time,
+                    &local_state,
+                    &local_rate,
+                    None,
+                )?;
+                let point_bindings = self.row_bindings(block_index, row.instance, &bound_values);
                 let (inputs, _) = point_inputs_system(
-                    &self.data.fields,
+                    fields,
                     integral,
                     cell,
                     point,
@@ -2188,11 +3629,10 @@ impl SystemOperator {
                     time,
                     &local_state,
                     &local_rate,
-                    &self.input_bindings(),
-                    block_index,
+                    &point_bindings,
                 )?;
                 for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
-                    let bound = bound_kernel(bindings, block, integral, output_index)?;
+                    let bound = bound_kernel(bindings, &row.path, integral, output_index)?;
                     let Some(point_output) = execute_parameter_jvp_values(
                         bound,
                         &inputs,
@@ -2250,11 +3690,12 @@ impl SystemOperator {
                 output.len()
             )));
         }
-        let block = &self.data.plan.system().blocks[block_index];
-        let row_field = &self.data.fields[&block.row];
+        let (row, block) = self.data.plan.row(block_index);
+        let fields = self.instance_fields(row.instance);
+        let (row_variable, row_field) = fields.field(block.row)?;
         let row_block = self
             .layout()
-            .block(block.row)
+            .block_by_variable(row_variable)
             .expect("row field implies a layout block");
         let sign = self
             .data
@@ -2268,8 +3709,8 @@ impl SystemOperator {
         for cell in 0..mesh.cells().len() {
             let geometry = CellGeometry::new(mesh, CellId(cell))?;
             let affine = AffineMap::from_cell(mesh, CellId(cell))?;
-            let local_state = self.gather_local(cell, state);
-            let local_rate = self.gather_local(cell, state_rate);
+            let local_state = self.gather_cell(cell, state);
+            let local_rate = self.gather_cell(cell, state_rate);
             let row_restriction = &row_field.dofs.restrictions()[cell];
             let local_adjoint = row_restriction
                 .dofs
@@ -2285,8 +3726,20 @@ impl SystemOperator {
                     cell,
                     point,
                 )?;
+                let bound_values = self.bound_point_values(
+                    cell,
+                    point,
+                    &geometry,
+                    &affine,
+                    reference_point,
+                    time,
+                    &local_state,
+                    &local_rate,
+                    None,
+                )?;
+                let point_bindings = self.row_bindings(block_index, row.instance, &bound_values);
                 let (inputs, _) = point_inputs_system(
-                    &self.data.fields,
+                    fields,
                     integral,
                     cell,
                     point,
@@ -2296,11 +3749,10 @@ impl SystemOperator {
                     time,
                     &local_state,
                     &local_rate,
-                    &self.input_bindings(),
-                    block_index,
+                    &point_bindings,
                 )?;
                 for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
-                    let bound = bound_kernel(bindings, block, integral, output_index)?;
+                    let bound = bound_kernel(bindings, &row.path, integral, output_index)?;
                     let output_components = component_count(&qoutput.shape)?;
                     let seed = gather_field_test_adjoint(
                         row_field,
@@ -2403,13 +3855,32 @@ impl SystemOperator {
         lane_width: usize,
     ) -> Result<SystemPartialAssemblyOperator, FinitumError> {
         let mesh = self.data.plan.mesh();
-        let system = self.data.plan.system();
+        if let Some(bound) = self.data.binds.first() {
+            let consumer_row = self
+                .data
+                .plan
+                .rows()
+                .find(|(_, row, _)| row.instance == bound.bind.consumer)
+                .map(|(_, row, _)| row.path.clone())
+                .unwrap_or_default();
+            return Err(FinitumError::RepresentationUnsupported {
+                representation: RepresentationKind::PartialAssembly,
+                equation: consumer_row,
+                integral: 0,
+                input: None,
+                reason: format!(
+                    "the same-mesh bind on `{}` ({} <- {}) is a state-dependent point chain; \
+                     partial assembly stores state-independent point Jacobians",
+                    bound.bind.consumer_slot, bound.bind.consumer_slot, bound.bind.output_path
+                ),
+            });
+        }
         if let Some((&(block_index, integral_index, input), binding)) =
             self.data.constitutive.iter().next()
         {
             return Err(FinitumError::RepresentationUnsupported {
                 representation: RepresentationKind::PartialAssembly,
-                equation: system.blocks[block_index].equation.clone(),
+                equation: self.data.plan.row(block_index).0.path.clone(),
                 integral: integral_index,
                 input: Some(input),
                 reason: format!(
@@ -2421,7 +3892,7 @@ impl SystemOperator {
                 ),
             });
         }
-        for block in &system.blocks {
+        for (_, row, block) in self.data.plan.rows() {
             if let Some(integral) = block
                 .factorization
                 .integrals
@@ -2430,7 +3901,7 @@ impl SystemOperator {
             {
                 return Err(FinitumError::RepresentationUnsupported {
                     representation: RepresentationKind::PartialAssembly,
-                    equation: block.equation.clone(),
+                    equation: row.path.clone(),
                     integral: integral.integral_index,
                     input: None,
                     reason: format!(
@@ -2445,9 +3916,12 @@ impl SystemOperator {
         for cell in 0..mesh.cells().len() {
             let geometry = CellGeometry::new(mesh, CellId(cell))?;
             let affine = AffineMap::from_cell(mesh, CellId(cell))?;
-            let local_zero = self.gather_local(cell, &zero);
+            let local_zero = self.gather_cell(cell, &zero);
             let mut cell_actions = Vec::new();
-            for (block_index, block) in system.blocks.iter().enumerate() {
+            let no_bound: Vec<BoundPointValue> = Vec::new();
+            for (block_index, row, block) in self.data.plan.rows() {
+                let fields = self.instance_fields(row.instance);
+                let row_variable = fields.variable(block.row)?;
                 let sign = self
                     .data
                     .equation_sign
@@ -2479,8 +3953,10 @@ impl SystemOperator {
                     for (point, quadrature_point) in self.data.quadrature.iter().enumerate() {
                         let reference_point = &quadrature_point.coordinates;
                         let scale = sign * quadrature_point.weight * geometry.determinant();
+                        let point_bindings =
+                            self.row_bindings(block_index, row.instance, &no_bound);
                         let (inputs, _) = point_inputs_system(
-                            &self.data.fields,
+                            fields,
                             integral,
                             cell,
                             point,
@@ -2490,11 +3966,10 @@ impl SystemOperator {
                             0.0,
                             &local_zero,
                             &local_zero,
-                            &self.input_bindings(),
-                            block_index,
+                            &point_bindings,
                         )?;
                         for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
-                            let bound = bound_kernel(bindings, block, integral, output_index)?;
+                            let bound = bound_kernel(bindings, &row.path, integral, output_index)?;
                             let mut columns = Vec::with_capacity(input_components);
                             for selected in 0..input_components {
                                 let mut directions = integral
@@ -2535,7 +4010,8 @@ impl SystemOperator {
                                 }
                             }
                             cell_actions.push(SystemPartialPointAction {
-                                row: block.row,
+                                row: row_variable,
+                                instance: row.instance,
                                 point,
                                 scale,
                                 active_inputs: active_inputs.clone(),
@@ -2581,28 +4057,16 @@ impl SystemOperator {
         row: SysResId,
         column: SysVarId,
     ) -> Result<(usize, &FieldBlock, &FieldBlock), FinitumError> {
-        let ids = self.system_ids();
-        let residual = ids.residual_origin(row).ok_or_else(|| {
+        let block_index = self.data.plan.row_index(row).ok_or_else(|| {
             FinitumError::InvalidRealization(format!("system has no residual {row}"))
         })?;
-        let block_index = self
-            .data
-            .plan
-            .system()
-            .blocks
-            .iter()
-            .position(|block| block.equation == residual.equation)
-            .ok_or_else(|| {
-                FinitumError::ArtifactMismatch(format!(
-                    "residual {row} names equation `{}` which the system does not carry",
-                    residual.equation
-                ))
-            })?;
+        let (record, block) = self.data.plan.row(block_index);
         let layout = self.layout();
-        let row_block = layout.block(residual.row).ok_or_else(|| {
+        let row_variable = self.instance_fields(record.instance).variable(block.row)?;
+        let row_block = layout.block_by_variable(row_variable).ok_or_else(|| {
             FinitumError::ArtifactMismatch(format!(
                 "residual {row} row field {} has no layout block",
-                residual.row
+                block.row
             ))
         })?;
         let column_block = layout.block_by_variable(column).ok_or_else(|| {
@@ -2851,13 +4315,12 @@ impl SystemOperator {
     /// an RT0 field is refused typed (its L2 mass needs the Piola-mapped basis, which no
     /// multiplier field of this crate's admitted pairings uses).
     pub fn mass_matrix(&self, field: SymbolId) -> Result<Vec<f64>, FinitumError> {
-        let element_field = self.data.fields.get(&field).ok_or_else(|| {
+        let block = self.layout().block(field).ok_or_else(|| {
             FinitumError::InvalidRealization(format!("field {field} was not realized"))
         })?;
-        let block = self
-            .layout()
-            .block(field)
-            .expect("realized field implies a layout block");
+        let element_field = self.data.fields.get(&block.variable).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("field {field} was not realized"))
+        })?;
         let element = match &element_field.kind {
             FieldKind::Lagrange(element) => element,
             FieldKind::Hdiv0 { .. } => {
@@ -2940,14 +4403,257 @@ impl SystemOperator {
         Ok(*self.data.symmetry_proof.get_or_init(|| proof))
     }
 
-    /// One block's contribution on one cell for one [`SystemAction`]: gathers every field's
+    /// The per-cell gather of every realized field's local DOFs of `vector`, by variable.
+    fn gather_cell(&self, cell: usize, vector: &[f64]) -> BTreeMap<SysVarId, Vec<f64>> {
+        let layout = self.layout();
+        self.data
+            .fields
+            .iter()
+            .map(|(&variable, field)| {
+                let field_block = layout
+                    .block_by_variable(variable)
+                    .expect("realized field implies a layout block");
+                let restriction = &field.dofs.restrictions()[cell];
+                (
+                    variable,
+                    restriction
+                        .dofs
+                        .iter()
+                        .map(|dof| vector[field_block.offset + dof.0])
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// One instance's view of the realized fields.
+    fn instance_fields(&self, instance: InstanceId) -> InstanceFields<'_> {
+        InstanceFields {
+            fields: &self.data.fields,
+            variables: &self.data.instance_variables[instance.0 as usize],
+        }
+    }
+
+    /// The input bindings of one residual row at a point, over the row instance's bound
+    /// inputs.
+    fn row_bindings<'a>(
+        &'a self,
+        row_index: usize,
+        instance: InstanceId,
+        bound: &'a [BoundPointValue],
+    ) -> SystemInputBindings<'a> {
+        SystemInputBindings {
+            scope: InputScope::Row {
+                row: row_index,
+                constitutive: &self.data.constitutive,
+                stored: &self.data.stored,
+            },
+            bound: BoundTable {
+                binds: &self.data.binds,
+                values: bound,
+                instance,
+            },
+            point_count: self.data.quadrature.len(),
+        }
+    }
+
+    /// W8 F-MI: every same-mesh bind's producer output at one quadrature point, in the plan's
+    /// dependency order (each output kernel sees the bound inputs of its own instance that
+    /// precede it), with its directional derivative along `directions` when given. Empty on
+    /// a one-instance plan.
+    #[allow(clippy::too_many_arguments)]
+    fn bound_point_values(
+        &self,
+        cell: usize,
+        point: usize,
+        geometry: &CellGeometry,
+        affine: &AffineMap,
+        reference_point: &[f64],
+        time: f64,
+        local_state: &BTreeMap<SysVarId, Vec<f64>>,
+        local_rate: &BTreeMap<SysVarId, Vec<f64>>,
+        directions: LocalDirections<'_>,
+    ) -> Result<Vec<BoundPointValue>, FinitumError> {
+        let mut values: Vec<BoundPointValue> = Vec::with_capacity(self.data.binds.len());
+        for (index, bound) in self.data.binds.iter().enumerate() {
+            let producer = bound.bind.producer;
+            let fields = self.instance_fields(producer);
+            let bindings = SystemInputBindings {
+                scope: InputScope::Output {
+                    constitutive: &bound.constitutive,
+                },
+                bound: BoundTable {
+                    binds: &self.data.binds,
+                    values: &values,
+                    instance: producer,
+                },
+                point_count: self.data.quadrature.len(),
+            };
+            let (inputs, evaluation) = point_inputs_system(
+                fields,
+                &bound.integral,
+                cell,
+                point,
+                geometry,
+                affine,
+                reference_point,
+                time,
+                local_state,
+                local_rate,
+                &bindings,
+            )?;
+            let output = execute_primal_values(&bound.bound, &inputs)?;
+            validate_finite("bound output", &output)?;
+            let direction = match directions {
+                None => None,
+                Some((state_direction, rate_direction)) => {
+                    let directions = point_directions_system(
+                        fields,
+                        &bound.integral,
+                        cell,
+                        point,
+                        geometry,
+                        affine,
+                        reference_point,
+                        time,
+                        state_direction,
+                        rate_direction,
+                        &bindings,
+                        &evaluation,
+                    )?;
+                    let tangent = execute_jvp_values(&bound.bound, &inputs, &directions)?;
+                    validate_finite("bound output direction", &tangent)?;
+                    Some(tangent)
+                }
+            };
+            values.push(BoundPointValue {
+                bind: index,
+                values: output,
+                direction,
+                producer_inputs: inputs,
+                producer_evaluation: evaluation,
+            });
+        }
+        Ok(values)
+    }
+
+    /// W8 F-MI: the transpose of the bind chain at one quadrature point. Walks the binds in
+    /// reverse dependency order: a bind's accumulated seed (the cotangent of its output) is
+    /// pushed through the producer output kernel's VJP into the producer's fields (scattered
+    /// through their bases, scaled like any column field's cotangent) and, through its
+    /// parameter cotangents, into the producer's closures (probed with unit active and bound
+    /// perturbations) and into the bound inputs the producer reads -- whose binds precede it
+    /// and are processed next.
+    #[allow(clippy::too_many_arguments)]
+    fn push_bound_cotangents(
+        &self,
+        values: &[BoundPointValue],
+        seeds: &mut BoundSeeds,
+        cell: usize,
+        point: usize,
+        geometry: &CellGeometry,
+        affine: &AffineMap,
+        reference_point: &[f64],
+        scale: f64,
+        rate_shift: f64,
+        local_outputs: &mut BTreeMap<SysVarId, Vec<f64>>,
+    ) -> Result<(), FinitumError> {
+        for index in (0..self.data.binds.len()).rev() {
+            let Some(seed) = seeds[index].take() else {
+                continue;
+            };
+            let bound = &self.data.binds[index];
+            let value = &values[index];
+            let producer = bound.bind.producer;
+            let fields = self.instance_fields(producer);
+            let bindings = SystemInputBindings {
+                scope: InputScope::Output {
+                    constitutive: &bound.constitutive,
+                },
+                bound: BoundTable {
+                    binds: &self.data.binds,
+                    values: &values[..index],
+                    instance: producer,
+                },
+                point_count: self.data.quadrature.len(),
+            };
+            let active_inputs = active_probe_inputs(&bound.integral, rate_shift);
+            let mut cotangents =
+                execute_vjp_values(&bound.bound, &value.producer_inputs, seed.clone())?;
+            if !bound.bound.bundle.parameter.independent_operands.is_empty() {
+                let parameter_cotangents =
+                    point_parameter_cotangents(&bound.bound, &value.producer_inputs, &seed)?;
+                accumulate_parameter_cotangents_system(
+                    fields,
+                    &bound.integral,
+                    cell,
+                    point,
+                    geometry,
+                    affine,
+                    reference_point,
+                    scale,
+                    rate_shift,
+                    &value.producer_evaluation,
+                    &active_inputs,
+                    &bindings,
+                    &parameter_cotangents,
+                    &mut cotangents,
+                    local_outputs,
+                    seeds,
+                )?;
+            }
+            for input in &bound.integral.primal.inputs {
+                if input.source != InputSourceRequirement::Basis
+                    || input.role != TensorInputRole::Active
+                {
+                    continue;
+                }
+                let Some((derivative, factor)) = transpose_scatter_shape(input, rate_shift) else {
+                    continue;
+                };
+                let Some(cotangent) = cotangents.get(&input.id) else {
+                    continue;
+                };
+                scatter_field_cotangent(
+                    fields,
+                    input.binding.symbol,
+                    geometry,
+                    affine,
+                    cell,
+                    point,
+                    reference_point,
+                    &derivative,
+                    cotangent,
+                    factor * scale,
+                    local_outputs,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One row's contribution on one cell for one [`SystemAction`]: gathers every field's
     /// local state/rate (and directions) through its own DOF restriction, drives each cell
     /// integral output's bound kernel at every shared quadrature point, and scatters through
     /// the row field's basis (PRIMAL/JVP) or through every active column field's basis (VJP).
+    ///
+    /// On a composed plan (W8 F-MI) every bind's producer output is evaluated at the point
+    /// first ([`Self::bound_point_values`]). PRIMAL: a consumer bundle on the kernel-input path
+    /// runs its Malleus `BindComposition` (`execute_bind_composition`); every other bundle
+    /// reads its bound inputs' values as external operands. JVP: the tangent is the §6
+    /// chain-rule product of local point kernels -- the producer output bundle's full JVP
+    /// (its active basis directions *and* its frozen-input tangents, which is how `sigma(T)`
+    /// inside `joule_heat` reaches `dR_thermal/dT`) fed as the bound operand's direction into
+    /// the consumer's parameter JVP, and as [`PointEvaluation::bound`] directions into the
+    /// consumer's closures. The recorded `jvp_compositions` are digest-checked at bind time
+    /// but not executed: their independent set is the producer's active basis operands only,
+    /// so executing them alone would drop the producer's provider-input tangent. VJP: the
+    /// exact transpose, [`Self::push_bound_cotangents`].
     #[allow(clippy::too_many_arguments)]
     fn apply_block_cell(
         &self,
-        block_index: usize,
+        row_index: usize,
+        row: &RealizedRow,
         block: &OperatorSystemBlock,
         cell: usize,
         geometry: &CellGeometry,
@@ -2959,46 +4665,27 @@ impl SystemOperator {
         output: &mut [f64],
     ) -> Result<(), FinitumError> {
         let layout = self.layout();
-        let row_field = self.data.fields.get(&block.row).ok_or_else(|| {
+        let fields = self.instance_fields(row.instance);
+        let (row_variable, row_field) = fields.field(block.row).map_err(|_| {
             FinitumError::ArtifactMismatch(format!(
                 "equation `{}` row field {} was not realized",
-                block.equation, block.row
+                row.path, block.row
             ))
         })?;
         let row_block = layout
-            .block(block.row)
+            .block_by_variable(row_variable)
             .expect("row field implies a layout block");
         let row_restriction = &row_field.dofs.restrictions()[cell];
         let sign = self
             .data
             .equation_sign
-            .get(&block_index)
+            .get(&row_index)
             .copied()
             .unwrap_or(1.0);
 
-        let gather = |vector: &[f64]| -> BTreeMap<SymbolId, Vec<f64>> {
-            self.data
-                .fields
-                .iter()
-                .map(|(&symbol, field)| {
-                    let field_block = layout
-                        .block(symbol)
-                        .expect("realized field implies a layout block");
-                    let restriction = &field.dofs.restrictions()[cell];
-                    (
-                        symbol,
-                        restriction
-                            .dofs
-                            .iter()
-                            .map(|dof| vector[field_block.offset + dof.0])
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect()
-        };
-        let local_state = gather(state);
-        let local_rate = gather(state_rate);
-        let bindings = &self.data.bindings[&block_index];
+        let local_state = self.gather_cell(cell, state);
+        let local_rate = self.gather_cell(cell, state_rate);
+        let bindings = &self.data.bindings[&row_index];
         let quadrature = &self.data.quadrature;
 
         match action {
@@ -3007,7 +4694,10 @@ impl SystemOperator {
                     SystemAction::Jvp {
                         state_direction,
                         rate_direction,
-                    } => Some((gather(state_direction), gather(rate_direction))),
+                    } => Some((
+                        self.gather_cell(cell, state_direction),
+                        self.gather_cell(cell, rate_direction),
+                    )),
                     _ => None,
                 };
                 let mut local_output = vec![0.0; row_restriction.dofs.len()];
@@ -3017,12 +4707,35 @@ impl SystemOperator {
                         continue;
                     }
                     for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
-                        let bound = bound_kernel(bindings, block, integral, output_index)?;
+                        let bound = bound_kernel(bindings, &row.path, integral, output_index)?;
+                        let composition = self.data.binds.iter().find_map(|bind| {
+                            bind.compositions
+                                .iter()
+                                .find(|composition| {
+                                    composition.row == row_index
+                                        && composition.integral_index == integral.integral_index
+                                        && composition.output_index == output_index
+                                })
+                                .map(|composition| (bind, composition))
+                        });
                         for (point, quadrature_point) in quadrature.iter().enumerate() {
                             let reference_point = &quadrature_point.coordinates;
                             let scale = quadrature_point.weight * geometry.determinant();
+                            let bound_values = self.bound_point_values(
+                                cell,
+                                point,
+                                geometry,
+                                affine,
+                                reference_point,
+                                time,
+                                &local_state,
+                                &local_rate,
+                                directions.as_ref().map(|(state, rate)| (state, rate)),
+                            )?;
+                            let point_bindings =
+                                self.row_bindings(row_index, row.instance, &bound_values);
                             let (inputs, evaluation) = point_inputs_system(
-                                &self.data.fields,
+                                fields,
                                 integral,
                                 cell,
                                 point,
@@ -3032,14 +4745,30 @@ impl SystemOperator {
                                 time,
                                 &local_state,
                                 &local_rate,
-                                &self.input_bindings(),
-                                block_index,
+                                &point_bindings,
                             )?;
                             let point_output = match &directions {
-                                None => execute_primal_values(bound, &inputs)?,
+                                None => match composition {
+                                    Some((bind, composition)) => {
+                                        let producer = bound_values
+                                            .iter()
+                                            .find(|value| {
+                                                std::ptr::eq(&self.data.binds[value.bind], bind)
+                                            })
+                                            .expect("every bind has a point value");
+                                        execute_bind_composition(
+                                            composition,
+                                            &bind.bound,
+                                            &producer.producer_inputs,
+                                            bound,
+                                            &inputs,
+                                        )?
+                                    }
+                                    None => execute_primal_values(bound, &inputs)?,
+                                },
                                 Some((local_state_direction, local_rate_direction)) => {
                                     let directions = point_directions_system(
-                                        &self.data.fields,
+                                        fields,
                                         integral,
                                         cell,
                                         point,
@@ -3049,8 +4778,7 @@ impl SystemOperator {
                                         time,
                                         local_state_direction,
                                         local_rate_direction,
-                                        &self.input_bindings(),
-                                        block_index,
+                                        &point_bindings,
                                         &evaluation,
                                     )?;
                                     execute_jvp_values(bound, &inputs, &directions)?
@@ -3089,9 +4817,9 @@ impl SystemOperator {
                     .data
                     .fields
                     .iter()
-                    .map(|(&symbol, field)| {
+                    .map(|(&variable, field)| {
                         (
-                            symbol,
+                            variable,
                             vec![0.0; field.dofs.restrictions()[cell].dofs.len()],
                         )
                     })
@@ -3102,13 +4830,26 @@ impl SystemOperator {
                     }
                     let active_inputs = active_probe_inputs(integral, rate_shift);
                     for (output_index, qoutput) in integral.primal.outputs.iter().enumerate() {
-                        let bound = bound_kernel(bindings, block, integral, output_index)?;
+                        let bound = bound_kernel(bindings, &row.path, integral, output_index)?;
                         let output_components = component_count(&qoutput.shape)?;
                         for (point, quadrature_point) in quadrature.iter().enumerate() {
                             let reference_point = &quadrature_point.coordinates;
                             let scale = quadrature_point.weight * geometry.determinant();
+                            let bound_values = self.bound_point_values(
+                                cell,
+                                point,
+                                geometry,
+                                affine,
+                                reference_point,
+                                time,
+                                &local_state,
+                                &local_rate,
+                                None,
+                            )?;
+                            let point_bindings =
+                                self.row_bindings(row_index, row.instance, &bound_values);
                             let (inputs, evaluation) = point_inputs_system(
-                                &self.data.fields,
+                                fields,
                                 integral,
                                 cell,
                                 point,
@@ -3118,8 +4859,7 @@ impl SystemOperator {
                                 time,
                                 &local_state,
                                 &local_rate,
-                                &self.input_bindings(),
-                                block_index,
+                                &point_bindings,
                             )?;
                             let seed = gather_field_test_adjoint(
                                 row_field,
@@ -3133,11 +4873,12 @@ impl SystemOperator {
                                 &local_adjoint,
                             )?;
                             let mut cotangents = execute_vjp_values(bound, &inputs, seed.clone())?;
+                            let mut bound_seeds: BoundSeeds = vec![None; self.data.binds.len()];
                             if !bound.bundle.parameter.independent_operands.is_empty() {
                                 let parameter_cotangents =
                                     point_parameter_cotangents(bound, &inputs, &seed)?;
                                 accumulate_parameter_cotangents_system(
-                                    &self.data.fields,
+                                    fields,
                                     integral,
                                     cell,
                                     point,
@@ -3148,11 +4889,11 @@ impl SystemOperator {
                                     rate_shift,
                                     &evaluation,
                                     &active_inputs,
-                                    &self.input_bindings(),
-                                    block_index,
+                                    &point_bindings,
                                     &parameter_cotangents,
                                     &mut cotangents,
                                     &mut local_outputs,
+                                    &mut bound_seeds,
                                 )?;
                             }
                             for input in &integral.primal.inputs {
@@ -3170,7 +4911,7 @@ impl SystemOperator {
                                     continue;
                                 };
                                 scatter_field_cotangent(
-                                    &self.data.fields,
+                                    fields,
                                     input.binding.symbol,
                                     geometry,
                                     affine,
@@ -3183,14 +4924,28 @@ impl SystemOperator {
                                     &mut local_outputs,
                                 )?;
                             }
+                            if bound_seeds.iter().any(Option::is_some) {
+                                self.push_bound_cotangents(
+                                    &bound_values,
+                                    &mut bound_seeds,
+                                    cell,
+                                    point,
+                                    geometry,
+                                    affine,
+                                    reference_point,
+                                    scale,
+                                    rate_shift,
+                                    &mut local_outputs,
+                                )?;
+                            }
                         }
                     }
                 }
-                for (symbol, local_output) in &local_outputs {
+                for (variable, local_output) in &local_outputs {
                     let field_block = layout
-                        .block(*symbol)
+                        .block_by_variable(*variable)
                         .expect("realized field implies a layout block");
-                    let restriction = &self.data.fields[symbol].dofs.restrictions()[cell];
+                    let restriction = &self.data.fields[variable].dofs.restrictions()[cell];
                     for (local_index, dof) in restriction.dofs.iter().enumerate() {
                         output[field_block.offset + dof.0] += local_output[local_index];
                     }
@@ -3206,7 +4961,7 @@ impl SystemOperator {
     /// `SystemRealizationPlan::bind_kernels_with_facets`'s doc comment), so `action` selects only
     /// which of `execute_primal_values`/`execute_jvp_values` runs the (input-free) bound kernel.
     fn apply_facets(&self, output: &mut [f64], action: FacetAction) -> Result<(), FinitumError> {
-        for (block_index, block) in self.data.plan.system().blocks.iter().enumerate() {
+        for (row_index, row, block) in self.data.plan.rows() {
             for integral in &block.factorization.integrals {
                 let region = match &integral.measure {
                     SemanticMeasure::ExteriorFacet { region } => *region,
@@ -3218,7 +4973,9 @@ impl SystemOperator {
                     .get(&region)
                     .expect("validated non-empty at bind_kernels_with_facets");
                 for &facet_id in facet_ids {
-                    self.apply_block_facet(block_index, block, integral, facet_id, output, action)?;
+                    self.apply_block_facet(
+                        row_index, row, block, integral, facet_id, output, action,
+                    )?;
                 }
             }
         }
@@ -3228,7 +4985,8 @@ impl SystemOperator {
     #[allow(clippy::too_many_arguments)]
     fn apply_block_facet(
         &self,
-        block_index: usize,
+        row_index: usize,
+        row: &RealizedRow,
         block: &OperatorSystemBlock,
         integral: &IntegralOperatorFactorization,
         facet_id: FacetId,
@@ -3236,19 +4994,23 @@ impl SystemOperator {
         action: FacetAction,
     ) -> Result<(), FinitumError> {
         let layout = self.layout();
-        let row_field = self.data.fields.get(&block.row).ok_or_else(|| {
-            FinitumError::ArtifactMismatch(format!(
-                "equation `{}` row field {} was not realized",
-                block.equation, block.row
-            ))
-        })?;
+        let block_index = row_index;
+        let (row_variable, row_field) = self
+            .instance_fields(row.instance)
+            .field(block.row)
+            .map_err(|_| {
+                FinitumError::ArtifactMismatch(format!(
+                    "equation `{}` row field {} was not realized",
+                    row.path, block.row
+                ))
+            })?;
         let orientations = match &row_field.kind {
             FieldKind::Hdiv0 { orientations } => orientations,
             FieldKind::Lagrange(_) => {
                 return Err(FinitumError::ArtifactMismatch(format!(
                     "equation `{}` has an exterior-facet integral but row field {} is not \
                      Hdiv(order=0) (should have been refused at bind_kernels_with_facets time)",
-                    block.equation, block.row
+                    row.path, block.row
                 )));
             }
         };
@@ -3264,21 +5026,14 @@ impl SystemOperator {
             ))
         })?;
         let row_block = layout
-            .block(block.row)
+            .block_by_variable(row_variable)
             .expect("row field implies a layout block");
         let restriction = &row_field.dofs.restrictions()[cell];
         let mut local_output = vec![0.0; restriction.dofs.len()];
         let bindings = &self.data.bindings[&block_index];
         let inputs = BTreeMap::new();
         for (output_index, _qoutput) in integral.primal.outputs.iter().enumerate() {
-            let bound = bindings
-                .get(&(integral.integral_index, output_index))
-                .ok_or_else(|| {
-                    FinitumError::ArtifactMismatch(format!(
-                        "equation `{}` integral {} output {output_index} has no bound kernel",
-                        block.equation, integral.integral_index
-                    ))
-                })?;
+            let bound = bound_kernel(bindings, &row.path, integral, output_index)?;
             let point_output = match action {
                 FacetAction::Primal => execute_primal_values(bound, &inputs)?,
                 FacetAction::Jvp => {
@@ -3344,7 +5099,7 @@ fn numeric_error(error: FinitumError) -> NumericError {
 
 fn bound_kernel<'a>(
     bindings: &'a BTreeMap<(usize, usize), BoundBundle>,
-    block: &OperatorSystemBlock,
+    equation: &str,
     integral: &IntegralOperatorFactorization,
     output_index: usize,
 ) -> Result<&'a BoundBundle, FinitumError> {
@@ -3352,8 +5107,8 @@ fn bound_kernel<'a>(
         .get(&(integral.integral_index, output_index))
         .ok_or_else(|| {
             FinitumError::ArtifactMismatch(format!(
-                "equation `{}` integral {} output {output_index} has no bound kernel",
-                block.equation, integral.integral_index
+                "equation `{equation}` integral {} output {output_index} has no bound kernel",
+                integral.integral_index
             ))
         })
 }
@@ -3379,9 +5134,28 @@ impl LinearOperator for SystemOperator {
             return *proof;
         }
         if self.data.equation_sign.values().any(|&sign| sign != 1.0) {
-            OperatorSymmetry::Unknown
+            return OperatorSymmetry::Unknown;
+        }
+        // A same-mesh bind adds cross blocks no per-model structure describes; several
+        // instances without binds are block-diagonal, symmetric iff every instance is.
+        if !self.data.binds.is_empty() {
+            return OperatorSymmetry::Unknown;
+        }
+        let claims = self
+            .data
+            .structures
+            .iter()
+            .map(|structure| map_form_symmetry(structure.form_symmetry))
+            .collect::<Vec<_>>();
+        if claims
+            .iter()
+            .all(|claim| *claim == OperatorSymmetry::Symmetric)
+        {
+            OperatorSymmetry::Symmetric
+        } else if claims.contains(&OperatorSymmetry::Nonsymmetric) {
+            OperatorSymmetry::Nonsymmetric
         } else {
-            map_form_symmetry(self.data.structure.form_symmetry)
+            OperatorSymmetry::Unknown
         }
     }
 
@@ -3946,14 +5720,11 @@ impl ReducedSystemOperator {
     /// digest is [`SystemOperator::digest`].
     pub fn capability(&self) -> RealizationCapability {
         let data = &self.operator.data;
-        let system = data.plan.system();
         let mut elements = Vec::new();
-        for block in &system.blocks {
+        let mut seen_elements = BTreeSet::new();
+        for (_, row, block) in data.plan.rows() {
             for element in &block.requirements.elements {
-                if elements
-                    .iter()
-                    .any(|seen: &CapabilityElement| seen.symbol == element.symbol)
-                {
+                if !seen_elements.insert((row.instance, element.symbol)) {
                     continue;
                 }
                 elements.push(CapabilityElement {
@@ -3965,10 +5736,10 @@ impl ReducedSystemOperator {
                 });
             }
         }
-        let measures = system
-            .blocks
-            .iter()
-            .flat_map(|block| block.factorization.integrals.iter())
+        let measures = data
+            .plan
+            .rows()
+            .flat_map(|(_, _, block)| block.factorization.integrals.iter())
             .map(|integral| integral.measure.clone())
             .collect::<Vec<_>>();
         let mut constraint_kinds = BTreeSet::new();
@@ -3985,7 +5756,7 @@ impl ReducedSystemOperator {
         ];
         if data.facet_regions.is_empty() {
             representation_kinds.push(RepresentationKind::ElementAssembly);
-            if data.constitutive.is_empty() {
+            if data.constitutive.is_empty() && data.binds.is_empty() {
                 representation_kinds.push(RepresentationKind::PartialAssembly);
             }
         }
@@ -4002,22 +5773,19 @@ impl ReducedSystemOperator {
         }
         let receipt = RealizationReceipt {
             source_requirements_digest: combined_digest(
-                system
-                    .blocks
-                    .iter()
-                    .map(|block| &block.requirements.artifact_digest),
+                data.plan
+                    .rows()
+                    .map(|(_, _, block)| &block.requirements.artifact_digest),
             ),
             source_factorization_digest: combined_digest(
-                system
-                    .blocks
-                    .iter()
-                    .map(|block| &block.factorization.artifact_digest),
+                data.plan
+                    .rows()
+                    .map(|(_, _, block)| &block.factorization.artifact_digest),
             ),
             source_kernels_digest: combined_digest(
-                system
-                    .blocks
-                    .iter()
-                    .map(|block| &block.kernels.artifact_digest),
+                data.plan
+                    .rows()
+                    .map(|(_, _, block)| &block.kernels.artifact_digest),
             ),
             realization_digest: data.digest.clone(),
         };
@@ -4037,18 +5805,13 @@ impl ReducedSystemOperator {
     /// realization ([`SystemRealizationArtifact`]).
     pub fn artifact(&self) -> SystemRealizationArtifact {
         let data = &self.operator.data;
-        let system = data.plan.system();
         let ids = data.plan.system_ids();
-        let blocks = system
-            .blocks
-            .iter()
-            .map(|block| SystemBlockReceipt {
-                equation: block.equation.clone(),
-                residual: ids
-                    .residuals()
-                    .iter()
-                    .find(|residual| residual.equation == block.equation)
-                    .map(|residual| residual.id),
+        let blocks = data
+            .plan
+            .rows()
+            .map(|(_, row, block)| SystemBlockReceipt {
+                equation: row.path.clone(),
+                residual: Some(row.residual),
                 source_requirements_digest: block.requirements.artifact_digest.clone(),
                 source_factorization_digest: block.factorization.artifact_digest.clone(),
                 source_kernels_digest: block.kernels.artifact_digest.clone(),
@@ -4057,23 +5820,18 @@ impl ReducedSystemOperator {
         let fields = data
             .fields
             .iter()
-            .map(|(&symbol, field)| SystemFieldArtifact {
-                symbol,
-                variable: data
+            .map(|(&variable, field)| SystemFieldArtifact {
+                symbol: data
                     .plan
                     .layout()
-                    .block(symbol)
+                    .block_by_variable(variable)
                     .expect("realized field implies a layout block")
-                    .variable,
+                    .symbol,
+                variable,
                 dofs: field.dofs.clone(),
             })
             .collect();
-        let residual_of = |block_index: usize| {
-            ids.residuals()
-                .iter()
-                .find(|residual| residual.equation == system.blocks[block_index].equation)
-                .map(|residual| residual.id)
-        };
+        let residual_of = |block_index: usize| Some(data.plan.rows[block_index].residual);
         let mut external_inputs = Vec::new();
         for (&(block_index, integral_index, input), table) in &data.stored {
             external_inputs.push(SystemRealizationExternalInput {
@@ -4097,6 +5855,11 @@ impl ReducedSystemOperator {
                 },
             });
         }
+        let instances = if data.plan.composed.is_some() {
+            ids.instances().to_vec()
+        } else {
+            Vec::new()
+        };
         SystemRealizationArtifact {
             schema: SYSTEM_REALIZATION_ARTIFACT_SCHEMA.into(),
             artifact_digest: data.digest.clone(),
@@ -4107,6 +5870,8 @@ impl ReducedSystemOperator {
             fields,
             constraints: self.constraints.clone(),
             external_inputs,
+            instances,
+            binds: self.operator.binds(),
         }
     }
 }
@@ -4189,12 +5954,38 @@ pub struct SystemRealizationArtifact {
     pub fields: Vec<SystemFieldArtifact>,
     pub constraints: ConstraintSet,
     pub external_inputs: Vec<SystemRealizationExternalInput>,
+    /// W8 F-MI: the instances of a composed plan (empty on a one-instance plan, whose
+    /// serialized form is therefore unchanged).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<crate::system_ids::InstanceRecord>,
+    /// W8 F-MI: every same-mesh bind the operator realizes (empty on a one-instance plan).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub binds: Vec<SystemBindReceipt>,
+}
+
+/// One same-mesh bind of a composed [`SystemOperator`] (W8 lane F-MI): which slot it closes,
+/// the producer output, the path it takes, the `(row, column)` blocks it occupies in the
+/// `scientia-operator-system/2` artifact, and the Malleus composition digests (kernel-input
+/// path) the operator validated and, for the primal, executes.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SystemBindReceipt {
+    pub consumer_slot: String,
+    pub consumer: InstanceId,
+    pub producer: InstanceId,
+    /// `<producer instance>.<output>`.
+    pub output: String,
+    pub path: BindPath,
+    pub rows: Vec<SysResId>,
+    pub columns: Vec<SysVarId>,
+    pub compositions: Vec<Digest>,
+    pub jvp_compositions: Vec<Digest>,
 }
 
 /// One stored quadrature-point Jacobian of a [`SystemPartialAssemblyOperator`].
 #[derive(Clone, Debug)]
 struct SystemPartialPointAction {
-    row: SymbolId,
+    row: SysVarId,
+    instance: InstanceId,
     point: usize,
     /// Quadrature weight x cell determinant x the row's `equation_sign`.
     scale: f64,
@@ -4249,13 +6040,14 @@ impl SystemPartialAssemblyOperator {
                 let Some(cell) = *cell else { continue };
                 let geometry = CellGeometry::new(mesh, CellId(cell))?;
                 let affine = AffineMap::from_cell(mesh, CellId(cell))?;
-                let local = self.operator.gather_local(cell, &physical);
+                let local = self.operator.gather_cell(cell, &physical);
                 let mut local_outputs = local
                     .iter()
-                    .map(|(&symbol, values)| (symbol, vec![0.0; values.len()]))
+                    .map(|(&variable, values)| (variable, vec![0.0; values.len()]))
                     .collect::<BTreeMap<_, _>>();
                 for action in &self.point_actions[cell] {
                     let reference_point = &data.quadrature[action.point].coordinates;
+                    let fields = self.operator.instance_fields(action.instance);
                     let mut point_input = Vec::new();
                     for qinput in &action.active_inputs {
                         if qinput.binding.evaluation.derivative
@@ -4264,7 +6056,7 @@ impl SystemPartialAssemblyOperator {
                             point_input.extend(vec![0.0; component_count(&qinput.shape)?]);
                             continue;
                         }
-                        let field = &data.fields[&qinput.binding.symbol];
+                        let (variable, field) = fields.field(qinput.binding.symbol)?;
                         point_input.extend(evaluate_field_basis_input(
                             field,
                             &geometry,
@@ -4273,7 +6065,7 @@ impl SystemPartialAssemblyOperator {
                             action.point,
                             reference_point,
                             qinput,
-                            &local[&qinput.binding.symbol],
+                            &local[&variable],
                         )?);
                     }
                     let input_components = point_input.len();
@@ -4300,12 +6092,12 @@ impl SystemPartialAssemblyOperator {
                             .expect("row field is realized"),
                     )?;
                 }
-                for (symbol, local_output) in &local_outputs {
+                for (variable, local_output) in &local_outputs {
                     let offset = layout
-                        .block(*symbol)
+                        .block_by_variable(*variable)
                         .expect("realized field implies a layout block")
                         .offset;
-                    let restriction = &data.fields[symbol].dofs.restrictions()[cell];
+                    let restriction = &data.fields[variable].dofs.restrictions()[cell];
                     for (local_index, dof) in restriction.dofs.iter().enumerate() {
                         physical_output[offset + dof.0] += local_output[local_index];
                     }
@@ -5060,7 +6852,7 @@ fn gather_field_test_adjoint(
 /// output (the trial-side scatter of the system VJP).
 #[allow(clippy::too_many_arguments)]
 fn scatter_field_cotangent(
-    fields: &BTreeMap<SymbolId, FieldElement>,
+    fields: InstanceFields<'_>,
     symbol: SymbolId,
     geometry: &CellGeometry,
     affine: &AffineMap,
@@ -5070,15 +6862,15 @@ fn scatter_field_cotangent(
     derivative: &DerivativeEvaluation,
     cotangent: &[f64],
     scale: f64,
-    local_outputs: &mut BTreeMap<SymbolId, Vec<f64>>,
+    local_outputs: &mut BTreeMap<SysVarId, Vec<f64>>,
 ) -> Result<(), FinitumError> {
-    let field = fields.get(&symbol).ok_or_else(|| {
+    let (variable, field) = fields.field(symbol).map_err(|_| {
         FinitumError::ArtifactMismatch(format!(
             "VJP cotangent references field {symbol} which the system operator has not realized"
         ))
     })?;
     let local_output = local_outputs
-        .get_mut(&symbol)
+        .get_mut(&variable)
         .expect("every realized field has a local output");
     apply_field_basis_adjoint(
         field,
@@ -5094,15 +6886,76 @@ fn scatter_field_cotangent(
     )
 }
 
+/// A cell's local state and rate directions by variable, when a JVP is being evaluated.
+type LocalDirections<'a> = Option<(
+    &'a BTreeMap<SysVarId, Vec<f64>>,
+    &'a BTreeMap<SysVarId, Vec<f64>>,
+)>;
+
+/// The per-point cotangent seeds of every bind's producer output (W8 F-MI), indexed like
+/// `SystemOperatorData::binds`; filled by [`accumulate_parameter_cotangents_system`] and
+/// pushed back through the producer kernels by [`SystemOperator::push_bound_cotangents`].
+type BoundSeeds = Vec<Option<Vec<f64>>>;
+
+fn add_bound_seed(seeds: &mut BoundSeeds, bind: usize, contribution: &[f64]) {
+    let entry = seeds[bind].get_or_insert_with(|| vec![0.0; contribution.len()]);
+    for (total, value) in entry.iter_mut().zip(contribution) {
+        *total += value;
+    }
+}
+
+/// A direction [`PointEvaluation`] that is zero on every active input and every bound input
+/// except one unit component of the bound input closing `symbol` -- the probe of a
+/// constitutive closure's chain rule through a same-mesh bind (W8 F-MI).
+fn probe_bound_direction_evaluation(
+    evaluation: &PointEvaluation,
+    active_inputs: &[&QFunctionInput],
+    symbol: SymbolId,
+    component: usize,
+) -> Result<PointEvaluation, FinitumError> {
+    let mut active = Vec::with_capacity(active_inputs.len());
+    for input in active_inputs {
+        active.push(PointActiveInput {
+            input: input.id,
+            derivative: input.binding.evaluation.derivative,
+            values: vec![0.0; component_count(&input.shape)?],
+        });
+    }
+    let bound = evaluation
+        .bound
+        .iter()
+        .map(|input| {
+            let mut values = vec![0.0; input.values.len()];
+            if input.symbol == symbol {
+                values[component] = 1.0;
+            }
+            PointBoundInput {
+                symbol: input.symbol,
+                slot: input.slot.clone(),
+                values,
+            }
+        })
+        .collect();
+    Ok(PointEvaluation {
+        time: evaluation.time,
+        cell: evaluation.cell,
+        coordinates: evaluation.coordinates.clone(),
+        active,
+        bound,
+    })
+}
+
 /// System analogue of `RealizationPlan::accumulate_parameter_cotangents`: routes each frozen-
 /// input cotangent of the bound parameter kernel to its exact destination. A passive basis-
 /// sourced input scatters directly through its own field's basis; a constitutive closure's
 /// cotangent is pushed back into the active cotangents by probing its trusted `direction`
 /// closure with unit active perturbations (exact because that closure is contracted to return
-/// the exact, hence linear and homogeneous, directional derivative of its value closure).
+/// the exact, hence linear and homogeneous, directional derivative of its value closure), and
+/// -- on a composed plan -- into the bound inputs' seeds by probing it with unit bound
+/// perturbations; a bound input's own cotangent (kernel-input path) seeds its producer output.
 #[allow(clippy::too_many_arguments)]
 fn accumulate_parameter_cotangents_system(
-    fields: &BTreeMap<SymbolId, FieldElement>,
+    fields: InstanceFields<'_>,
     integral: &IntegralOperatorFactorization,
     cell: usize,
     point: usize,
@@ -5114,10 +6967,10 @@ fn accumulate_parameter_cotangents_system(
     evaluation: &PointEvaluation,
     active_inputs: &[&QFunctionInput],
     bindings: &SystemInputBindings<'_>,
-    block_index: usize,
     parameter_cotangents: &BTreeMap<TensorInputId, Vec<f64>>,
     cotangents: &mut BTreeMap<TensorInputId, Vec<f64>>,
-    local_outputs: &mut BTreeMap<SymbolId, Vec<f64>>,
+    local_outputs: &mut BTreeMap<SysVarId, Vec<f64>>,
+    bound_seeds: &mut BoundSeeds,
 ) -> Result<(), FinitumError> {
     for (input_id, grad) in parameter_cotangents {
         let input = integral
@@ -5149,21 +7002,36 @@ fn accumulate_parameter_cotangents_system(
             )?;
             continue;
         }
-        let key = (block_index, integral.integral_index, *input_id);
-        let binding = match bindings.resolve(key)? {
+        let binding = match bindings.resolve(integral.integral_index, input)? {
             // A stored table is state-independent: no chain rule through it.
             SystemInputBinding::Stored(_) => continue,
+            SystemInputBinding::Bound(bound) => {
+                // The kernel-input path: the cotangent of the bound operand (unscaled: the
+                // quadrature scale is applied once, when the producer chain scatters).
+                add_bound_seed(bound_seeds, bound.bind, grad);
+                continue;
+            }
             SystemInputBinding::Constitutive(binding) => binding,
         };
         for probe_input in active_inputs {
             let count = component_count(&probe_input.shape)?;
             for component in 0..count {
-                let probe = probe_direction_evaluation(
+                let mut probe = probe_direction_evaluation(
                     evaluation,
                     active_inputs,
                     probe_input.id,
                     component,
                 )?;
+                // An active probe holds every bound input's direction at zero.
+                probe.bound = evaluation
+                    .bound
+                    .iter()
+                    .map(|input| PointBoundInput {
+                        symbol: input.symbol,
+                        slot: input.slot.clone(),
+                        values: vec![0.0; input.values.len()],
+                    })
+                    .collect();
                 let response = binding.evaluate_direction(evaluation, &probe)?;
                 if response.len() != grad.len() {
                     return Err(FinitumError::InvalidRealization(format!(
@@ -5185,13 +7053,44 @@ fn accumulate_parameter_cotangents_system(
                 entry[component] += contribution;
             }
         }
+        // The provider-input path: the closure's chain rule through every bound input of its
+        // instance, probed with unit bound perturbations.
+        for (bind, value) in bindings.bound.entries() {
+            let mut seed = vec![0.0; value.values.len()];
+            for (component, seed_component) in seed.iter_mut().enumerate() {
+                let probe = probe_bound_direction_evaluation(
+                    evaluation,
+                    active_inputs,
+                    bind.consumer_symbol,
+                    component,
+                )?;
+                let response = binding.evaluate_direction(evaluation, &probe)?;
+                if response.len() != grad.len() {
+                    return Err(FinitumError::InvalidRealization(format!(
+                        "constitutive input {input_id:?} direction returned {} components, \
+                         expected {}",
+                        response.len(),
+                        grad.len()
+                    )));
+                }
+                validate_finite("constitutive input bound direction probe", &response)?;
+                *seed_component = response
+                    .iter()
+                    .zip(grad.iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+            }
+            if seed.iter().any(|component| *component != 0.0) {
+                add_bound_seed(bound_seeds, value.bind, &seed);
+            }
+        }
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn point_inputs_system(
-    fields: &BTreeMap<SymbolId, FieldElement>,
+    fields: InstanceFields<'_>,
     integral: &IntegralOperatorFactorization,
     cell: usize,
     point: usize,
@@ -5199,10 +7098,9 @@ fn point_inputs_system(
     affine: &AffineMap,
     reference_point: &[f64],
     time: f64,
-    local_state: &BTreeMap<SymbolId, Vec<f64>>,
-    local_rate: &BTreeMap<SymbolId, Vec<f64>>,
+    local_state: &BTreeMap<SysVarId, Vec<f64>>,
+    local_rate: &BTreeMap<SysVarId, Vec<f64>>,
     bindings: &SystemInputBindings<'_>,
-    block_index: usize,
 ) -> Result<(BTreeMap<TensorInputId, Vec<f64>>, PointEvaluation), FinitumError> {
     let mut inputs = BTreeMap::new();
     let mut active = Vec::new();
@@ -5210,7 +7108,7 @@ fn point_inputs_system(
         if input.source != InputSourceRequirement::Basis {
             continue;
         }
-        let field = fields.get(&input.binding.symbol).ok_or_else(|| {
+        let (variable, field) = fields.field(input.binding.symbol).map_err(|_| {
             FinitumError::ArtifactMismatch(format!(
                 "integral {} input {:?} references field {} which the system operator has not \
                  realized",
@@ -5218,9 +7116,9 @@ fn point_inputs_system(
             ))
         })?;
         let dofs = if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
-            &local_rate[&input.binding.symbol]
+            &local_rate[&variable]
         } else {
-            &local_state[&input.binding.symbol]
+            &local_state[&variable]
         };
         let values = evaluate_field_basis_input(
             field,
@@ -5246,17 +7144,18 @@ fn point_inputs_system(
         cell: CellId(cell),
         coordinates: geometry.physical_point(reference_point),
         active,
+        bound: bindings.bound.point_inputs(),
     };
     for input in &integral.primal.inputs {
         if input.source == InputSourceRequirement::Basis {
             continue;
         }
-        let key = (block_index, integral.integral_index, input.id);
-        let values = match bindings.resolve(key)? {
+        let values = match bindings.resolve(integral.integral_index, input)? {
             SystemInputBinding::Stored(stored) => stored
                 .point_values(cell, point, bindings.point_count)
                 .to_vec(),
             SystemInputBinding::Constitutive(binding) => binding.evaluate_value(&evaluation)?,
+            SystemInputBinding::Bound(bound) => bound.values.clone(),
         };
         if values.len() != component_count(&input.shape)? {
             return Err(FinitumError::InvalidRealization(format!(
@@ -5274,7 +7173,7 @@ fn point_inputs_system(
 
 #[allow(clippy::too_many_arguments)]
 fn point_directions_system(
-    fields: &BTreeMap<SymbolId, FieldElement>,
+    fields: InstanceFields<'_>,
     integral: &IntegralOperatorFactorization,
     cell: usize,
     point: usize,
@@ -5282,10 +7181,9 @@ fn point_directions_system(
     affine: &AffineMap,
     reference_point: &[f64],
     time: f64,
-    local_state_direction: &BTreeMap<SymbolId, Vec<f64>>,
-    local_rate_direction: &BTreeMap<SymbolId, Vec<f64>>,
+    local_state_direction: &BTreeMap<SysVarId, Vec<f64>>,
+    local_rate_direction: &BTreeMap<SysVarId, Vec<f64>>,
     bindings: &SystemInputBindings<'_>,
-    block_index: usize,
     evaluation: &PointEvaluation,
 ) -> Result<BTreeMap<TensorInputId, Vec<f64>>, FinitumError> {
     let mut directions = BTreeMap::new();
@@ -5294,7 +7192,7 @@ fn point_directions_system(
         if input.source != InputSourceRequirement::Basis {
             continue;
         }
-        let field = fields.get(&input.binding.symbol).ok_or_else(|| {
+        let (variable, field) = fields.field(input.binding.symbol).map_err(|_| {
             FinitumError::ArtifactMismatch(format!(
                 "integral {} input {:?} references field {} which the system operator has not \
                  realized",
@@ -5302,9 +7200,9 @@ fn point_directions_system(
             ))
         })?;
         let dofs = if input.binding.evaluation.derivative == DerivativeEvaluation::TimeDerivative {
-            &local_rate_direction[&input.binding.symbol]
+            &local_rate_direction[&variable]
         } else {
-            &local_state_direction[&input.binding.symbol]
+            &local_state_direction[&variable]
         };
         let values = evaluate_field_basis_input(
             field,
@@ -5330,17 +7228,21 @@ fn point_directions_system(
         cell: CellId(cell),
         coordinates: evaluation.coordinates.clone(),
         active,
+        bound: bindings.bound.point_directions(),
     };
     for input in &integral.primal.inputs {
         if input.source == InputSourceRequirement::Basis {
             continue;
         }
-        let key = (block_index, integral.integral_index, input.id);
-        let values = match bindings.resolve(key)? {
+        let values = match bindings.resolve(integral.integral_index, input)? {
             SystemInputBinding::Stored(stored) => vec![0.0; stored.component_count()],
             SystemInputBinding::Constitutive(binding) => {
                 binding.evaluate_direction(evaluation, &direction_evaluation)?
             }
+            SystemInputBinding::Bound(bound) => bound
+                .direction
+                .clone()
+                .unwrap_or_else(|| vec![0.0; bound.values.len()]),
         };
         if values.len() != component_count(&input.shape)? {
             return Err(FinitumError::InvalidRealization(format!(
@@ -5356,6 +7258,77 @@ fn point_directions_system(
     Ok(directions)
 }
 
+/// Runs one kernel-input bind composition at a quadrature point (W8 F-MI, the Malleus
+/// contract for `BoundChain::Composed`): stage 0 is the producer output's primal kernel over
+/// `producer_inputs`, stage 1 the consumer's primal kernel over `consumer_inputs`; the shared
+/// buffer carries the output into the consumer's bound operand(s). Returns the consumer's
+/// primal output at the point.
+fn execute_bind_composition(
+    composition: &BoundComposition,
+    producer: &BoundBundle,
+    producer_inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+    consumer: &BoundBundle,
+    consumer_inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+) -> Result<Vec<f64>, FinitumError> {
+    let stages = [(producer, producer_inputs), (consumer, consumer_inputs)];
+    let mut buffers: Vec<(malleus::StageOperand, Vec<f64>)> = Vec::new();
+    for (stage_index, (bound, inputs)) in stages.iter().enumerate() {
+        let kernel = &composition.composition.composition.stages[stage_index];
+        let by_operand = bound
+            .bundle
+            .primal_inputs
+            .iter()
+            .map(|binding| (binding.operand, binding.input))
+            .collect::<BTreeMap<_, _>>();
+        for (index, operand) in kernel.operands.iter().enumerate() {
+            let target = malleus::StageOperand::new(stage_index, malleus::OperandId::new(index));
+            if composition.executable.shared_buffer_of(target).is_some() {
+                continue;
+            }
+            let mut values = vec![0.0; operand.region.offset + operand.region.length];
+            if let Some(input) = by_operand.get(&target.operand) {
+                let point_values = inputs.get(input).ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "bundle input {input:?} is absent from the gathered point inputs"
+                    ))
+                })?;
+                let count = component_count(&operand.shape)?;
+                if point_values.len() != count {
+                    return Err(FinitumError::InvalidRealization(format!(
+                        "composition stage {stage_index} operand {index} received {} values, \
+                         expected {count}",
+                        point_values.len()
+                    )));
+                }
+                let start = operand.region.offset;
+                values[start..start + count].copy_from_slice(point_values);
+            }
+            buffers.push((target, values));
+        }
+    }
+    let mut bindings = buffers
+        .iter_mut()
+        .map(|(target, values)| malleus::CompositionBinding::operand(*target, values))
+        .collect::<Vec<_>>();
+    malleus::Interpreter::run_composition(&composition.executable, &mut bindings)
+        .map_err(|error| FinitumError::KernelExecution(error.to_string()))?;
+    drop(bindings);
+    let output = malleus::StageOperand::new(1, consumer.bundle.primal_output);
+    let definition =
+        &composition.composition.composition.stages[1].operands[output.operand.index()];
+    let count = component_count(&definition.shape)?;
+    let start = definition.region.offset;
+    buffers
+        .iter()
+        .find(|(target, _)| *target == output)
+        .map(|(_, values)| values[start..start + count].to_vec())
+        .ok_or_else(|| {
+            FinitumError::InvalidRealization(
+                "the composition's consumer output operand was not bound".into(),
+            )
+        })
+}
+
 /// One essential (Dirichlet) constraint requirement for a single field within a
 /// [`SystemOperator`]'s [`BlockLayout`].
 #[derive(Clone, Debug)]
@@ -5369,7 +7342,7 @@ pub struct SystemEssentialConstraintRequirement {
 /// fields' boundary DOFs from a [`TaggedMesh`]/[`RegionMap`] into `operator`'s [`BlockLayout`]
 /// [`ConstraintSet`], reusing the same [`crate::FacetTopology`]/[`RegionMap`] region-tag
 /// resolution [`crate::essential_constraints_from`] uses and composing it with
-/// [`essential_constraints_for_blocks`] (unchanged) for the elimination-facing `ConstraintSet`
+/// [`crate::essential_constraints_for_variables`] for the elimination-facing `ConstraintSet`
 /// construction -- rather than duplicating *that* DOF-indexing machinery.
 ///
 /// This does not delegate to [`crate::essential_constraints_from`] itself, because that function is
@@ -5405,6 +7378,69 @@ pub fn essential_constraints_from_system_at(
     requirements: &[SystemEssentialConstraintRequirement],
     time: f64,
 ) -> Result<ConstraintSet, FinitumError> {
+    let layout = operator.layout();
+    let keyed = requirements
+        .iter()
+        .map(|requirement| {
+            let variable = layout
+                .block(requirement.field)
+                .map(|block| block.variable)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(format!(
+                        "essential constraint requirement names field {} which the system \
+                         operator has not realized",
+                        requirement.field
+                    ))
+                })?;
+            Ok(SystemVariableEssentialConstraint {
+                variable,
+                requirement: requirement.requirement.clone(),
+                value: requirement.value.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, FinitumError>>()?;
+    let region_maps = operator
+        .system_ids()
+        .instances()
+        .iter()
+        .map(|record| (record.instance, region_map))
+        .collect::<Vec<_>>();
+    essential_constraints_from_system_by_variable_at(operator, mesh, &region_maps, &keyed, time)
+}
+
+/// One essential (Dirichlet) constraint requirement keyed by system variable (W8 lane F-MI):
+/// the per-model requirement of the variable's instance (its `region` is that instance's
+/// per-model `RegionId`) and the value source.
+#[derive(Clone, Debug)]
+pub struct SystemVariableEssentialConstraint {
+    pub variable: SysVarId,
+    pub requirement: EssentialConstraintRequirement,
+    pub value: FieldSource,
+}
+
+/// [`essential_constraints_from_system_by_variable_at`] at `t = 0`.
+pub fn essential_constraints_from_system_by_variable(
+    operator: &SystemOperator,
+    mesh: &TaggedMesh,
+    region_maps: &[(InstanceId, &RegionMap)],
+    requirements: &[SystemVariableEssentialConstraint],
+) -> Result<ConstraintSet, FinitumError> {
+    essential_constraints_from_system_by_variable_at(operator, mesh, region_maps, requirements, 0.0)
+}
+
+/// W8 lane F-MI: [`essential_constraints_from_system_at`] over a composed (multi-instance)
+/// layout -- every requirement names its field by [`SysVarId`], and its per-model region is
+/// resolved through the [`RegionMap`] of the variable's instance (`region_maps`, one entry per
+/// instance that has constrained fields; an instance without an entry is refused
+/// `RealizationRegionUnmapped`). Constraints touch only the named variable's block. On a
+/// one-instance plan this is exactly [`essential_constraints_from_system_at`].
+pub fn essential_constraints_from_system_by_variable_at(
+    operator: &SystemOperator,
+    mesh: &TaggedMesh,
+    region_maps: &[(InstanceId, &RegionMap)],
+    requirements: &[SystemVariableEssentialConstraint],
+    time: f64,
+) -> Result<ConstraintSet, FinitumError> {
     if !time.is_finite() {
         return Err(FinitumError::InvalidRealization(
             "essential constraint evaluation time must be finite".into(),
@@ -5436,19 +7472,36 @@ pub fn essential_constraints_from_system_at(
 
     let mut values = Vec::new();
     for requirement in requirements {
-        let dof_map = operator.dof_map(requirement.field).ok_or_else(|| {
-            FinitumError::InvalidRealization(format!(
-                "essential constraint requirement names field {} which the system operator has \
-                 not realized",
-                requirement.field
-            ))
-        })?;
+        let dof_map = operator
+            .dof_map_by_variable(requirement.variable)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "essential constraint requirement names variable {} which the system \
+                     operator has not realized",
+                    requirement.variable
+                ))
+            })?;
         let block = layout
-            .block(requirement.field)
+            .block_by_variable(requirement.variable)
             .expect("a realized field's DOF map implies a layout block");
+        let instance = operator
+            .system_ids()
+            .variable_origin(requirement.variable)
+            .expect("a realized variable has an origin")
+            .instance;
+        let region_map = region_maps
+            .iter()
+            .find(|(candidate, _)| *candidate == instance)
+            .map(|(_, region_map)| *region_map)
+            .ok_or_else(|| {
+                FinitumError::RealizationRegionUnmapped(format!(
+                    "{:?} of {instance} (no region map for the instance)",
+                    requirement.requirement.region
+                ))
+            })?;
         let components = block.component_count;
         if matches!(
-            operator.data.fields[&requirement.field].kind,
+            operator.data.fields[&requirement.variable].kind,
             FieldKind::Hdiv0 { .. }
         ) {
             rt0_essential_values(
@@ -5457,6 +7510,7 @@ pub fn essential_constraints_from_system_at(
                 mesh,
                 region_map,
                 requirement,
+                block.symbol,
                 time,
                 &mut values,
             )?;
@@ -5546,8 +7600,8 @@ pub fn essential_constraints_from_system_at(
                         "essential value is not finite".into(),
                     ));
                 }
-                values.push(BlockEssentialValue {
-                    block: requirement.field,
+                values.push(BlockVariableEssentialValue {
+                    variable: requirement.variable,
                     entity: node,
                     component,
                     value,
@@ -5555,7 +7609,7 @@ pub fn essential_constraints_from_system_at(
             }
         }
     }
-    essential_constraints_for_blocks(layout, values)
+    essential_constraints_for_variables(layout, values)
 }
 
 /// GX-CONTRACTS C11.22: essential normal-trace data on an RT0 (`Hdiv(order=0)`) field. The
@@ -5570,14 +7624,16 @@ pub fn essential_constraints_from_system_at(
 /// the divergence theorem through the `mass_balance` block action in
 /// `tests/w7_rt0_essential.rs`. Interior facets in the region and nodal sources are refused
 /// typed (RT0 has no nodes; an interior facet has no outward normal).
+#[allow(clippy::too_many_arguments)]
 fn rt0_essential_values(
     facets: &crate::FacetTopology,
     mesh: &Mesh,
     tagged: &TaggedMesh,
     region_map: &RegionMap,
-    requirement: &SystemEssentialConstraintRequirement,
+    requirement: &SystemVariableEssentialConstraint,
+    field: SymbolId,
     time: f64,
-    values: &mut Vec<BlockEssentialValue>,
+    values: &mut Vec<BlockVariableEssentialValue>,
 ) -> Result<(), FinitumError> {
     let tags = region_map
         .tags(requirement.requirement.region)
@@ -5600,7 +7656,7 @@ fn rt0_essential_values(
             return Err(FinitumError::UnsupportedRealization(format!(
                 "essential normal-trace data on RT0 field {} names interior facet {}; only \
                  exterior facets carry an outward normal",
-                requirement.field, facet_id.0
+                field, facet_id.0
             )));
         }
         let vertices = facet
@@ -5651,7 +7707,7 @@ fn rt0_essential_values(
                 return Err(FinitumError::UnsupportedRealization(format!(
                     "RT0 field {} has no nodes; essential normal-trace data must be a \
                      Constant or Sampled scalar",
-                    requirement.field
+                    field
                 )));
             }
             FieldSource::Table(_) | FieldSource::Kernel { .. } => {
@@ -5676,8 +7732,8 @@ fn rt0_essential_values(
         }
         let orientation = f64::from(facet.minus().orientation);
         let basis_flux = 1.0 / (1..dimension).product::<usize>() as f64;
-        values.push(BlockEssentialValue {
-            block: requirement.field,
+        values.push(BlockVariableEssentialValue {
+            variable: requirement.variable,
             entity: facet_id.0,
             component: 0,
             value: orientation * g * measure / basis_flux,

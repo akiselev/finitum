@@ -34,6 +34,15 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   `external_inputs_from` and both essential-constraint samplers; Finitum's own kernel / table
   closures refuse typed (`REALIZATION_PROPERTY_UNAVAILABLE`) instead of NaN or a panic; the
   infallible forms are deleted by slice F3 after Sinbad 7d-2 migrates
++ W8 lane F-MI (Finitum, additive): the multi-instance `SystemRealizationPlan::composed` over
+  Scientia's `scientia-operator-system/2` -- rows by `SysResId`, fields by `SysVarId` (two
+  instances of one model, or two models with colliding `SymbolId`s, realize as distinct
+  blocks), same-mesh `bind` chains realized at bind time (kernel-input path: the producer
+  output kernel feeds the consumer operand through the Malleus `BindComposition`, executed
+  for the residual; provider-input path: the output's value and tangent reach the consumer
+  closures as `PointEvaluation::bound`), cross blocks by the §6 chain rule (JVP and exact
+  VJP), keyed essential constraints, `finitum-system-realization/3` identity for composed
+  plans; one-instance plans and every `/2` digest bitwise unchanged (`w7_system_path_parity`)
 
 ## Implemented
 
@@ -839,6 +848,153 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     change no behaviour and that none of `finitum-system-realization/2`,
     `finitum-system-operator/2`, `finitum-field-sampler/1` moved.
 
+- W8 lane F-MI (2026-09-07, PLAN §6 W8 lane F-MI, gate G2; the exact need of
+  GX-CONTRACTS C12.9 "Sinbad `59b00af`/`ec0042f` -- W8 lane A2", items 1-4;
+  `sinbad/ARCHITECTURE.md` §2.3/§2.4/§2.6/§6/§8): the multi-instance
+  `SystemRealizationPlan` over one realization group (working-tree implementation;
+  coordinator landing pending as of 2026-09-08). Additive: every existing signature,
+  default and digest value is unchanged (the 205 pre-existing tests pass unchanged; the
+  bitwise fixtures of `w7_system_path_parity` are the proof that internal re-keying moved no
+  one-instance value).
+  - **Item 1, keyed layout and tables.** `SystemRealizationPlan::composed(&scientia::
+    SystemOperatorCompilation, mesh, layout, SystemQuadrature)` accepts the `/2`
+    `SystemOperator` with its per-instance `/1` `OperatorSystem`s (`model_systems`, checked
+    against `instance_artifacts` and each `SysResBlock`'s `model_system`/`block` digests by
+    `scientia::block_digest`), its `output_kernels` and `compositions`; ids come from
+    `SystemIdMap::from_scientia`; the layout is `BlockLayout::new_keyed` over
+    `system_ids().variables()`. Internally the plan is a list of rows (`SysResId` order, each
+    `(instance, per-model block)`) and the operator's field tables, local gathers, cotangent
+    scatters, partial-assembly actions and receipts are keyed by `SysVarId`; every kernel
+    input's `binding.symbol` resolves through its instance's `symbol -> SysVarId` map. On a
+    one-instance plan the row index is the block index and `SysVarId(symbol.0)` orders the
+    tables exactly as `SymbolId` did, so `(block index, integral, input)` keys, digest payloads
+    and floating-point summation order are unchanged. New accessors: `plan.instance_system
+    (InstanceId)`, `plan.system_operator()` (the `/2`, `None` on a one-instance plan),
+    `SystemOperator::dof_map_by_variable`, `instance_structure(InstanceId)`, `binds()`.
+    `system()` / `structure()` answer instance 0's `/1` artifact / structure; the
+    symbol-keyed `dof_map(symbol)` / `mass_matrix(symbol)` / `essential_constraints_from_system`
+    answer only symbols unique across instances (`BlockLayout::block`'s rule; `V` and `T` of
+    the electrothermal pair are both `SymbolId(0)` of their models, so they are ambiguous
+    there). Closures are keyed by `SystemConstitutiveInput::try_new_for_residual(SysResId,
+    ..)` (an equation-name key is accepted only when unique across instances, else refused
+    typed naming the count) and stored tables by `SystemExternalInput.residual` as before;
+    `equation_sign` accepts the display path `<instance>.<equation>`. Methodus block names are
+    `<instance>/field_<symbol>` on a composed plan (`field_<symbol>` unchanged otherwise);
+    `symmetry()` of a plan with binds is `Unknown` until proven, of several instances without
+    binds the conjunction of the instances' claims. Nullspace candidates stay symbol-keyed and
+    are refused typed when the symbol is ambiguous.
+  - **Item 2, kernel-input binds.** At bind time every bind's producer output (one cell
+    point function, one bundle) is bound with `bind_kernels`; each `BindComposition` is
+    `validate_composition`ed, its `composition_digest` checked against the recorded digest,
+    its JVP rebuilt with `differentiate_composition` under Scientia's request (producer active
+    operands -> consumer output) and checked against `jvp_digest`. At every consumer quadrature
+    point the binds are evaluated in dependency order (an output kernel that reads a bound
+    input of its own instance comes after that bind; an algebraic loop among outputs is refused
+    typed). Residual: a consumer bundle with a composition runs `Interpreter::run_composition`
+    (stage 0 the output primal kernel over the producer's fields gathered at the same point,
+    stage 1 the consumer kernel, the shared buffer carrying `Q`). JVP: the §6 chain-rule
+    product of local point kernels -- the producer bundle's full JVP (active basis directions
+    *and* its frozen-input tangents through `execute_jvp_values`) is the bound operand's
+    direction into the consumer's parameter JVP. **Deviation, recorded:** the `jvp_compositions`
+    are digest-checked but not executed, because their independent set is the producer's
+    active basis operands only (Scientia's request), so executing them alone would drop the
+    provider-input tangent `sigma(T)` inside `joule_heat` and `dR_thermal/dT` through `Q`
+    would be silently short; the two-kernel chain carries both, and Malleus's STATUS records
+    the composition as "the contract, not a mandate to change [Finitum's] loop". VJP: the
+    exact transpose -- the consumer's parameter cotangent of the bound operand seeds the
+    producer output's VJP (active cotangents scattered through the producer's fields; its
+    parameter cotangents chained on into the producer's closures and bound inputs, binds walked
+    in reverse dependency order), proven by the adjoint identity to `1e-12` and equal to the
+    monolithic transpose.
+  - **Item 3, provider-input binds.** `PointEvaluation` gains `bound: Vec<PointBoundInput {
+    symbol, slot, values }>` (empty on every one-instance realization; `bound_values(symbol)`,
+    `bound_slot_values(slot)`): the value of every bound input of the consumer instance at the
+    point, and in the direction callback the output's directional derivative; the transpose
+    probes each closure with unit bound perturbations (`probe_bound_direction_evaluation`) and
+    holds bound directions at zero on active probes. Output kernels' own non-basis inputs
+    (`joule_heat`'s `sigma`) take `SystemConstitutiveInput::try_new_for_output(InstanceId,
+    OutputId, integral, input, ..)` closures, which see the producer instance's active inputs
+    and its bound inputs that precede the output in dependency order; a bound symbol may not
+    also be bound as a closure or table (refused typed), and every other non-basis output input
+    must have a closure (refused typed naming the output and the constructor).
+  - **Item 4, constraints.** `SystemVariableEssentialConstraint { variable: SysVarId,
+    requirement, value }` with `essential_constraints_from_system_by_variable[_at](operator,
+    mesh, region_maps: &[(InstanceId, &RegionMap)], requirements[, time])`: the per-model
+    requirement's `RegionId` resolves through the variable's instance's own `RegionMap` (an
+    instance without one is `RealizationRegionUnmapped` naming region and instance); the
+    symbol-keyed forms delegate to it. `mixed::BlockVariableEssentialValue` /
+    `essential_constraints_for_variables` are the keyed forms `essential_constraints_for_blocks`
+    now delegates to. `reduced` is unchanged (a `ConstraintSet` over the keyed layout).
+    **Deviation, recorded:** no `SysRegionId` newtype -- instance regions are keyed by
+    `(InstanceId, per-model RegionId)`, which is what Sinbad's per-instance `RegionMap`s carry
+    today; a `SysRegionId` table on `SystemIdMap` would change `finitum-system-ids/1` (the
+    one-instance identity `from_scientia == one_instance` is a test) for no consumer.
+  - **Identity and receipts.** Composed plans digest as `finitum-system-realization/3`
+    (`SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA`: the `/2` identity, every instance's name/
+    model/`/1` artifact, the layout by variable and symbol, every bind's slot, output, path and
+    composition/JVP-composition digests); `with_quadrature` plans keep `/2` bitwise.
+    `finitum-system-operator/2` gains an `outputs` list of output-kernel closure identities that
+    is omitted from the payload when empty, so one-instance digests are unchanged.
+    `SystemRealizationArtifact` gains `instances` and `binds: Vec<SystemBindReceipt {
+    consumer_slot, consumer, producer, output, path: BindPath::{KernelInput, ProviderInput},
+    rows, columns, compositions, jvp_compositions }>` (both `skip_serializing_if` empty);
+    `SystemBlockReceipt.equation` is the display path and `residual` always `Some`.
+    `capability()` lists every instance's element requirements and drops `PartialAssembly`
+    when binds exist; `partial_assembly` and therefore `check_system_realization_agreement`
+    refuse typed (`RepresentationUnsupported { PartialAssembly, equation: <consumer row>,
+    reason: "the same-mesh bind on `..`" }`) because a bind chain is a state-dependent point
+    chain; matrix-free, `assemble`, `element_assembly`, `linearize`, `block_operator`,
+    coefficient JVP/VJP (a stored table on one instance's row) and `prove_symmetry` work.
+  - Coordinator review follow-up (2026-09-08, working tree): output closures now remain
+    available for every consumer of a shared output, fixing fan-out failure at bind time.
+    A three-instance electrothermal fixture checks equal thermal residuals, state/rate finite
+    differences, and the shifted transpose identity through both outgoing binds. The bind
+    dependency sort now includes self-edges: `Q <- heating`, with
+    `heating = Q + rho * cp * dt(T)`, refuses an algebraic output loop at plan admission.
+    Pure-basis producer outputs do not depend on provider-input binds; opaque output
+    closures conservatively depend on all such binds of their producer instance.
+  - Evidence (`tests/w8_multi_instance_system.rs`, 9 tests, snapshots `fixtures/corpus/
+    08-electrothermal-joule.res` and `fixtures/corpus/modules/{physics.electrical,
+    physics.thermal, systems.electrothermal}.res` copied verbatim from Sinbad): the two-instance
+    `Electrothermal` (both binds: `thermal/input/Q <- electrical.joule_heat` on the kernel-input
+    path with one composition and one JVP composition, `electrical/input/temperature <-
+    thermal.temperature` on the provider-input path) as one plan on a 3x3 unit square versus
+    the monolithic 08 one-instance plan, hand-closed the way Sinbad's dual closures close it
+    (`current_density = -sigma(T) grad V`, `joule = sigma(T)|grad V|^2`, `k(T)`, constant
+    `rho`/`cp`), under both `Barycenter` and `Richest`, at zero, perturbed and nontrivial
+    `(t, u, u_t)`: residual, full JVP and all four `(row, column)` blocks agree after the
+    `OriginMap` permutation to a measured worst relative discrepancy of `0` to `2.8e-17`
+    (gate `1e-10`), both cross blocks `dR_thermal/dV` (max `2.3e-1`) and `dR_electrical/dT`
+    (max `4.5e-4`) nonzero on a unit direction at an interior node and equal; the composed
+    adjoint identity `<J d, w> = <d, J^T w>` with a rate shift to `1e-12`, the VJP equal to
+    the monolithic one, both cross-block transposes adjoint; `linearize().assemble()` equal to
+    the JVP and to the monolithic matrix, the Jacobian nonsymmetric at the nontrivial state
+    while the zero-point view proves `Symmetric` (both cross blocks vanish with `grad V = 0`);
+    receipts (`residual_path` `thermal.thermal`, `<instance>/field_` block names, two
+    `SystemBindReceipt`s with their rows/columns/digests, dependency order `temperature` before
+    `Q`, four capability elements, the typed partial-assembly refusal, matrix-free = assembled
+    = element assembly); two `HeatConduction` instances (`TwoHeat`) with distinct `SysVarId`s
+    and the same `SymbolId`, an ambiguous equation-name closure refused typed, each block equal
+    to the one-instance realization of the same model with its own state to `1e-12`; keyed
+    Dirichlet data on the electrical `V` through the electrical instance's own region map touch
+    only `V`'s block, `reduced` keeps the count, the symbol-keyed form refuses the ambiguous
+    symbol, a missing instance map is `RealizationRegionUnmapped`, a stored `rho` table on the
+    thermal row gives an adjoint-exact coefficient JVP/VJP and the same residual as the
+    closure; a `try_new_for_residual` (`k`) and a `try_new_for_output` (`joule_heat`'s
+    `sigma`) closure refusing at one cell surface from residual, JVP and VJP as
+    `FinitumError::InputEvaluation` with the producer's code, the untouched `Slot` /
+    `ExpressionPath` origin, cell, point and time; bind-time refusals (missing output closure,
+    a closure on a bound `Q`, an output-keyed closure on a one-instance plan) are typed, and
+    a `/2` artifact of an implicit one-instance model is admitted by `composed` with a `/3`
+    identity distinct from the `/2` plan's.
+  - Honest limits: same-mesh binds only (cross-mesh `Transferred` chains are Krasis's, §8);
+    an output is one cell point function with one bundle; a bound output's own closures see
+    only the bound inputs that precede the output in dependency order; stored tables bind to
+    rows only (an output kernel's non-basis inputs take closures); `system_constitutive_from_
+    sources` and `FieldSampler::from_system_plan` stay per-model-symbol keyed; partial assembly
+    (and the all-table agreement report) refuse on a plan with binds; interior/interface
+    measures and the SC-W2 cases are unchanged (refused as before).
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -907,7 +1063,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 205 passed, 0 failed across 30 binaries (W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 214 passed, 0 failed across 31 binaries (W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -966,6 +1122,12 @@ interpolation work, and dimension-complete triangle/tetrahedron exact-sequence i
 ranks. Hostile patch, transpose, cross-kind report, serialized-report tamper, missing 3-D
 divergence, and non-refining mesh fixtures are rejected or produce non-accepted reports. The FC6
 nonuniform sheared affine patch above remains the independent realization oracle.
+
+2026-09-08 review validation: coordinator's full workspace/all-targets run exited 0,
+including the final nine-test F-MI binary and all eleven one-instance parity tests.
+The run began before the review edits and used the shared build cache; a separate focused
+F-MI rerun and clippy/fmt/rustdoc checks validate the final edited tree before handoff.
+No commit or push is included in this working-tree evidence.
 
 ## Known limits recorded by the 2026-08-30 workspace audit (tree `8ec3eac`)
 
@@ -1041,10 +1203,9 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
    (`9c21b67`); SC-W1 system-level ids keying `BlockLayout` plus public per-block
    actions/transposes (`b477525`); and the SV2-B2 interface-measure realization binding Malleus
    facet-pair kernels (`d552da2`). Still open, in order of pull:
-   - re-key `SystemOperator`'s internal field tables and admit a multi-instance
-     `SystemRealizationPlan` (Scientia's `scientia-operator-system/2` ids are now consumed by
-     `SystemIdMap::from_scientia`, proven equal to `compose`; the operator's per-field tables
-     are the remaining per-model-keyed part);
+   - Done (W8 lane F-MI, 2026-09-07, item 9 below): the internal field tables are keyed by
+     `SysVarId` and `SystemRealizationPlan::composed` admits a multi-instance group with its
+     same-mesh `Composed` bind chains;
    - bridge Scientia's `InteriorFacet`/`Interface` factorizations (they already carry
      `MinusTrace`/`PlusTrace` inputs) into `InterfaceKernel`s so `bind_kernels` stops refusing
      them -- needs a driving `.res` case (SC-W2 CHT), plus `BoundChain::Composed`
@@ -1148,6 +1309,44 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      alone, for the new variant; tests: consistent and lumped P1 mass against the closed
      forms, stiffness bitwise with `Barycenter`, and the 08-style DAE's differential rows
      regular under consistent initialization (Krasis) -- about one lane-day.
+
+9. W8 lane F-MI implemented in the working tree (2026-09-08; coordinator landing pending): the multi-instance `SystemRealizationPlan` (see
+   "Implemented"). Cross-repo needs:
+   - **Sinbad, G2 completion** (`run_plan` / `coupled_run.rs`): for a declared system whose
+     instances share the level mesh, build ONE realization group instead of one per instance:
+     keep the `SystemOperatorCompilation` (`compile_system` + `compile_system_operator`) the
+     runner already recompiles from the frozen closure and call
+     `SystemRealizationPlan::composed(&compilation, mesh, BlockLayout::new_keyed(
+     system_ids.variables()...), quadrature)` with `SystemIdMap::from_scientia`; build the
+     instance slot closures per residual with `SystemConstitutiveInput::try_new_for_residual
+     (system_ids.residual(instance, equation), ..)` (`system_inputs.rs` today keys by
+     equation name, which collides for two instances of one model) and stored tables with the
+     residual as before; for every `SystemBind` on the provider-input path, `dual_closure`'s
+     `DualContext` reads the bound symbol from `PointEvaluation::bound_values(consumer_symbol)`
+     (value) / the direction point's `bound_values` (tangent) exactly as it reads an active
+     input; for every producer output that a bind reads, build the output kernel's non-basis
+     closures (`OutputKernels.factorization.integrals[0].primal.inputs`, the same
+     `dual_closure` machinery over the producer model) with `try_new_for_output(InstanceId,
+     OutputId, ..)`; on the kernel-input path bind nothing for the bound symbol (the plan
+     refuses a closure on it). Dirichlet data: `SystemVariableEssentialConstraint { variable:
+     system_ids.variable(instance, symbol), requirement, value }` with
+     `essential_constraints_from_system_by_variable_at(operator, mesh, &[(instance,
+     &instance_region_map), ..], .., time)` -- the per-instance `RegionMap`s the runner builds
+     today, keyed by the instance. One `CoupledLeaf::reduced_system` over the composed
+     operator (its `layout()` is already `SysVarId`-keyed, so `SemanticId = SysVarId` needs
+     no re-keying); the N-leaf route stays for cross-group systems. Receipts: record the plan
+     digest (`finitum-system-realization/3`), `SystemOperator::binds()` (slot, output, path,
+     rows/columns, composition and JVP-composition digests) and the input dispositions per
+     bound input as `Available` (state tangent through the chain), `realization_agreement` as
+     the typed `RepresentationUnsupported { PartialAssembly }` refusal a bind chain earns
+     (matrix-free / assembled / element assembly still agree and can be reported directly).
+     Then the decision-9 comparison (residuals, state/rate JVPs with both cross blocks,
+     consistent initialization, trajectories) against monolithic 08 is measurable; the
+     operator-level half is `tests/w8_multi_instance_system.rs`.
+   - **Scientia:** nothing. **Malleus:** nothing (the JVP compositions are validated and
+     digest-checked; a composition whose independent set also covers the producer's frozen
+     inputs would let Finitum execute the JVP composition instead of the two-kernel chain --
+     recorded, not needed).
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.
