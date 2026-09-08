@@ -64,7 +64,8 @@ pub use optimized::{
 pub use profile::{
     ComponentSelection, FieldSource, MeshProfile, MeshProvenance, PartitionReport, RegionMap,
     RegionTagId, RegionTags, TaggedMesh, check_boundary_partition, essential_constraints_from,
-    essential_constraints_from_selected, facet_membership_from, realize, refine_uniform,
+    essential_constraints_from_at, essential_constraints_from_selected,
+    essential_constraints_from_selected_at, facet_membership_from, realize, refine_uniform,
 };
 pub use realization::{
     AssembledOperator, CapabilityElement, CoefficientLayout, ConstraintKind, DerivativeProduct,
@@ -73,6 +74,7 @@ pub use realization::{
     PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
     RealizationArtifact, RealizationCapability, RealizationExternalInput, RealizationPlan,
     RealizationReceipt, RepresentationKind, SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from,
+    external_inputs_from_at,
 };
 pub use sampler::{
     ExteriorFacet, FIELD_SAMPLER_SCHEMA, FacetTrace, FieldSample, FieldSampler,
@@ -90,7 +92,8 @@ pub use system::{
     SystemConstitutiveInput, SystemDistributedCoefficient, SystemEssentialConstraintRequirement,
     SystemExternalInput, SystemFieldArtifact, SystemOperator, SystemPartialAssemblyOperator,
     SystemQuadrature, SystemRealizationArtifact, SystemRealizationExternalInput,
-    SystemRealizationPlan, essential_constraints_from_system, system_constitutive_from_sources,
+    SystemRealizationPlan, essential_constraints_from_system, essential_constraints_from_system_at,
+    system_constitutive_from_sources,
 };
 pub use system_ids::{
     InstanceId, InstanceRecord, SYSTEM_ID_MAP_SCHEMA, SysRes, SysResId, SysVar, SysVarId,

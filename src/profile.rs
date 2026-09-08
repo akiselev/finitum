@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::{
     AffineConstraint, CadGeometryRealization, Cell, ConstraintSet, DofId, DofMap, FacetId,
-    FacetTopology, FinitumError, Mesh, VertexId,
+    FacetTopology, FinitumError, InputEvaluationError, Mesh, VertexId,
 };
 
 const MESH_PROFILE_ITEM_CAP: usize = 1_000_000;
@@ -326,6 +326,7 @@ impl RegionMap {
 /// (GX-C3, contract C7). `identity()` returns a canonical digest of the source, replacing the
 /// caller-invented strings dynamic bindings used before this landed.
 type SampledFieldFn = dyn Fn(&[f64]) -> Vec<f64> + Send + Sync;
+type FallibleFieldFn = dyn Fn(&[f64], f64) -> Result<Vec<f64>, InputEvaluationError> + Send + Sync;
 
 #[derive(Clone)]
 pub enum FieldSource {
@@ -333,8 +334,15 @@ pub enum FieldSource {
     Constant(Vec<f64>),
     /// A caller-projected vertex-major field, `components` entries per vertex.
     Nodal(Vec<f64>),
-    /// A coordinate-driven evaluator returning `components` values per call.
+    /// A coordinate-driven evaluator returning `components` values per call. The infallible,
+    /// time-blind form (deleted by slice F3; see [`FieldSource::Fallible`]).
     Sampled(Arc<SampledFieldFn>),
+    /// W8 lane F2: a coordinate- and time-driven evaluator returning `components` values or
+    /// its own typed [`InputEvaluationError`] per call ([`FieldSource::fallible`]). Every
+    /// sampling site passes the evaluation time (the `_at(time)` forms their caller's time,
+    /// the legacy forms `0.0`, the system path's constitutive closures the runtime point's)
+    /// and locates a refusal at the point it sampled (cell when there is one, time).
+    Fallible(Arc<FallibleFieldFn>),
     /// A Scientia interpolation table, validated for shape/finiteness at construction.
     Table(scientia::PropertyTable),
     /// A Scientia property kernel, revalidated through Malleus at construction and bound to its
@@ -353,6 +361,7 @@ impl std::fmt::Debug for FieldSource {
             }
             FieldSource::Nodal(values) => formatter.debug_tuple("Nodal").field(values).finish(),
             FieldSource::Sampled(_) => formatter.debug_tuple("Sampled").field(&"<fn>").finish(),
+            FieldSource::Fallible(_) => formatter.debug_tuple("Fallible").field(&"<fn>").finish(),
             FieldSource::Table(table) => formatter.debug_tuple("Table").field(table).finish(),
             FieldSource::Kernel { kernel, .. } => formatter
                 .debug_struct("Kernel")
@@ -391,6 +400,13 @@ impl FieldSource {
         Self::Sampled(Arc::new(sampler))
     }
 
+    /// W8 lane F2: the fallible, time-aware sampled source (see [`FieldSource::Fallible`]).
+    pub fn fallible(
+        sampler: impl Fn(&[f64], f64) -> Result<Vec<f64>, InputEvaluationError> + Send + Sync + 'static,
+    ) -> Self {
+        Self::Fallible(Arc::new(sampler))
+    }
+
     /// Validates axis/value shape, monotone finite axis points, and finite table values.
     pub fn table(table: scientia::PropertyTable) -> Result<Self, FinitumError> {
         validate_property_table(&table)?;
@@ -421,15 +437,19 @@ impl FieldSource {
 
     /// Canonical digest of this source: for `Kernel`, the `PropertyKernel` identity Scientia
     /// already computed; for `Table`, a digest of its axes/values/policies; for `Constant`/
-    /// `Nodal`, a digest of the owned data. `Sampled` wraps an opaque closure with no structural
-    /// identity, so its digest distinguishes closures only within one process run (the `Arc`'s
-    /// address), not across runs or processes.
+    /// `Nodal`, a digest of the owned data. `Sampled` and `Fallible` wrap an opaque closure with
+    /// no structural identity, so their digest distinguishes closures only within one process
+    /// run (the `Arc`'s address), not across runs or processes.
     pub fn identity(&self) -> Digest {
         match self {
             FieldSource::Constant(values) => field_source_digest("constant", values),
             FieldSource::Nodal(values) => field_source_digest("nodal", values),
             FieldSource::Sampled(sampler) => {
                 let marker = format!("sampled:{:p}", Arc::as_ptr(sampler));
+                Digest::blake3(marker.as_bytes())
+            }
+            FieldSource::Fallible(sampler) => {
+                let marker = format!("fallible:{:p}", Arc::as_ptr(sampler));
                 Digest::blake3(marker.as_bytes())
             }
             FieldSource::Table(table) => field_source_digest("table", table),
@@ -799,13 +819,30 @@ pub fn essential_constraints_from(
     region_map: &RegionMap,
     values: &[FieldSource],
 ) -> Result<ConstraintSet, FinitumError> {
-    essential_constraints_from_selected(
+    essential_constraints_from_at(mesh, dof_map, requirements, region_map, values, 0.0)
+}
+
+/// W8 lane F2: [`essential_constraints_from`] with the sources evaluated at `time` (the
+/// `"t"`/`"time"` kernel inputs and table axes, and a [`FieldSource::Fallible`] closure's time
+/// argument), so transient Dirichlet data stop being frozen at `t = 0`; rebuild the constraint
+/// set per step. A `Fallible` refusal is located at the node's coordinates and `time` (no
+/// cell) and returned as [`FinitumError::InputEvaluation`].
+pub fn essential_constraints_from_at(
+    mesh: &TaggedMesh,
+    dof_map: &DofMap,
+    requirements: &[scientia::EssentialConstraintRequirement],
+    region_map: &RegionMap,
+    values: &[FieldSource],
+    time: f64,
+) -> Result<ConstraintSet, FinitumError> {
+    essential_constraints_from_selected_at(
         mesh,
         dof_map,
         requirements,
         region_map,
         values,
         &vec![ComponentSelection::All; requirements.len()],
+        time,
     )
 }
 
@@ -817,7 +854,8 @@ pub fn essential_constraints_from(
 /// a boundary value has no active-field state to supply). A time-dependent boundary kernel's
 /// identity ([`FieldSource::identity`]) still changes with the kernel, so callers that need a
 /// different time rebuild the constraint set with a fresh evaluation rather than mutating this
-/// one; the `t = 0.0` evaluation is a fixed convention, not a runtime parameter of this function.
+/// one; the `t = 0.0` evaluation is this function's fixed convention --
+/// [`essential_constraints_from_selected_at`] takes the time as a parameter.
 pub fn essential_constraints_from_selected(
     mesh: &TaggedMesh,
     dof_map: &DofMap,
@@ -826,6 +864,33 @@ pub fn essential_constraints_from_selected(
     values: &[FieldSource],
     selection: &[ComponentSelection],
 ) -> Result<ConstraintSet, FinitumError> {
+    essential_constraints_from_selected_at(
+        mesh,
+        dof_map,
+        requirements,
+        region_map,
+        values,
+        selection,
+        0.0,
+    )
+}
+
+/// W8 lane F2: [`essential_constraints_from_selected`] evaluated at `time` (see
+/// [`essential_constraints_from_at`]).
+pub fn essential_constraints_from_selected_at(
+    mesh: &TaggedMesh,
+    dof_map: &DofMap,
+    requirements: &[scientia::EssentialConstraintRequirement],
+    region_map: &RegionMap,
+    values: &[FieldSource],
+    selection: &[ComponentSelection],
+    time: f64,
+) -> Result<ConstraintSet, FinitumError> {
+    if !time.is_finite() {
+        return Err(FinitumError::InvalidRealization(
+            "essential constraint evaluation time must be finite".into(),
+        ));
+    }
     if requirements.len() != values.len() || requirements.len() != selection.len() {
         return Err(FinitumError::InvalidRealization(format!(
             "essential constraint requirements has {} entries but {} field sources and {} \
@@ -901,12 +966,17 @@ pub fn essential_constraints_from_selected(
                     nodal[start..start + components].to_vec()
                 }
                 FieldSource::Sampled(sampler) => sampler(coordinates),
+                FieldSource::Fallible(sampler) => {
+                    sampler(coordinates, time).map_err(|failure| {
+                        FinitumError::from(failure.at(None, coordinates, Some(time)))
+                    })?
+                }
                 FieldSource::Table(table) => {
-                    let point = named_axis_point(&table.axes, coordinates, 0.0)?;
+                    let point = named_axis_point(&table.axes, coordinates, time)?;
                     vec![evaluate_table_value(table, &point)?]
                 }
                 FieldSource::Kernel { kernel, executable } => {
-                    let inputs = named_coordinate_inputs(coordinates, 0.0);
+                    let inputs = named_coordinate_inputs(coordinates, time);
                     vec![evaluate_kernel_value(kernel, executable, &inputs)?]
                 }
             };

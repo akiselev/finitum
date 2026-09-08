@@ -723,6 +723,35 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     and propagates it as `FinitumError::InputEvaluation`. The first failure in cell, then
     quadrature-point, then declared-input order wins, deterministically (same error on every
     repeat).
+  - Fallible stored-table builders and time-aware sampling (Sinbad A1's cross-repo need, same
+    slice): `ExternalInput::try_sampled(.., FnMut(CellId, &[f64]) -> Result<Vec<f64>,
+    InputEvaluationError>)` (steady), `ExternalInput::try_sampled_at(.., time, FnMut(CellId,
+    &[f64], f64) -> Result<..>)`, `ExternalInput::try_sampled_on_facets` /
+    `try_sampled_on_facets_at`, `ExternalSensitivityInput::try_sampled` (design derivatives are
+    steady). A refusal is located at the cell (a facet's owning cell) and physical point, at
+    `time` for the `_at` forms and without one for the steady forms, re-labelled
+    `InputOrigin::Table(<origin display>)` (a `Table` origin is kept) and returned typed at
+    construction -- no table is ever built with a non-finite placeholder, and the old
+    `sampler_error`-then-NaN pattern inside `external_inputs_from` (whose captured error was
+    shadowed by the non-finite check) is gone: every stored table samples through one
+    `sample_cell_table` / `sample_facet_table` core whose first `FinitumError` ends the
+    sampling. The infallible `sampled` forms are that core with `Ok`. `FieldSource::Fallible(
+    Arc<dyn Fn(&[f64], f64) -> Result<Vec<f64>, InputEvaluationError>>)` /
+    `FieldSource::fallible(..)` is a new variant beside `Sampled`: Sinbad `run.rs` and Krasis
+    `initial.rs` match `FieldSource::Sampled(sampler)` by payload and call it, so its closure
+    type cannot change in this wave, and both consumers' matches carry a wildcard arm, so the
+    added variant compiles for them; it is time-aware and its `identity()` hashes the `Arc`
+    address like `Sampled`'s. Time-aware forms, each the existing function with the time as a
+    parameter (the legacy forms pass `0.0`, their documented convention):
+    `external_inputs_from_at(.., time)` (coordinate-only `Kernel` / `Table` sources sampled
+    with `t = time`, `Fallible` sources through `try_sampled_at`; the state-dependent dynamic
+    bindings are unaffected, they read the runtime `PointEvaluation::time`),
+    `essential_constraints_from_at` / `essential_constraints_from_selected_at` (profile path;
+    `Table` / `Kernel` / `Fallible` at `time`), `essential_constraints_from_system_at` (system
+    path, nodal and RT0 normal-trace data; `Fallible` admitted beside `Constant` / `Nodal` /
+    `Sampled`). A `Fallible` Dirichlet refusal is located at the node (no cell) and `time`,
+    origin untouched. `system_constitutive_from_sources` binds a `Fallible` source as a
+    `try_new` closure at the runtime point's coordinates and time (zero direction).
   - Carrying mechanism, per entry point: **propagated everywhere, nothing recorded**. Every
     Methodus operator trait entry point returns `Result<(), NumericError>` and
     `NumericError::Evaluation` carries the typed payload, so no `last_evaluation_failure()`
@@ -759,6 +788,23 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     (`a_system_constitutive_refusal_is_located_and_carried_through_the_reduced_dae_operator`);
     the infallible constructors reproduce the fallible-with-`Ok` ones bitwise with equal
     digests on both paths (`the_infallible_*_constructor_is_the_fallible_one_with_ok_bitwise_and_digest_equal`).
+    Stored tables and time (3 more integration tests, 1 more unit test): on the transient
+    all-table system path (P1 barycenter, `bind_kernels_with_inputs`) an `f` table builder
+    refusing on cell 2 refuses at construction with origin
+    `Table("TransientNonlinear.evolution[0].f")`, cell 2, the cell centroid and `t = 0.5`, the
+    steady form records no time, and without the refusal the `t = 0.5` table holds `0.5`
+    everywhere and the all-table operator loads it
+    (`a_failing_table_builder_refuses_at_construction_with_a_table_origin_on_the_all_table_transient_path`);
+    `g(t) = t` Dirichlet data through `FieldSource::fallible` sampled at `t = 0.5` give `0.5`
+    on every constrained DOF on the system path (`essential_constraints_from_system_at`) and
+    the profile path (`essential_constraints_from_at`), the legacy forms give `0`, and a
+    refusing datum is located at the node without a cell with its `Slot` origin untouched
+    (`transient_dirichlet_data_g_of_t_is_sampled_at_the_requested_time_on_both_paths`);
+    `external_inputs_from_at` samples a `Fallible` source at the given time (`0.5` everywhere,
+    `0` through the legacy form) and a refusing one is `Table`-labelled at the first offending
+    cell, while `system_constitutive_from_sources` binds it at the runtime time (the residual
+    is affine in `t` through `fa = t`) and a refusal is located through the operator action
+    (`fallible_field_sources_feed_time_sampled_tables_and_runtime_time_constitutive_inputs`).
     The pre-existing 191 tests are unchanged and pass, which is the proof that the wrappers
     change no behaviour and that none of `finitum-system-realization/2`,
     `finitum-system-operator/2`, `finitum-field-sampler/1` moved.
@@ -831,7 +877,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 200 passed, 0 failed across 30 binaries (W8 F2 fallible callbacks, +4 unit +5 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 204 passed, 0 failed across 30 binaries (W8 F2 fallible callbacks, +5 unit +8 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -1013,10 +1059,17 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      pair would leave two paths and is not proposed. **Landed as item 8** with `try_` names
      and a named deletion slice (F3), because Sinbad A2 builds against the tree concurrently.
 8. W8 lane F2 landed (2026-09-07): fallible callbacks (see "Implemented"). Follow-ups:
-   - **Slice F3** (after Sinbad 7d-2 has migrated; a deletion, not a compatibility layer):
-     delete `DynamicExternalInput::new` and `SystemConstitutiveInput::new` (the infallible
-     wrappers; `try_new` stays as the only form, no rename). The stored-table and
-     `FieldSource` items of this lane extend this list below as they land.
+   - **Slice F3** (after Sinbad 7d-2 has migrated; a deletion, not a compatibility layer),
+     the exact list: `DynamicExternalInput::new`, `SystemConstitutiveInput::new`,
+     `ExternalInput::sampled`, `ExternalInput::sampled_on_facets`,
+     `ExternalSensitivityInput::sampled` (the infallible wrappers; the `try_` forms stay as
+     the only forms, no rename), `FieldSource::Sampled` and `FieldSource::sampled` (the
+     time-blind infallible variant; `Fallible` stays -- Krasis `initial.rs` and Sinbad
+     `run.rs` must match `Fallible` first), and the frozen-`t = 0` conveniences
+     `external_inputs_from`, `essential_constraints_from`,
+     `essential_constraints_from_selected`, `essential_constraints_from_system` (the `_at`
+     forms stay; after 7d-2 no consumer samples at an implicit `t = 0`). Also delete then:
+     the `sampler_error`-free `Nodal` refusal stays, the `SampledFieldFn` alias goes.
    - Cross-repo needs: (a) **Krasis K1** -- pass Methodus's typed `NumericError::Evaluation
      { code, origin, message }` through unchanged at its three
      `map_err(.. NumericError::Operator { message })` sites (`coupled.rs`, `coupled_system.rs`)
@@ -1026,7 +1079,16 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      `InputEvaluationError::new(refusal.code, InputOrigin::Slot(slot) | ExpressionPath(origin),
      refusal.message)` (Finitum fills point / time / cell), then `src/evaluation_failure.rs`
      shrinks to reading `FinitumError::InputEvaluation` / `NumericError::Evaluation` (the
-     `EvaluationFailureCell` and the `ClosureSite::fail` NaN placeholder go away).
+     `EvaluationFailureCell` and the `ClosureSite::fail` NaN placeholder go away);
+     `system_inputs.rs`'s `stored_table` switches to `ExternalInput::try_sampled_at(.., time,
+     ..)` with the step's time; Dirichlet data become `FieldSource::fallible(|x, t| ..)` and
+     the transient path (`coupled_run.rs`) rebuilds `essential_constraints_from_system_at(..,
+     time)` / `reduced(..)` per step so `g(t)` stops being frozen at `t = 0`;
+     `derivative_campaign.rs` / `advanced.rs` / `artifacts.rs` table builders take the `try_`
+     forms. (c) **Krasis K1 (addition)** -- `initial.rs` matches `FieldSource::Sampled` by
+     payload; add a `FieldSource::Fallible(sampler)` arm evaluating `sampler(x, t0)` at the
+     initial time and mapping the `InputEvaluationError` typed (today the wildcard arm refuses
+     it as an unsupported source).
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.

@@ -13,7 +13,12 @@
 //! 2. the same on `SystemOperator` / `ReducedSystemOperator` for a fallible constitutive
 //!    input, through the `DaeOperator` and `LinearOperator` impls and a Methodus BDF step;
 //! 3. the infallible constructors are the fallible ones with `Ok`: same digest, bitwise the
-//!    same actions (the unchanged pre-existing suite is the broader proof).
+//!    same actions (the unchanged pre-existing suite is the broader proof);
+//! 4. a stored-table builder that refuses fails at construction with a `Table` origin, located
+//!    at the cell, point and sampling time (the transient all-table system path);
+//! 5. time-aware sampling: `g(t) = t` Dirichlet data sampled at `t = 0.5` give `0.5` on every
+//!    constrained DOF on the system and the profile path, and `FieldSource::fallible` sources
+//!    reach stored tables at the requested time and constitutive closures at the runtime time.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,9 +28,12 @@ use finitum::{
     DynamicExternalInput, ElementRestriction, ExternalInput, FieldSource, FinitumError,
     InputEvaluationError, InputLocation, InputOrigin, Mesh, MeshProfile, PointEvaluation,
     PreparedElement, QuadratureView, RealizationPlan, ReducedSystemOperator, RegionMap,
-    RegionTagId, SystemConstitutiveInput, SystemEssentialConstraintRequirement, SystemOperator,
-    SystemRealizationPlan, TaggedMesh, VertexId, check_realization_agreement,
-    essential_constraints_from_system, realize,
+    RegionTagId, SysResId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
+    SystemExternalInput, SystemOperator, SystemQuadrature, SystemRealizationPlan, TaggedMesh,
+    VertexId, cell_centroid, check_realization_agreement, essential_constraints_from,
+    essential_constraints_from_at, essential_constraints_from_system,
+    essential_constraints_from_system_at, external_inputs_from, external_inputs_from_at, realize,
+    system_constitutive_from_sources, vector_nodal_dof_map,
 };
 use methodus::{
     BdfConfig, BdfOrder, BdfState, ComparisonTolerance, DaeOperator, EvaluationContext,
@@ -952,4 +960,440 @@ fn the_infallible_system_constructor_is_the_fallible_one_with_ok_bitwise_and_dig
         .vector_jacobian_product(0.2, &state, &rate, &direction, &mut right)
         .unwrap();
     assert_eq!(bits(&left), bits(&right), "system vjp");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stored tables and time-aware sampling.
+// ---------------------------------------------------------------------------------------------
+
+fn walls_region_map(region: scientia::RegionId) -> RegionMap {
+    let mut map = RegionMap::new();
+    map.insert(
+        region,
+        ["x_min", "x_max", "y_min", "y_max"].map(RegionTagId::new),
+    );
+    map
+}
+
+#[test]
+fn a_failing_table_builder_refuses_at_construction_with_a_table_origin_on_the_all_table_transient_path()
+ {
+    let compilation =
+        compile_semantics(TRANSIENT_NONLINEAR, &UnitRegistry::si_bootstrap()).unwrap();
+    let model = compilation.semantic.models[0].clone();
+    let system =
+        compile_operator_system(&compilation.semantic, "TransientNonlinear", &["evolution"])
+            .unwrap();
+    let tagged = unit_square(3);
+    let mesh = tagged.mesh.clone();
+    let u = symbol(&model, "u");
+    let layout = BlockLayout::new([(u, mesh.vertices().len(), 1)]).unwrap();
+    let plan = SystemRealizationPlan::with_quadrature(
+        system.clone(),
+        mesh.clone(),
+        layout,
+        SystemQuadrature::Barycenter,
+    )
+    .unwrap();
+    // The single-model P1 element tabulates the same barycenter rule (W7 7c A), so it is the
+    // table these system-path inputs are sampled on.
+    let element = PreparedElement::linear_simplex(2).unwrap();
+    assert_eq!(element.quadrature(), plan.quadrature().unwrap().as_slice());
+    let block = &system.blocks[0];
+    let centroid = cell_centroid(&mesh, CellId(2)).unwrap();
+
+    let mut stored = Vec::new();
+    let mut refused = None;
+    let mut source_input = None;
+    for integral in &block.factorization.integrals {
+        for input in &integral.primal.inputs {
+            if input.source == InputSourceRequirement::Basis {
+                continue;
+            }
+            let name = model.symbols[input.binding.symbol.index()].name.clone();
+            let path = format!(
+                "TransientNonlinear.evolution[{}].{name}",
+                integral.integral_index
+            );
+            if name == "f" {
+                source_input = Some((integral.integral_index, input.id, path.clone()));
+            }
+            let table = ExternalInput::try_sampled_at(
+                integral.integral_index,
+                input.id,
+                1,
+                &mesh,
+                &element,
+                0.5,
+                |cell, _, time| {
+                    if name == "f" && cell == CellId(2) {
+                        Err(InputEvaluationError::new(
+                            "RUN_PROPERTY_UNSUPPORTED",
+                            InputOrigin::ExpressionPath(path.clone()),
+                            "the source has no value here",
+                        ))
+                    } else if name == "f" {
+                        Ok(vec![time])
+                    } else {
+                        Ok(vec![1.0])
+                    }
+                },
+            );
+            match table {
+                Ok(table) => stored.push(SystemExternalInput {
+                    residual: SysResId(0),
+                    input: table,
+                }),
+                Err(error) => {
+                    assert_eq!(name, "f");
+                    refused = Some(error);
+                }
+            }
+        }
+    }
+    let error = refused.expect("the f table builder refuses");
+    let (f_integral, f_input, f_path) = source_input.unwrap();
+    let FinitumError::InputEvaluation(failure) = &error else {
+        panic!("expected a typed input failure, got {error}");
+    };
+    assert_eq!(failure.code, "RUN_PROPERTY_UNSUPPORTED");
+    assert_eq!(failure.origin, InputOrigin::Table(f_path.clone()));
+    assert_eq!(failure.cell(), Some(CellId(2)));
+    let point = failure.point().unwrap();
+    assert!(close(point, &centroid), "{point:?} vs {centroid:?}");
+    assert_eq!(failure.time(), Some(0.5));
+    assert_eq!(error.code(), Some("RUN_PROPERTY_UNSUPPORTED"));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "RUN_PROPERTY_UNSUPPORTED at {f_path} (stored table), point ({}, {}), t = 0.5, \
+             cell 2: the source has no value here",
+            point[0], point[1]
+        )
+    );
+
+    // Without the refusal the same builder samples the source at t = 0.5 everywhere, and the
+    // all-table operator binds and loads it.
+    let f = ExternalInput::try_sampled_at(
+        f_integral,
+        f_input,
+        1,
+        &mesh,
+        &element,
+        0.5,
+        |_, _, time| Ok(vec![time]),
+    )
+    .unwrap();
+    assert_eq!(f.values().len(), mesh.cells().len());
+    assert!(f.values().iter().all(|value| *value == 0.5));
+    stored.push(SystemExternalInput {
+        residual: SysResId(0),
+        input: f,
+    });
+    let operator = plan
+        .bind_kernels_with_inputs(Vec::new(), stored, BTreeMap::new(), BTreeMap::new())
+        .unwrap();
+    let load = operator.load_vector().unwrap();
+    assert!(load.iter().any(|value| *value != 0.0));
+
+    // The steady form carries no time; the origin is still re-labelled as the table's.
+    let steady = ExternalInput::try_sampled(f_integral, f_input, 1, &mesh, &element, |cell, _| {
+        if cell == CellId(2) {
+            Err(InputEvaluationError::new(
+                "RUN_PROPERTY_UNSUPPORTED",
+                InputOrigin::Slot("source/f".into()),
+                "no value",
+            ))
+        } else {
+            Ok(vec![0.0])
+        }
+    })
+    .unwrap_err();
+    let FinitumError::InputEvaluation(failure) = &steady else {
+        panic!("expected a typed input failure, got {steady}");
+    };
+    assert_eq!(failure.origin, InputOrigin::Table("source/f".into()));
+    assert_eq!(failure.cell(), Some(CellId(2)));
+    assert_eq!(failure.time(), None);
+    assert!(
+        steady
+            .to_string()
+            .starts_with("RUN_PROPERTY_UNSUPPORTED at source/f (stored table), point (")
+    );
+    assert!(steady.to_string().ends_with("), cell 2: no value"));
+}
+
+#[test]
+fn transient_dirichlet_data_g_of_t_is_sampled_at_the_requested_time_on_both_paths() {
+    // System path: the coupled transient fixture with `g(t) = t` on every wall.
+    let compiled = compile_coupled();
+    let tagged = unit_square(3);
+    let (operator, _) = coupled_operators(
+        &compiled,
+        &tagged,
+        coupled_constitutive(&compiled, &Binding::Infallible),
+    );
+    let mut requirements = Vec::new();
+    let mut region_map = RegionMap::new();
+    for block in &compiled.system.blocks {
+        for requirement in &block.factorization.essential_constraints {
+            region_map.insert(
+                requirement.region,
+                ["x_min", "x_max", "y_min", "y_max"].map(RegionTagId::new),
+            );
+            requirements.push(SystemEssentialConstraintRequirement {
+                field: block.row,
+                requirement: requirement.clone(),
+                value: FieldSource::fallible(|_, time| Ok(vec![time])),
+            });
+        }
+    }
+    let at_half =
+        essential_constraints_from_system_at(&operator, &tagged, &region_map, &requirements, 0.5)
+            .unwrap();
+    let mut constrained = 0;
+    for constraint in at_half.constraints() {
+        assert_eq!(constraint.offset, 0.5);
+        assert!(constraint.dependencies.is_empty());
+        constrained += 1;
+    }
+    assert!(constrained > 0);
+    let legacy =
+        essential_constraints_from_system(&operator, &tagged, &region_map, &requirements).unwrap();
+    assert_eq!(legacy.constraints().count(), constrained);
+    for constraint in legacy.constraints() {
+        assert_eq!(constraint.offset, 0.0);
+    }
+
+    // A refusing datum is located at the node (no cell) at the requested time, its origin
+    // untouched (a datum is not a stored table).
+    requirements[0].value = FieldSource::fallible(|point, _| {
+        if point[0] == 0.0 {
+            Err(InputEvaluationError::new(
+                "RUN_PROPERTY_UNSUPPORTED",
+                InputOrigin::Slot("boundary/walls_a".into()),
+                "no data on x = 0",
+            ))
+        } else {
+            Ok(vec![0.0])
+        }
+    });
+    let error =
+        essential_constraints_from_system_at(&operator, &tagged, &region_map, &requirements, 0.5)
+            .unwrap_err();
+    let FinitumError::InputEvaluation(failure) = &error else {
+        panic!("expected a typed input failure, got {error}");
+    };
+    assert_eq!(failure.code, "RUN_PROPERTY_UNSUPPORTED");
+    assert_eq!(failure.origin, InputOrigin::Slot("boundary/walls_a".into()));
+    assert_eq!(failure.cell(), None);
+    assert_eq!(failure.point().unwrap()[0], 0.0);
+    assert_eq!(failure.time(), Some(0.5));
+    let display = error.to_string();
+    assert!(
+        display.starts_with("RUN_PROPERTY_UNSUPPORTED at boundary/walls_a, point (0, "),
+        "{display}"
+    );
+    assert!(
+        display.ends_with("), t = 0.5: no data on x = 0"),
+        "{display}"
+    );
+
+    // Profile path: the single-model transient plan's `walls` requirement.
+    let compilation =
+        compile_semantics(TRANSIENT_NONLINEAR, &UnitRegistry::si_bootstrap()).unwrap();
+    let form =
+        derive_variational_form(&compilation.semantic, "TransientNonlinear", "evolution").unwrap();
+    let form_requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &form_requirements).unwrap();
+    let dofs = vector_nodal_dof_map(&tagged.mesh, 1).unwrap();
+    let region_map = walls_region_map(factorization.essential_constraints[0].region);
+    let values = [FieldSource::fallible(|_, time| Ok(vec![time]))];
+    let at_half = essential_constraints_from_at(
+        &tagged,
+        &dofs,
+        &factorization.essential_constraints,
+        &region_map,
+        &values,
+        0.5,
+    )
+    .unwrap();
+    assert!(at_half.constraints().count() > 0);
+    for constraint in at_half.constraints() {
+        assert_eq!(constraint.offset, 0.5);
+    }
+    let legacy = essential_constraints_from(
+        &tagged,
+        &dofs,
+        &factorization.essential_constraints,
+        &region_map,
+        &values,
+    )
+    .unwrap();
+    assert_eq!(legacy.constraints().count(), at_half.constraints().count());
+    for constraint in legacy.constraints() {
+        assert_eq!(constraint.offset, 0.0);
+    }
+}
+
+#[test]
+fn fallible_field_sources_feed_time_sampled_tables_and_runtime_time_constitutive_inputs() {
+    // Single-model path: `external_inputs_from_at` samples a Fallible source into a stored
+    // table at the given time.
+    let compilation =
+        compile_semantics(TRANSIENT_NONLINEAR, &UnitRegistry::si_bootstrap()).unwrap();
+    let model = &compilation.semantic.models[0];
+    let form =
+        derive_variational_form(&compilation.semantic, "TransientNonlinear", "evolution").unwrap();
+    let requirements = infer_form_requirements(&compilation.semantic, &form).unwrap();
+    let factorization = factor_operator(&form, &requirements).unwrap();
+    let (mesh, _, _) = square_discretization(2);
+    let element = PreparedElement::linear_simplex(2).unwrap();
+    let constant = |value: f64| FieldSource::fallible(move |_, _| Ok(vec![value]));
+    let f = symbol(model, "f");
+    let sources = vec![
+        (symbol(model, "capacity"), constant(1.0)),
+        (symbol(model, "k"), constant(1.0)),
+        (f, FieldSource::fallible(|_, time| Ok(vec![time]))),
+    ];
+    let (stored, dynamic) =
+        external_inputs_from_at(&factorization, model, &mesh, &element, &sources, 0.5).unwrap();
+    assert!(dynamic.is_empty());
+    let is_f = |table: &ExternalInput| {
+        factorization.integrals.iter().any(|integral| {
+            integral.integral_index == table.integral_index
+                && integral
+                    .primal
+                    .inputs
+                    .iter()
+                    .any(|input| input.id == table.input && input.binding.symbol == f)
+        })
+    };
+    let f_table = stored.iter().find(|table| is_f(table)).unwrap();
+    assert_eq!(f_table.values().len(), mesh.cells().len());
+    assert!(f_table.values().iter().all(|value| *value == 0.5));
+    let (legacy, _) =
+        external_inputs_from(&factorization, model, &mesh, &element, &sources).unwrap();
+    let legacy_f = legacy.iter().find(|table| is_f(table)).unwrap();
+    assert!(legacy_f.values().iter().all(|value| *value == 0.0));
+
+    // A refusing source is a typed, located, table-labelled failure at the first offending
+    // cell in cell order.
+    let refusing = vec![
+        (symbol(model, "capacity"), constant(1.0)),
+        (symbol(model, "k"), constant(1.0)),
+        (
+            f,
+            FieldSource::fallible(|point, _| {
+                if point[1] > 0.6 {
+                    Err(InputEvaluationError::new(
+                        "RUN_PROPERTY_UNSUPPORTED",
+                        InputOrigin::Provider("volumetric_source".into()),
+                        "undefined above y = 0.6",
+                    ))
+                } else {
+                    Ok(vec![0.0])
+                }
+            }),
+        ),
+    ];
+    let error = external_inputs_from_at(&factorization, model, &mesh, &element, &refusing, 0.25)
+        .unwrap_err();
+    let FinitumError::InputEvaluation(failure) = &error else {
+        panic!("expected a typed input failure, got {error}");
+    };
+    assert_eq!(
+        failure.origin,
+        InputOrigin::Table("provider/volumetric_source".into())
+    );
+    assert!(failure.point().unwrap()[1] > 0.6);
+    assert_eq!(failure.time(), Some(0.25));
+    let expected_cell = (0..mesh.cells().len())
+        .find(|cell| cell_centroid(&mesh, CellId(*cell)).unwrap()[1] > 0.6)
+        .unwrap();
+    assert_eq!(failure.cell(), Some(CellId(expected_cell)));
+
+    // System path: `system_constitutive_from_sources` binds a Fallible source as a closure
+    // evaluated at the runtime point's time.
+    let compiled = compile_coupled();
+    let tagged = unit_square(3);
+    let m = &compiled.model;
+    let sources = vec![
+        (symbol(m, "ka"), constant(1.0)),
+        (symbol(m, "kb"), constant(1.0)),
+        (symbol(m, "ca"), constant(1.0)),
+        (
+            symbol(m, "fa"),
+            FieldSource::fallible(|_, time| Ok(vec![time])),
+        ),
+        (symbol(m, "fb"), constant(0.5)),
+    ];
+    let constitutive = system_constitutive_from_sources(&compiled.system, m, &sources).unwrap();
+    let (operator, _) = coupled_operators(&compiled, &tagged, constitutive);
+    let dimension = operator.dimension();
+    let zero = vec![0.0; dimension];
+    let residual_at = |time: f64| {
+        let mut output = vec![0.0; dimension];
+        operator.residual(time, &zero, &zero, &mut output).unwrap();
+        output
+    };
+    let r0 = residual_at(0.0);
+    let r1 = residual_at(1.0);
+    let r_half = residual_at(0.5);
+    assert!(r0.iter().zip(&r1).any(|(a, b)| a != b));
+    for ((a, b), half) in r0.iter().zip(&r1).zip(&r_half) {
+        assert!(
+            (0.5 * (a + b) - half).abs() <= 1.0e-14,
+            "the residual is affine in the source's time: {a} {b} {half}"
+        );
+    }
+
+    // A refusing source is located through the operator action, at the runtime time, with
+    // its origin untouched (a constitutive closure is not a stored table).
+    let sources = vec![
+        (symbol(m, "ka"), constant(1.0)),
+        (symbol(m, "kb"), constant(1.0)),
+        (symbol(m, "ca"), constant(1.0)),
+        (
+            symbol(m, "fa"),
+            FieldSource::fallible(|point, _| {
+                if point[0] > 0.9 {
+                    Err(InputEvaluationError::new(
+                        "RUN_PROPERTY_UNSUPPORTED",
+                        InputOrigin::ExpressionPath("Coupled.ea[0].fa".into()),
+                        "undefined beyond x = 0.9",
+                    ))
+                } else {
+                    Ok(vec![0.0])
+                }
+            }),
+        ),
+        (symbol(m, "fb"), constant(0.5)),
+    ];
+    let constitutive = system_constitutive_from_sources(&compiled.system, m, &sources).unwrap();
+    let (operator, _) = coupled_operators(&compiled, &tagged, constitutive);
+    let view = QuadratureView::of_system_plan(operator.plan()).unwrap();
+    let (expected_cell, expected_point) = (0..tagged.mesh.cells().len())
+        .find_map(|cell| {
+            view.cell_points(CellId(cell))
+                .unwrap()
+                .into_iter()
+                .find(|point| point.physical[0] > 0.9)
+                .map(|point| (CellId(cell), point.physical))
+        })
+        .unwrap();
+    let mut output = vec![0.0; dimension];
+    let error = operator
+        .residual(0.7, &zero, &zero, &mut output)
+        .unwrap_err();
+    let FinitumError::InputEvaluation(failure) = &error else {
+        panic!("expected a typed input failure, got {error}");
+    };
+    assert_eq!(
+        failure.origin,
+        InputOrigin::ExpressionPath("Coupled.ea[0].fa".into())
+    );
+    assert_eq!(failure.cell(), Some(expected_cell));
+    assert!(close(failure.point().unwrap(), &expected_point));
+    assert_eq!(failure.time(), Some(0.7));
 }

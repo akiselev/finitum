@@ -312,6 +312,97 @@ enum ExternalBinding {
     Dynamic(DynamicExternalInput),
 }
 
+/// A stored-table sampler's failure, located where the table was being sampled and re-labelled
+/// [`crate::InputOrigin::Table`] (W8 lane F2): the refusal happened at bind time, not inside an
+/// operator action, and the table is never built with a non-finite placeholder.
+pub(crate) fn table_failure(
+    failure: InputEvaluationError,
+    cell: Option<CellId>,
+    point: &[f64],
+    time: Option<f64>,
+) -> FinitumError {
+    failure.at(cell, point, time).into_table().into()
+}
+
+fn validate_sampling_time(time: f64) -> Result<(), FinitumError> {
+    if time.is_finite() {
+        Ok(())
+    } else {
+        Err(FinitumError::InvalidRealization(
+            "table sampling time must be finite".into(),
+        ))
+    }
+}
+
+/// The deterministic cell / quadrature-point / component sampling every stored cell table
+/// shares: `sample` sees each cell's physical quadrature points in the element's own order,
+/// and its first `FinitumError` (a located `InputEvaluation` included) ends the sampling.
+fn sample_cell_table(
+    mesh: &Mesh,
+    element: &PreparedElement,
+    component_count: usize,
+    label: &str,
+    mut sample: impl FnMut(CellId, &[f64]) -> Result<Vec<f64>, FinitumError>,
+) -> Result<Vec<f64>, FinitumError> {
+    if mesh.dimension() != element.dimension() {
+        return Err(FinitumError::InvalidRealization(format!(
+            "mesh dimension {} differs from element dimension {}",
+            mesh.dimension(),
+            element.dimension()
+        )));
+    }
+    let mut values =
+        Vec::with_capacity(mesh.cells().len() * element.quadrature().len() * component_count);
+    for cell_index in 0..mesh.cells().len() {
+        let cell = CellGeometry::new(mesh, CellId(cell_index))?;
+        for point in element.quadrature() {
+            let physical = cell.physical_point(&point.coordinates);
+            let sampled = sample(CellId(cell_index), &physical)?;
+            if sampled.len() != component_count {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "{label} sampler returned {} components, expected {component_count}",
+                    sampled.len()
+                )));
+            }
+            values.extend(sampled);
+        }
+    }
+    Ok(values)
+}
+
+/// The facet counterpart of [`sample_cell_table`]: one centroid point per facet of
+/// `facet_ids`, in that order (`FacetGeometry`'s single-point rule).
+fn sample_facet_table(
+    mesh: &Mesh,
+    facets: &FacetTopology,
+    facet_ids: &[FacetId],
+    component_count: usize,
+    mut sample: impl FnMut(FacetId, &FacetGeometry) -> Result<Vec<f64>, FinitumError>,
+) -> Result<Vec<f64>, FinitumError> {
+    let mut values = Vec::with_capacity(facet_ids.len() * component_count);
+    for &facet_id in facet_ids {
+        let facet = facets.facets().get(facet_id.0).ok_or_else(|| {
+            FinitumError::InvalidRealization(format!("facet {} does not exist", facet_id.0))
+        })?;
+        if !facet.is_exterior() {
+            return Err(FinitumError::UnsupportedRealization(format!(
+                "facet {} is not exterior; exterior facet integrals refuse interior facets",
+                facet_id.0
+            )));
+        }
+        let geometry = FacetGeometry::compute(mesh, facet.minus())?;
+        let sampled = sample(facet_id, &geometry)?;
+        if sampled.len() != component_count {
+            return Err(FinitumError::InvalidRealization(format!(
+                "facet external input sampler returned {} components, expected {component_count}",
+                sampled.len()
+            )));
+        }
+        values.extend(sampled);
+    }
+    Ok(values)
+}
+
 impl ExternalInput {
     pub fn new(
         integral_index: usize,
@@ -337,7 +428,9 @@ impl ExternalInput {
         })
     }
 
-    /// Sample and own input values in deterministic cell/quadrature/component order.
+    /// Sample and own input values in deterministic cell/quadrature/component order. The
+    /// infallible form: `sample` cannot refuse (a thin wrapper over the same sampling as
+    /// [`Self::try_sampled`]; deleted by slice F3).
     pub fn sampled(
         integral_index: usize,
         input: TensorInputId,
@@ -346,28 +439,66 @@ impl ExternalInput {
         element: &PreparedElement,
         mut sample: impl FnMut(CellId, &[f64]) -> Vec<f64>,
     ) -> Result<Self, FinitumError> {
-        if mesh.dimension() != element.dimension() {
-            return Err(FinitumError::InvalidRealization(format!(
-                "mesh dimension {} differs from element dimension {}",
-                mesh.dimension(),
-                element.dimension()
-            )));
-        }
-        let mut values = Vec::new();
-        for (cell_index, _) in mesh.cells().iter().enumerate() {
-            let cell = CellGeometry::new(mesh, CellId(cell_index))?;
-            for point in element.quadrature() {
-                let physical = cell.physical_point(&point.coordinates);
-                let sampled = sample(CellId(cell_index), &physical);
-                if sampled.len() != component_count {
-                    return Err(FinitumError::InvalidRealization(format!(
-                        "external input sampler returned {} components, expected {component_count}",
-                        sampled.len()
-                    )));
-                }
-                values.extend(sampled);
-            }
-        }
+        let values = sample_cell_table(
+            mesh,
+            element,
+            component_count,
+            "external input",
+            |cell, point| Ok(sample(cell, point)),
+        )?;
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    /// W8 lane F2: the fallible form of [`Self::sampled`] for a steady table. A refusal
+    /// `sample` returns is located at its cell and physical point (no time), re-labelled
+    /// [`crate::InputOrigin::Table`] and returned as [`FinitumError::InputEvaluation`] -- the
+    /// table is never built with a non-finite placeholder. The first refusal in cell, then
+    /// quadrature-point order wins.
+    pub fn try_sampled(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        mut sample: impl FnMut(CellId, &[f64]) -> Result<Vec<f64>, InputEvaluationError>,
+    ) -> Result<Self, FinitumError> {
+        let values = sample_cell_table(
+            mesh,
+            element,
+            component_count,
+            "external input",
+            |cell, point| {
+                sample(cell, point)
+                    .map_err(|failure| table_failure(failure, Some(cell), point, None))
+            },
+        )?;
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    /// W8 lane F2: as [`Self::try_sampled`] at evaluation time `time`, which the sampler
+    /// receives and a refusal records -- the transient path's tables (sources, coefficients)
+    /// sampled at the step's time instead of frozen at `t = 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_sampled_at(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        time: f64,
+        mut sample: impl FnMut(CellId, &[f64], f64) -> Result<Vec<f64>, InputEvaluationError>,
+    ) -> Result<Self, FinitumError> {
+        validate_sampling_time(time)?;
+        let values = sample_cell_table(
+            mesh,
+            element,
+            component_count,
+            "external input",
+            |cell, point| {
+                sample(cell, point, time)
+                    .map_err(|failure| table_failure(failure, Some(cell), point, Some(time)))
+            },
+        )?;
         Self::new(integral_index, input, component_count, values)
     }
 
@@ -461,27 +592,76 @@ impl ExternalInput {
         facet_ids: &[FacetId],
         mut sample: impl FnMut(FacetId, &[f64]) -> Vec<f64>,
     ) -> Result<Self, FinitumError> {
-        let mut values = Vec::new();
-        for &facet_id in facet_ids {
-            let facet = facets.facets().get(facet_id.0).ok_or_else(|| {
-                FinitumError::InvalidRealization(format!("facet {} does not exist", facet_id.0))
-            })?;
-            if !facet.is_exterior() {
-                return Err(FinitumError::UnsupportedRealization(format!(
-                    "facet {} is not exterior; exterior facet integrals refuse interior facets",
-                    facet_id.0
-                )));
-            }
-            let geometry = FacetGeometry::compute(mesh, facet.minus())?;
-            let sampled = sample(facet_id, &geometry.physical_centroid);
-            if sampled.len() != component_count {
-                return Err(FinitumError::InvalidRealization(format!(
-                    "facet external input sampler returned {} components, expected {component_count}",
-                    sampled.len()
-                )));
-            }
-            values.extend(sampled);
-        }
+        let values = sample_facet_table(
+            mesh,
+            facets,
+            facet_ids,
+            component_count,
+            |facet, geometry| Ok(sample(facet, &geometry.physical_centroid)),
+        )?;
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    /// W8 lane F2: the fallible form of [`Self::sampled_on_facets`] (steady); a refusal is
+    /// located at the facet's owning cell and centroid, re-labelled
+    /// [`crate::InputOrigin::Table`], and ends the sampling.
+    pub fn try_sampled_on_facets(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        facets: &FacetTopology,
+        facet_ids: &[FacetId],
+        mut sample: impl FnMut(FacetId, &[f64]) -> Result<Vec<f64>, InputEvaluationError>,
+    ) -> Result<Self, FinitumError> {
+        let values = sample_facet_table(
+            mesh,
+            facets,
+            facet_ids,
+            component_count,
+            |facet, geometry| {
+                sample(facet, &geometry.physical_centroid).map_err(|failure| {
+                    table_failure(
+                        failure,
+                        Some(geometry.cell),
+                        &geometry.physical_centroid,
+                        None,
+                    )
+                })
+            },
+        )?;
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    /// W8 lane F2: as [`Self::try_sampled_on_facets`] at evaluation time `time`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_sampled_on_facets_at(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        facets: &FacetTopology,
+        facet_ids: &[FacetId],
+        time: f64,
+        mut sample: impl FnMut(FacetId, &[f64], f64) -> Result<Vec<f64>, InputEvaluationError>,
+    ) -> Result<Self, FinitumError> {
+        validate_sampling_time(time)?;
+        let values = sample_facet_table(
+            mesh,
+            facets,
+            facet_ids,
+            component_count,
+            |facet, geometry| {
+                sample(facet, &geometry.physical_centroid, time).map_err(|failure| {
+                    table_failure(
+                        failure,
+                        Some(geometry.cell),
+                        &geometry.physical_centroid,
+                        Some(time),
+                    )
+                })
+            },
+        )?;
         Self::new(integral_index, input, component_count, values)
     }
 
@@ -513,10 +693,13 @@ impl ExternalInput {
 /// GX-C4 facet integrals build their external inputs separately, since they sample at facet
 /// points rather than cell quadrature points (see `ExternalInput::sampled_on_facets`).
 ///
-/// A `Constant`/`Nodal`/`Sampled`/`Table` source, or a `Kernel` source whose declared inputs are
-/// all resolvable as coordinates/time (names `"x"`/`"y"`/`"z"`/`"t"`/`"time"`), is sampled once
-/// per cell quadrature point into a stored `ExternalInput` — coordinates only, so it cannot vary
-/// with the runtime evaluation time or the active field.
+/// A `Constant`/`Sampled`/`Fallible`/`Table` source, or a `Kernel` source whose declared inputs
+/// are all resolvable as coordinates/time (names `"x"`/`"y"`/`"z"`/`"t"`/`"time"`), is sampled
+/// once per cell quadrature point into a stored `ExternalInput` at `t = 0` -- coordinates only,
+/// so it cannot vary with the runtime evaluation time or the active field; W8 lane F2's
+/// [`external_inputs_from_at`] samples the same tables at a caller-chosen time instead. A
+/// `Nodal` source is refused (it has no coordinate sampler). A `Fallible` source's refusal is
+/// located, re-labelled [`crate::InputOrigin::Table`] and returned typed.
 ///
 /// A `Kernel` or `Table` source whose declared inputs (or axes) include the name of exactly one
 /// active, basis-sourced field of the same integral becomes a `DynamicExternalInput`: its value
@@ -536,6 +719,23 @@ pub fn external_inputs_from(
     element: &PreparedElement,
     sources: &[(SymbolId, FieldSource)],
 ) -> Result<(Vec<ExternalInput>, Vec<DynamicExternalInput>), FinitumError> {
+    external_inputs_from_at(factorization, model, mesh, element, sources, 0.0)
+}
+
+/// W8 lane F2: [`external_inputs_from`] with the state-independent sources sampled at `time`
+/// (their `"t"`/`"time"` inputs, table axes, and the `Fallible` closure's time argument), so a
+/// transient realization's stored tables carry the step's data rather than `t = 0`'s. The
+/// state-dependent (`DynamicExternalInput`) bindings are unaffected: they read the runtime
+/// `PointEvaluation::time`.
+pub fn external_inputs_from_at(
+    factorization: &OperatorFactorization,
+    model: &scientia::SemanticModel,
+    mesh: &Mesh,
+    element: &PreparedElement,
+    sources: &[(SymbolId, FieldSource)],
+    time: f64,
+) -> Result<(Vec<ExternalInput>, Vec<DynamicExternalInput>), FinitumError> {
+    validate_sampling_time(time)?;
     let sources_by_symbol = sources
         .iter()
         .map(|(symbol, source)| (*symbol, source))
@@ -579,34 +779,23 @@ pub fn external_inputs_from(
                         .map(|slot| slot.name.clone())
                         .collect::<Vec<_>>();
                     if state_names.is_empty() {
-                        let mut sampler_error = None;
-                        let sample_kernel = kernel.clone();
-                        let sample_executable = executable.clone();
-                        let built = ExternalInput::sampled(
+                        let values = sample_cell_table(
+                            mesh,
+                            element,
+                            components,
+                            "external input",
+                            |_, point| {
+                                let named = named_coordinate_inputs(point, time);
+                                evaluate_kernel_value(kernel, executable, &named)
+                                    .map(|value| vec![value])
+                            },
+                        )?;
+                        stored.push(ExternalInput::new(
                             integral.integral_index,
                             input.id,
                             components,
-                            mesh,
-                            element,
-                            |_, point| {
-                                let named = named_coordinate_inputs(point, 0.0);
-                                match evaluate_kernel_value(
-                                    &sample_kernel,
-                                    &sample_executable,
-                                    &named,
-                                ) {
-                                    Ok(value) => vec![value],
-                                    Err(error) => {
-                                        sampler_error.get_or_insert(error);
-                                        vec![f64::NAN]
-                                    }
-                                }
-                            },
-                        )?;
-                        if let Some(error) = sampler_error {
-                            return Err(error);
-                        }
-                        stored.push(built);
+                            values,
+                        )?);
                         continue;
                     }
                     if state_names.len() > 1 || components != 1 {
@@ -690,41 +879,34 @@ pub fn external_inputs_from(
                         .map(|axis| axis.name.clone())
                         .collect::<Vec<_>>();
                     if state_names.is_empty() {
-                        let mut sampler_error = None;
-                        let sample_table = table.clone();
-                        let built = ExternalInput::sampled(
+                        let values = sample_cell_table(
+                            mesh,
+                            element,
+                            components,
+                            "external input",
+                            |_, point| {
+                                let named = named_coordinate_inputs(point, time);
+                                let axis_point = table
+                                    .axes
+                                    .iter()
+                                    .map(|axis| {
+                                        named.get(&axis.name).copied().ok_or_else(|| {
+                                            FinitumError::InvalidRealization(format!(
+                                                "property table axis {:?} is not a coordinate/time name",
+                                                axis.name
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                evaluate_table_value(table, &axis_point).map(|value| vec![value])
+                            },
+                        )?;
+                        stored.push(ExternalInput::new(
                             integral.integral_index,
                             input.id,
                             components,
-                            mesh,
-                            element,
-                            |_, point| {
-                                let named = named_coordinate_inputs(point, 0.0);
-                                let axis_point = sample_table
-                                    .axes
-                                    .iter()
-                                    .map(|axis| named.get(&axis.name).copied().ok_or_else(|| {
-                                        FinitumError::InvalidRealization(format!(
-                                            "property table axis {:?} is not a coordinate/time name",
-                                            axis.name
-                                        ))
-                                    }))
-                                    .collect::<Result<Vec<_>, _>>();
-                                match axis_point
-                                    .and_then(|point| evaluate_table_value(&sample_table, &point))
-                                {
-                                    Ok(value) => vec![value],
-                                    Err(error) => {
-                                        sampler_error.get_or_insert(error);
-                                        vec![f64::NAN]
-                                    }
-                                }
-                            },
-                        )?;
-                        if let Some(error) = sampler_error {
-                            return Err(error);
-                        }
-                        stored.push(built);
+                            values,
+                        )?);
                         continue;
                     }
                     if state_names.len() > 1 || components != 1 {
@@ -805,36 +987,44 @@ pub fn external_inputs_from(
                         },
                     )?);
                 }
-                FieldSource::Constant(_) | FieldSource::Nodal(_) | FieldSource::Sampled(_) => {
-                    let mut sampler_error = None;
-                    let source = source.clone();
-                    let built = ExternalInput::sampled(
+                FieldSource::Nodal(_) => {
+                    return Err(FinitumError::UnsupportedRealization(
+                        "a Nodal field source has no coordinate sampler; supply its \
+                         already-projected quadrature-point values directly as an \
+                         ExternalInput instead of through external_inputs_from"
+                            .into(),
+                    ));
+                }
+                FieldSource::Constant(values) => {
+                    stored.push(ExternalInput::sampled(
                         integral.integral_index,
                         input.id,
                         components,
                         mesh,
                         element,
-                        |_, point| match &source {
-                            FieldSource::Constant(values) => values.clone(),
-                            FieldSource::Sampled(sampler) => sampler(point),
-                            FieldSource::Nodal(_) => {
-                                sampler_error.get_or_insert(FinitumError::UnsupportedRealization(
-                                    "a Nodal field source has no coordinate sampler; supply its \
-                                     already-projected quadrature-point values directly as an \
-                                     ExternalInput instead of through external_inputs_from"
-                                        .into(),
-                                ));
-                                vec![f64::NAN; components]
-                            }
-                            FieldSource::Table(_) | FieldSource::Kernel { .. } => {
-                                unreachable!("handled by their own match arms above")
-                            }
-                        },
-                    )?;
-                    if let Some(error) = sampler_error {
-                        return Err(error);
-                    }
-                    stored.push(built);
+                        |_, _| values.clone(),
+                    )?);
+                }
+                FieldSource::Sampled(sampler) => {
+                    stored.push(ExternalInput::sampled(
+                        integral.integral_index,
+                        input.id,
+                        components,
+                        mesh,
+                        element,
+                        |_, point| sampler(point),
+                    )?);
+                }
+                FieldSource::Fallible(sampler) => {
+                    stored.push(ExternalInput::try_sampled_at(
+                        integral.integral_index,
+                        input.id,
+                        components,
+                        mesh,
+                        element,
+                        time,
+                        |_, point, time| sampler(point, time),
+                    )?);
                 }
             }
         }
@@ -898,28 +1088,37 @@ impl ExternalSensitivityInput {
         element: &PreparedElement,
         mut sample: impl FnMut(CellId, &[f64]) -> Vec<f64>,
     ) -> Result<Self, FinitumError> {
-        if mesh.dimension() != element.dimension() {
-            return Err(FinitumError::InvalidRealization(format!(
-                "mesh dimension {} differs from element dimension {}",
-                mesh.dimension(),
-                element.dimension()
-            )));
-        }
-        let mut values = Vec::new();
-        for (cell_index, _) in mesh.cells().iter().enumerate() {
-            let cell = CellGeometry::new(mesh, CellId(cell_index))?;
-            for point in element.quadrature() {
-                let physical = cell.physical_point(&point.coordinates);
-                let sampled = sample(CellId(cell_index), &physical);
-                if sampled.len() != component_count {
-                    return Err(FinitumError::InvalidRealization(format!(
-                        "external sensitivity sampler returned {} components, expected {component_count}",
-                        sampled.len()
-                    )));
-                }
-                values.extend(sampled);
-            }
-        }
+        let values = sample_cell_table(
+            mesh,
+            element,
+            component_count,
+            "external sensitivity",
+            |cell, point| Ok(sample(cell, point)),
+        )?;
+        Self::new(integral_index, input, component_count, values)
+    }
+
+    /// W8 lane F2: the fallible form of [`Self::sampled`]; a refusal is located at its cell
+    /// and baseline point, re-labelled [`crate::InputOrigin::Table`], and ends the sampling
+    /// (design derivatives are steady, so there is no `_at` form).
+    pub fn try_sampled(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        mesh: &Mesh,
+        element: &PreparedElement,
+        mut sample: impl FnMut(CellId, &[f64]) -> Result<Vec<f64>, InputEvaluationError>,
+    ) -> Result<Self, FinitumError> {
+        let values = sample_cell_table(
+            mesh,
+            element,
+            component_count,
+            "external sensitivity",
+            |cell, point| {
+                sample(cell, point)
+                    .map_err(|failure| table_failure(failure, Some(cell), point, None))
+            },
+        )?;
         Self::new(integral_index, input, component_count, values)
     }
 

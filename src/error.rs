@@ -315,6 +315,16 @@ impl InputEvaluationError {
         parts.join(", ")
     }
 
+    /// Re-label the origin as a stored table built for it: the failure happened while a
+    /// quadrature-point table was sampled at bind time, not during an operator action.
+    pub(crate) fn into_table(mut self) -> Self {
+        self.origin = match self.origin {
+            InputOrigin::Table(origin) => InputOrigin::Table(origin),
+            other => InputOrigin::Table(other.to_string()),
+        };
+        self
+    }
+
     /// Locate this failure where Finitum evaluated it (Finitum's values replace the callback's).
     pub(crate) fn at(mut self, cell: Option<CellId>, point: &[f64], time: Option<f64>) -> Self {
         self.location = Some(Box::new(InputLocation {
@@ -452,6 +462,17 @@ mod tests {
             InputOrigin::from_display("boundary/walls"),
             InputOrigin::Slot("boundary/walls".into())
         );
+    }
+
+    #[test]
+    fn a_table_relabel_keeps_a_table_origin_and_wraps_any_other() {
+        let wrapped = failure().into_table();
+        assert_eq!(
+            wrapped.origin,
+            InputOrigin::Table("provider/diffusivity".into())
+        );
+        let kept = wrapped.clone().into_table();
+        assert_eq!(kept.origin, wrapped.origin);
     }
 
     #[test]

@@ -58,8 +58,12 @@ implementation contains:
   the cell, physical point and time it evaluated and propagates it as
   `FinitumError::InputEvaluation` out of every action and as Methodus's
   `NumericError::Evaluation` out of every operator trait, never as a non-finite value.
-  `FinitumError::code()` returns the producer's code. The infallible constructors are thin
-  wrappers, scheduled for deletion (slice F3) once Sinbad has migrated.
+  `FinitumError::code()` returns the producer's code. Stored-table builders have `try_sampled`
+  / `try_sampled_at(time)` forms that refuse at construction with a `Table` origin, and
+  `FieldSource::fallible(|x, t| ..)` with the `_at(time)` forms of `external_inputs_from` and
+  both essential-constraint samplers stop transient data being frozen at `t = 0`. The
+  infallible constructors are thin wrappers, scheduled for deletion (slice F3) once Sinbad has
+  migrated.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference

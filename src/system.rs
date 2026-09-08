@@ -4951,6 +4951,20 @@ pub fn system_constitutive_from_sources(
                             move |_: &PointEvaluation, _: &PointEvaluation| vec![0.0; components],
                         )?
                     }
+                    FieldSource::Fallible(sampler) => {
+                        let sampler = sampler.clone();
+                        SystemConstitutiveInput::try_new(
+                            block.equation.clone(),
+                            integral.integral_index,
+                            input.id,
+                            components,
+                            format!("finitum.system-field-source/1:{}", source.identity().hex),
+                            move |point: &PointEvaluation| sampler(&point.coordinates, point.time),
+                            move |_: &PointEvaluation, _: &PointEvaluation| {
+                                Ok(vec![0.0; components])
+                            },
+                        )?
+                    }
                     FieldSource::Nodal(_) => {
                         return Err(FinitumError::UnsupportedRealization(format!(
                             "a Nodal field source has no coordinate sampler; symbol {symbol} \
@@ -5381,13 +5395,35 @@ pub struct SystemEssentialConstraintRequirement {
 /// nodes, matching [`crate::quadratic_simplex_dof_map`]/[`crate::quadratic_simplex_node_points`]'s
 /// shared vertex-then-edge convention), so this one function serves either order.
 /// [`FieldSource::Table`]/[`FieldSource::Kernel`] are refused typed (unsupported here; only
-/// `Constant`/`Nodal`/`Sampled` are admitted).
+/// `Constant`/`Nodal`/`Sampled`/`Fallible` are admitted; `Fallible` values are evaluated at
+/// `t = 0` here and at the caller's time by [`essential_constraints_from_system_at`]).
 pub fn essential_constraints_from_system(
     operator: &SystemOperator,
     mesh: &TaggedMesh,
     region_map: &RegionMap,
     requirements: &[SystemEssentialConstraintRequirement],
 ) -> Result<ConstraintSet, FinitumError> {
+    essential_constraints_from_system_at(operator, mesh, region_map, requirements, 0.0)
+}
+
+/// W8 lane F2: [`essential_constraints_from_system`] with every value evaluated at `time` (a
+/// [`FieldSource::Fallible`] closure's time argument; `Constant` / `Nodal` / `Sampled` values do
+/// not depend on it), so transient Dirichlet data on the system path stop being frozen at
+/// `t = 0`: rebuild the constraint set (and `reduced(..)`) per step. A `Fallible` refusal is
+/// located at the node's coordinates (or the RT0 facet centroid) and `time`, without a cell,
+/// and returned as [`FinitumError::InputEvaluation`].
+pub fn essential_constraints_from_system_at(
+    operator: &SystemOperator,
+    mesh: &TaggedMesh,
+    region_map: &RegionMap,
+    requirements: &[SystemEssentialConstraintRequirement],
+    time: f64,
+) -> Result<ConstraintSet, FinitumError> {
+    if !time.is_finite() {
+        return Err(FinitumError::InvalidRealization(
+            "essential constraint evaluation time must be finite".into(),
+        ));
+    }
     if mesh.mesh.vertices().len() != operator.plan().mesh().vertices().len()
         || mesh.mesh.cells().len() != operator.plan().mesh().cells().len()
     {
@@ -5435,6 +5471,7 @@ pub fn essential_constraints_from_system(
                 mesh,
                 region_map,
                 requirement,
+                time,
                 &mut values,
             )?;
             continue;
@@ -5498,9 +5535,14 @@ pub fn essential_constraints_from_system(
                     nodal[start..start + components].to_vec()
                 }
                 FieldSource::Sampled(sampler) => sampler(coordinates),
+                FieldSource::Fallible(sampler) => {
+                    sampler(coordinates, time).map_err(|failure| {
+                        FinitumError::from(failure.at(None, coordinates, Some(time)))
+                    })?
+                }
                 FieldSource::Table(_) | FieldSource::Kernel { .. } => {
                     return Err(FinitumError::UnsupportedRealization(
-                        "essential_constraints_from_system admits Constant/Nodal/Sampled field \
+                        "essential_constraints_from_system admits Constant/Nodal/Sampled/Fallible field \
                          sources only"
                             .into(),
                     ));
@@ -5548,6 +5590,7 @@ fn rt0_essential_values(
     tagged: &TaggedMesh,
     region_map: &RegionMap,
     requirement: &SystemEssentialConstraintRequirement,
+    time: f64,
     values: &mut Vec<BlockEssentialValue>,
 ) -> Result<(), FinitumError> {
     let tags = region_map
@@ -5616,6 +5659,8 @@ fn rt0_essential_values(
         let datum = match &requirement.value {
             FieldSource::Constant(constant) => constant.clone(),
             FieldSource::Sampled(sampler) => sampler(&centroid),
+            FieldSource::Fallible(sampler) => sampler(&centroid, time)
+                .map_err(|failure| FinitumError::from(failure.at(None, &centroid, Some(time))))?,
             FieldSource::Nodal(_) => {
                 return Err(FinitumError::UnsupportedRealization(format!(
                     "RT0 field {} has no nodes; essential normal-trace data must be a \
@@ -5625,7 +5670,7 @@ fn rt0_essential_values(
             }
             FieldSource::Table(_) | FieldSource::Kernel { .. } => {
                 return Err(FinitumError::UnsupportedRealization(
-                    "essential_constraints_from_system admits Constant/Nodal/Sampled field \
+                    "essential_constraints_from_system admits Constant/Nodal/Sampled/Fallible field \
                      sources only"
                         .into(),
                 ));
