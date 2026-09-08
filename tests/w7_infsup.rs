@@ -13,7 +13,7 @@ use finitum::{
     InfSupNorm, InfSupPairing, InfSupVerdict, Mesh, MeshProfile, MixedOperator, MixedSpace,
     PointEvaluation, RegionMap, RegionTagId, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemOperator, SystemRealizationPlan, WeightedDof,
-    essential_constraints_from_system, estimate_inf_sup, facet_membership_from,
+    essential_constraints_from_system_at, estimate_inf_sup, facet_membership_from,
     quadratic_simplex_dof_map, realize, require_inf_sup_stable,
 };
 use quantitas::UnitRegistry;
@@ -104,39 +104,43 @@ fn stokes_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> 
                 }
                 let components = input.shape.iter().product::<usize>().max(1);
                 let binding = if components == 4 {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "w7-infsup/viscosity",
                         |evaluation: &PointEvaluation| {
-                            evaluation
-                                .values(DerivativeEvaluation::SymmetricGradient)
-                                .expect("active symmetric-gradient input")
-                                .iter()
-                                .map(|value| 2.0 * MU * value)
-                                .collect()
+                            Ok({
+                                evaluation
+                                    .values(DerivativeEvaluation::SymmetricGradient)
+                                    .expect("active symmetric-gradient input")
+                                    .iter()
+                                    .map(|value| 2.0 * MU * value)
+                                    .collect()
+                            })
                         },
                         |_evaluation: &PointEvaluation, direction: &PointEvaluation| {
-                            direction
-                                .values(DerivativeEvaluation::SymmetricGradient)
-                                .expect("active symmetric-gradient direction")
-                                .iter()
-                                .map(|value| 2.0 * MU * value)
-                                .collect()
+                            Ok({
+                                direction
+                                    .values(DerivativeEvaluation::SymmetricGradient)
+                                    .expect("active symmetric-gradient direction")
+                                    .iter()
+                                    .map(|value| 2.0 * MU * value)
+                                    .collect()
+                            })
                         },
                     )
                 } else {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "w7-infsup/zero",
-                        move |_evaluation: &PointEvaluation| vec![0.0; components],
+                        move |_evaluation: &PointEvaluation| Ok(vec![0.0; components]),
                         move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                            vec![0.0; components]
+                            Ok(vec![0.0; components])
                         },
                     )
                 };
@@ -200,7 +204,7 @@ fn realize_stokes(
         .expect("momentum declares the walls essential constraint")
         .clone();
     let region_map = walls_region_map(requirement.region, 2);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         &mesh,
         &region_map,
@@ -209,6 +213,7 @@ fn realize_stokes(
             requirement,
             value: FieldSource::constant(vec![0.0, 0.0]),
         }],
+        0.0,
     )
     .unwrap();
     (
@@ -425,27 +430,27 @@ fn darcy_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> {
                 let binding = match input.source {
                     InputSourceRequirement::Basis => continue,
                     InputSourceRequirement::ModelDefinedConstitutive { .. } => {
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             1,
                             "mobility_inverse",
-                            move |_evaluation: &PointEvaluation| vec![DARCY_MOBILITY_INVERSE],
+                            move |_evaluation: &PointEvaluation| Ok(vec![DARCY_MOBILITY_INVERSE]),
                             move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                                vec![0.0]
+                                Ok(vec![0.0])
                             },
                         )
                     }
-                    _ => SystemConstitutiveInput::new(
+                    _ => SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "zero",
-                        move |_evaluation: &PointEvaluation| vec![0.0; components],
+                        move |_evaluation: &PointEvaluation| Ok(vec![0.0; components]),
                         move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                            vec![0.0; components]
+                            Ok(vec![0.0; components])
                         },
                     ),
                 };

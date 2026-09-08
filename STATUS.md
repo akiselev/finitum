@@ -28,12 +28,12 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 + W8 lane F2 (Finitum, a transition inside one wave): fallible external-input and constitutive
   callbacks -- `InputEvaluationError { code, origin: InputOrigin, message, location }`,
   `FinitumError::InputEvaluation` with `code()` returning the producer's own code, `try_new` on
-  `DynamicExternalInput` / `SystemConstitutiveInput` (the infallible `new` is a thin wrapper),
+  `DynamicExternalInput` / `SystemConstitutiveInput`,
   every Methodus boundary mapping it to `NumericError::Evaluation` verbatim; stored-table
-  builders `try_sampled[_at]`, `FieldSource::fallible(|x, t| ..)`, the `_at(time)` forms of
-  `external_inputs_from` and both essential-constraint samplers; Finitum's own kernel / table
+  builders `try_sampled[_at]`, `FieldSource::fallible(|x, t| ..)`, `external_inputs_from_at`,
+  and explicit-time essential-constraint samplers; Finitum's own kernel / table
   closures refuse typed (`REALIZATION_PROPERTY_UNAVAILABLE`) instead of NaN or a panic; the
-  infallible forms are deleted by slice F3 after Sinbad 7d-2 migrates
+  infallible forms are removed by F3 (prepared in isolation until consumer migration)
 + W8 lane F-MI (Finitum, additive): the multi-instance `SystemRealizationPlan::composed` over
   Scientia's `scientia-operator-system/2` -- rows by `SysResId`, fields by `SysVarId` (two
   instances of one model, or two models with colliding `SymbolId`s, realize as distinct
@@ -46,6 +46,21 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 
 ## Implemented
 
+- W8 F3 deletion (2026-09-08, isolated preparation; coordinator integration pending):
+  removed infallible `DynamicExternalInput`/`SystemConstitutiveInput::new`, sampled table
+  aliases, `FieldSource::Sampled`/`sampled`, and implicit-zero-time sampling/constraint
+  helpers including `essential_constraints_from_system_by_variable`. The `try_*`,
+  `FieldSource::fallible`, and explicit `_at` functions are the sole APIs. Own consumers
+  preserve their declared sampling time and typed failures. The two historical alias-parity
+  tests now verify nonzero primal values, state/rate finite differences, adjoint identities,
+  and assembled/matrix-free agreement under the sole constructor; test count is unchanged.
+  Static table/dynamic callback identities and behavior are unchanged. Opaque FieldSource
+  closure identities remain address-based, as before; no old Sampled identity equivalence
+  is claimed. The historical F2 implementation record below describes the original additive
+  transition, superseded by this deletion. Final isolated workspace/all-target gate passed
+  235 tests across 33 binaries, using current sibling symlinks and explicit isolated Cargo
+  target/build directories. Workspace clippy and rustdoc with warnings denied, scoped
+  formatting and diff checks passed. Live integration remains coordinator-controlled.
 - W8 fallible nodal-patch verification seam (2026-09-08, implemented and validated):
   `try_check_nodal_patch` accepts the exact field as a fallible callback. Its original
   failure code/origin survives with the actual sampled vertex, no invented cell/time, and
@@ -1130,7 +1145,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 232 passed, 0 failed across 33 binaries (W8 prescribed motion, +4 integration; 228 at W8 F-EVAL functional evaluation, +14 integration; 214 at W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 235 passed, 0 failed across 33 binaries in isolated F3 preparation (two alias-parity tests replaced with FD/transpose/assembly checks, no count reduction; +1 paired-source projection and +2 fallible patch checks; 232 at W8 prescribed motion, +4 integration; 228 at W8 F-EVAL functional evaluation, +14 integration; 214 at W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -1316,39 +1331,16 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      the existing closure types is the non-additive step; a parallel `*_fallible` constructor
      pair would leave two paths and is not proposed. **Landed as item 8** with `try_` names
      and a named deletion slice (F3), because Sinbad A2 builds against the tree concurrently.
-8. W8 lane F2 landed (2026-09-07): fallible callbacks (see "Implemented"). Follow-ups:
-   - **Slice F3** (after Sinbad 7d-2 has migrated; a deletion, not a compatibility layer),
-     the exact list: `DynamicExternalInput::new`, `SystemConstitutiveInput::new`,
-     `ExternalInput::sampled`, `ExternalInput::sampled_on_facets`,
-     `ExternalSensitivityInput::sampled` (the infallible wrappers; the `try_` forms stay as
-     the only forms, no rename), `FieldSource::Sampled` and `FieldSource::sampled` (the
-     time-blind infallible variant; `Fallible` stays -- Krasis `initial.rs` and Sinbad
-     `run.rs` must match `Fallible` first), and the frozen-`t = 0` conveniences
-     `external_inputs_from`, `essential_constraints_from`,
-     `essential_constraints_from_selected`, `essential_constraints_from_system` (the `_at`
-     forms stay; after 7d-2 no consumer samples at an implicit `t = 0`). Also delete then:
-     the `sampler_error`-free `Nodal` refusal stays, the `SampledFieldFn` alias goes.
-   - Cross-repo needs: (a) **Krasis K1** -- pass Methodus's typed `NumericError::Evaluation
-     { code, origin, message }` through unchanged at its three
-     `map_err(.. NumericError::Operator { message })` sites (`coupled.rs`, `coupled_system.rs`)
-     so a failure raised inside `attempt_step_with` reaches the transaction outcome as a typed
-     refusal rather than a rolled-back "non-finite" step; (b) **Sinbad 7d-2** -- switch
-     `system_inputs.rs`'s `SystemConstitutiveInput::new` closures to `try_new` returning
-     `InputEvaluationError::new(refusal.code, InputOrigin::Slot(slot) | ExpressionPath(origin),
-     refusal.message)` (Finitum fills point / time / cell), then `src/evaluation_failure.rs`
-     shrinks to reading `FinitumError::InputEvaluation` / `NumericError::Evaluation` (the
-     `EvaluationFailureCell` and the `ClosureSite::fail` NaN placeholder go away);
-     `system_inputs.rs`'s `stored_table` switches to `ExternalInput::try_sampled_at(.., time,
-     ..)` with the step's time; Dirichlet data become `FieldSource::fallible(|x, t| ..)` and
-     the transient path (`coupled_run.rs`) rebuilds `essential_constraints_from_system_at(..,
-     time)` / `reduced(..)` per step so `g(t)` stops being frozen at `t = 0`;
-     `derivative_campaign.rs` / `advanced.rs` / `artifacts.rs` table builders take the `try_`
-     forms; `RUN_*` codes flow through unchanged, and Finitum's own
-     `REALIZATION_PROPERTY_UNAVAILABLE` / `REALIZATION_TANGENT_UNAVAILABLE` join the refusal
-     vocabulary (C12). (c) **Krasis K1 (addition)** -- `initial.rs` matches
-     `FieldSource::Sampled` by payload; add a `FieldSource::Fallible(sampler)` arm evaluating
-     `sampler(x, t0)` at the initial time and mapping the `InputEvaluationError` typed (today
-     the wildcard arm refuses it as an unsupported source).
+8. W8 F3 is prepared in an isolated worktree after F2 consumer APIs landed. Integrate only
+   after Sinbad 7d-2 has migrated all production/test uses, then remove Krasis's final
+   `FieldSource::Sampled` match arm atomically with this owner deletion. Retained signatures
+   are `DynamicExternalInput::try_new`, `SystemConstitutiveInput::try_new` / keyed forms,
+   `ExternalInput::try_sampled` / `try_sampled_at` / `try_sampled_on_facets`,
+   `ExternalSensitivityInput::try_sampled`, `FieldSource::fallible`, and every `_at` helper.
+   Run the three live consumer/owner suites after integration. Current-time coefficients
+   use runtime callbacks; prescribed essential values use `with_prescribed_values` with
+   analytic rate lifting, not repeated snapshots alone. Historical F2 sequencing above is
+   superseded by these requirements.
    - **P1 mass option on `SystemQuadrature::Barycenter` (recorded, not built; the F2 brief's
      item 6).** Need: a DAE structure with an unconstrained differential field (08 on 3x3)
      cannot take the migration rule under Krasis consistent initialization because the

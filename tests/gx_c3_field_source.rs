@@ -1,4 +1,4 @@
-//! GX-C3: kernel/table-backed `FieldSource` inputs and the `external_inputs_from` builder.
+//! GX-C3: kernel/table-backed `FieldSource` inputs and the `external_inputs_from_at` builder.
 
 use finitum::{
     AffineConstraint, Cell, ConstraintSet, DofId, DofMap, DynamicExternalInput, ElementRestriction,
@@ -152,7 +152,7 @@ fn conductivity_kernel() -> PropertyKernel {
     lower_property_kernel(&conductivity_definition(), &UnitRegistry::si_bootstrap()).unwrap()
 }
 
-/// Builds the `TransientNonlinear` plan via [`finitum::external_inputs_from`], with `k`
+/// Builds the `TransientNonlinear` plan via [`finitum::external_inputs_from_at`], with `k`
 /// backed by a [`FieldSource::Kernel`] wrapping `1.0 + 0.2 * u` (matching the FC7 gate's hand
 /// closure exactly), `capacity` a constant `1.0`, and `f` a zero sampler.
 fn kernel_backed_plan() -> RealizationPlan {
@@ -175,10 +175,14 @@ fn kernel_backed_plan() -> RealizationPlan {
             symbol_id(model, "k"),
             FieldSource::kernel(conductivity_kernel()).unwrap(),
         ),
-        (symbol_id(model, "f"), FieldSource::sampled(|_| vec![0.0])),
+        (
+            symbol_id(model, "f"),
+            FieldSource::fallible(|_, _time| Ok(vec![0.0])),
+        ),
     ];
     let (stored, dynamic) =
-        finitum::external_inputs_from(&factorization, model, &mesh, &element, &sources).unwrap();
+        finitum::external_inputs_from_at(&factorization, model, &mesh, &element, &sources, 0.0)
+            .unwrap();
     RealizationPlan::new_stateful(
         requirements,
         factorization,
@@ -215,48 +219,52 @@ fn hand_closure_plan() -> RealizationPlan {
             let name = &model.symbols[input.binding.symbol.index()].name;
             match name.as_str() {
                 "capacity" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "capacity=1;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "k=1+0.2u;direction=0.2du/v1",
                         |evaluation| {
-                            vec![
-                                1.0 + 0.2
-                                    * evaluation
-                                        .values(scientia::DerivativeEvaluation::Value)
-                                        .unwrap()[0],
-                            ]
+                            Ok({
+                                vec![
+                                    1.0 + 0.2
+                                        * evaluation
+                                            .values(scientia::DerivativeEvaluation::Value)
+                                            .unwrap()[0],
+                                ]
+                            })
                         },
                         |_, direction| {
-                            vec![
-                                0.2 * direction
-                                    .values(scientia::DerivativeEvaluation::Value)
-                                    .unwrap()[0],
-                            ]
+                            Ok({
+                                vec![
+                                    0.2 * direction
+                                        .values(scientia::DerivativeEvaluation::Value)
+                                        .unwrap()[0],
+                                ]
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
@@ -357,9 +365,13 @@ fn kernel_field_source_refuses_missing_tangent() {
             FieldSource::constant(vec![1.0]),
         ),
         (symbol_id(model, "k"), field_source),
-        (symbol_id(model, "f"), FieldSource::sampled(|_| vec![0.0])),
+        (
+            symbol_id(model, "f"),
+            FieldSource::fallible(|_, _time| Ok(vec![0.0])),
+        ),
     ];
-    let result = finitum::external_inputs_from(&factorization, model, &mesh, &element, &sources);
+    let result =
+        finitum::external_inputs_from_at(&factorization, model, &mesh, &element, &sources, 0.0);
     assert!(matches!(
         result,
         Err(finitum::FinitumError::RealizationTangentUnavailable(_))
@@ -380,7 +392,7 @@ fn linear_table() -> PropertyTable {
 }
 
 /// Exercises [`FieldSource::table`]'s interpolation through the public
-/// `essential_constraints_from` boundary path (the interpolator itself is crate-private): a
+/// `essential_constraints_from_at` boundary path (the interpolator itself is crate-private): a
 /// 1-D segment mesh offset from the table's grid puts one tagged endpoint strictly between grid
 /// points (an interpolation) and the other outside the table's range (a refusal).
 #[test]
@@ -403,12 +415,13 @@ fn table_field_source_interpolates_linearly_and_refuses_out_of_range() {
         region: scientia::RegionId(0),
         condition: scientia::DeclarationId(0),
     };
-    let constraints = finitum::essential_constraints_from(
+    let constraints = finitum::essential_constraints_from_at(
         &mesh,
         &dof_map,
         std::slice::from_ref(&requirement),
         &region_map,
         &[FieldSource::table(linear_table()).unwrap()],
+        0.0,
     )
     .unwrap();
     let value = constraints
@@ -421,12 +434,13 @@ fn table_field_source_interpolates_linearly_and_refuses_out_of_range() {
     // x_max = 3.5, outside the table's [0.0, 3.0] range with `OutOfValidityPolicy::Error`.
     let mut region_map = RegionMap::new();
     region_map.insert(scientia::RegionId(0), [RegionTagId::new("x_max")]);
-    let result = finitum::essential_constraints_from(
+    let result = finitum::essential_constraints_from_at(
         &mesh,
         &dof_map,
         &[requirement],
         &region_map,
         &[FieldSource::table(linear_table()).unwrap()],
+        0.0,
     );
     assert!(result.is_err(), "out-of-range table lookup must refuse");
 }

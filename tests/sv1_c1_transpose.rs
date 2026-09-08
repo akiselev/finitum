@@ -19,7 +19,7 @@
 use finitum::{
     CoefficientLayout, DerivativeProduct, DistributedCoefficient, DynamicExternalInput,
     ExternalInput, FieldSource, MeshProfile, PreparedElement, RealizationPlan, RegionMap,
-    RegionTagId, TaggedMesh, essential_constraints_from, realize, vector_nodal_dof_map,
+    RegionTagId, TaggedMesh, essential_constraints_from_at, realize, vector_nodal_dof_map,
 };
 use methodus::{
     ConjugateGradientConfig, EvaluationContext, GmresConfig, LinearOperator, TransposableOperator,
@@ -122,12 +122,13 @@ fn poisson_plan(
     let element = PreparedElement::linear_simplex(2).unwrap();
     let dofs = vector_nodal_dof_map(&mesh, 1).unwrap();
     let region_map = walls_region_map(factorization.essential_constraints[0].region);
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         tagged,
         &dofs,
         &factorization.essential_constraints,
         &region_map,
         &[FieldSource::constant([0.0])],
+        0.0,
     )
     .unwrap();
     let model = &compilation.semantic.models[0];
@@ -160,13 +161,13 @@ fn poisson_plan(
                     );
                 }
                 "f" => external.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![SOURCE],
+                        |_, _| Ok(vec![SOURCE]),
                     )
                     .unwrap(),
                 ),
@@ -202,12 +203,13 @@ fn nonlinear_plan(tagged: &TaggedMesh) -> RealizationPlan {
     let element = PreparedElement::linear_simplex(2).unwrap();
     let dofs = vector_nodal_dof_map(&mesh, 1).unwrap();
     let region_map = walls_region_map(factorization.essential_constraints[0].region);
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         tagged,
         &dofs,
         &factorization.essential_constraints,
         &region_map,
         &[FieldSource::constant([0.0])],
+        0.0,
     )
     .unwrap();
     let model = &compilation.semantic.models[0];
@@ -221,49 +223,60 @@ fn nonlinear_plan(tagged: &TaggedMesh) -> RealizationPlan {
             let name = model.symbols[input.binding.symbol.index()].name.as_str();
             match name {
                 "capacity" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "capacity=1+0.3u^2;direction=0.6u*du/v1",
                         |evaluation| {
-                            let u = evaluation.values(DerivativeEvaluation::Value).unwrap()[0];
-                            vec![1.0 + 0.3 * u * u]
+                            Ok({
+                                let u = evaluation.values(DerivativeEvaluation::Value).unwrap()[0];
+                                vec![1.0 + 0.3 * u * u]
+                            })
                         },
                         |evaluation, direction| {
-                            let u = evaluation.values(DerivativeEvaluation::Value).unwrap()[0];
-                            let du = direction.values(DerivativeEvaluation::Value).unwrap()[0];
-                            vec![0.6 * u * du]
+                            Ok({
+                                let u = evaluation.values(DerivativeEvaluation::Value).unwrap()[0];
+                                let du = direction.values(DerivativeEvaluation::Value).unwrap()[0];
+                                vec![0.6 * u * du]
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "k=1+0.2u;direction=0.2du/v1",
                         |evaluation| {
-                            vec![
-                                1.0 + 0.2
-                                    * evaluation.values(DerivativeEvaluation::Value).unwrap()[0],
-                            ]
+                            Ok({
+                                vec![
+                                    1.0 + 0.2
+                                        * evaluation.values(DerivativeEvaluation::Value).unwrap()
+                                            [0],
+                                ]
+                            })
                         },
                         |_, direction| {
-                            vec![0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0]]
+                            Ok({
+                                vec![
+                                    0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0],
+                                ]
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),

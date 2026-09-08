@@ -12,7 +12,7 @@ use finitum::{
     BlockLayout, ExternalInput, FieldSource, MeshProfile, PointEvaluation, ReducedSystemOperator,
     RegionMap, RegionTagId, SysResId, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemExternalInput, SystemQuadrature,
-    SystemRealizationPlan, TaggedMesh, essential_constraints_from_system, realize,
+    SystemRealizationPlan, TaggedMesh, essential_constraints_from_system_at, realize,
 };
 use methodus::{
     ConjugateGradientConfig, ConjugateGradientSymmetryPolicy, EvaluationContext, LinearOperator,
@@ -117,15 +117,15 @@ fn elasticity_system(tagged: &TaggedMesh, rule: SystemQuadrature) -> ReducedSyst
             ) {
                 assert_eq!(components, dimension * dimension, "the stress tensor");
                 constitutive.push(
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "linear-elasticity/hooke",
-                        move |evaluation| stress(&strain_of(evaluation, dimension), dimension),
+                        move |evaluation| Ok(stress(&strain_of(evaluation, dimension), dimension)),
                         move |_evaluation, direction| {
-                            stress(&strain_of(direction, dimension), dimension)
+                            Ok(stress(&strain_of(direction, dimension), dimension))
                         },
                     )
                     .unwrap(),
@@ -149,7 +149,7 @@ fn elasticity_system(tagged: &TaggedMesh, rule: SystemQuadrature) -> ReducedSyst
         .unwrap();
     let requirement = block.factorization.essential_constraints[0].clone();
     let region_map = boundary_region_map(requirement.region, dimension);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         tagged,
         &region_map,
@@ -158,6 +158,7 @@ fn elasticity_system(tagged: &TaggedMesh, rule: SystemQuadrature) -> ReducedSyst
             requirement,
             value: FieldSource::constant([0.0, 0.0, 0.0]),
         }],
+        0.0,
     )
     .unwrap();
     operator.reduced(constraints).unwrap()
@@ -197,7 +198,7 @@ fn poisson_system(tagged: &TaggedMesh) -> ReducedSystemOperator {
         .unwrap();
     let requirement = block.factorization.essential_constraints[0].clone();
     let region_map = boundary_region_map(requirement.region, 2);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         tagged,
         &region_map,
@@ -206,6 +207,7 @@ fn poisson_system(tagged: &TaggedMesh) -> ReducedSystemOperator {
             requirement,
             value: FieldSource::constant([0.0]),
         }],
+        0.0,
     )
     .unwrap();
     operator.reduced(constraints).unwrap()

@@ -232,13 +232,13 @@ fn scientia_poisson_uses_cad_boundary_ids_and_both_primal_paths_agree() {
                         "f" => 0.0,
                         other => panic!("unexpected external input {other}"),
                     };
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        move |_, _| vec![value],
+                        move |_, _| Ok(vec![value]),
                     )
                     .unwrap()
                 })

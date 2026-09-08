@@ -2,7 +2,7 @@
 
 use finitum::{
     DofId, FieldSource, FinitumError, MeshProfile, RegionMap, RegionTagId,
-    check_boundary_partition, essential_constraints_from, realize, vector_nodal_dof_map,
+    check_boundary_partition, essential_constraints_from_at, realize, vector_nodal_dof_map,
 };
 use scientia::{
     BoundaryPartitionRequirement, DeclarationId, DomainId, EssentialConstraintRequirement,
@@ -54,12 +54,13 @@ fn essential_constraints_from_tags_matches_index_arithmetic_boundary_set() {
         region: RegionId(0),
         condition: DeclarationId(0),
     };
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         &mesh,
         &dof_map,
         &[requirement],
         &region_map,
         &[FieldSource::constant(vec![5.0])],
+        0.0,
     )
     .unwrap();
 
@@ -100,10 +101,13 @@ fn essential_constraints_from_supports_vector_fields_and_sampled_sources() {
     ];
     let values = vec![
         FieldSource::constant(vec![1.0, 2.0]),
-        FieldSource::sampled(|coordinates: &[f64]| vec![coordinates[0], coordinates[1]]),
+        FieldSource::fallible(|coordinates: &[f64], _time| {
+            Ok(vec![coordinates[0], coordinates[1]])
+        }),
     ];
     let constraints =
-        essential_constraints_from(&mesh, &dof_map, &requirements, &region_map, &values).unwrap();
+        essential_constraints_from_at(&mesh, &dof_map, &requirements, &region_map, &values, 0.0)
+            .unwrap();
 
     // x_min vertices: column 0, every row; constant vector [1.0, 2.0].
     let width = n + 1;
@@ -146,12 +150,13 @@ fn essential_constraints_from_refuses_unmapped_region() {
         region: RegionId(0),
         condition: DeclarationId(0),
     };
-    let result = essential_constraints_from(
+    let result = essential_constraints_from_at(
         &mesh,
         &dof_map,
         &[requirement],
         &region_map,
         &[FieldSource::constant(vec![1.0])],
+        0.0,
     );
     assert!(matches!(
         result,
@@ -183,7 +188,8 @@ fn essential_constraints_from_refuses_conflicting_corner_values() {
         FieldSource::constant(vec![1.0]),
         FieldSource::constant(vec![2.0]),
     ];
-    let result = essential_constraints_from(&mesh, &dof_map, &requirements, &region_map, &values);
+    let result =
+        essential_constraints_from_at(&mesh, &dof_map, &requirements, &region_map, &values, 0.0);
     assert!(matches!(
         result,
         Err(FinitumError::ConflictingRegionValue { .. })

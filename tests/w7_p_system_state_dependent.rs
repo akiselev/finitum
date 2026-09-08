@@ -20,8 +20,8 @@
 use finitum::{
     BlockLayout, FieldSource, FinitumError, MeshProfile, PointEvaluation, ReducedSystemOperator,
     RegionMap, RegionTagId, SystemConstitutiveInput, SystemEssentialConstraintRequirement,
-    SystemOperator, SystemRealizationPlan, TaggedMesh, essential_constraints_from_system, realize,
-    system_constitutive_from_sources,
+    SystemOperator, SystemRealizationPlan, TaggedMesh, essential_constraints_from_system_at,
+    realize, system_constitutive_from_sources,
 };
 use methodus::{
     BdfConfig, BdfOrder, BdfState, EvaluationContext, LinearOperator, NewtonConfig, StepOutcome,
@@ -174,71 +174,77 @@ fn closure_constitutive(compiled: &Compiled) -> Vec<SystemConstitutiveInput> {
                 let built = match name {
                     "ka" => {
                         let b = value_input("b");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w7_p/ka=1+0.3b^2",
                             move |point: &PointEvaluation| {
-                                vec![ka(point.input_values(b).unwrap()[0])]
+                                Ok(vec![ka(point.input_values(b).unwrap()[0])])
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_ka(
-                                    point.input_values(b).unwrap()[0],
-                                    direction.input_values(b).unwrap()[0],
-                                )]
+                                Ok({
+                                    vec![d_ka(
+                                        point.input_values(b).unwrap()[0],
+                                        direction.input_values(b).unwrap()[0],
+                                    )]
+                                })
                             },
                         )
                     }
                     "kb" => {
                         let a = value_input("a");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w7_p/kb=1+0.5a",
                             move |point: &PointEvaluation| {
-                                vec![kb(point.input_values(a).unwrap()[0])]
+                                Ok(vec![kb(point.input_values(a).unwrap()[0])])
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_kb(
-                                    point.input_values(a).unwrap()[0],
-                                    direction.input_values(a).unwrap()[0],
-                                )]
+                                Ok({
+                                    vec![d_kb(
+                                        point.input_values(a).unwrap()[0],
+                                        direction.input_values(a).unwrap()[0],
+                                    )]
+                                })
                             },
                         )
                     }
                     "ca" => {
                         let a = value_input("a");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w7_p/ca=1+0.2a^2",
                             move |point: &PointEvaluation| {
-                                vec![ca(point.input_values(a).unwrap()[0])]
+                                Ok(vec![ca(point.input_values(a).unwrap()[0])])
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_ca(
-                                    point.input_values(a).unwrap()[0],
-                                    direction.input_values(a).unwrap()[0],
-                                )]
+                                Ok({
+                                    vec![d_ca(
+                                        point.input_values(a).unwrap()[0],
+                                        direction.input_values(a).unwrap()[0],
+                                    )]
+                                })
                             },
                         )
                     }
                     "fa" | "fb" => {
                         let value = if name == "fa" { FA } else { FB };
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             format!("w7_p/{name}={value}"),
-                            move |_: &PointEvaluation| vec![value],
-                            |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            move |_: &PointEvaluation| Ok(vec![value]),
+                            |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         )
                     }
                     other => panic!("unexpected non-basis input {other}"),
@@ -358,7 +364,8 @@ fn build(
         }
     }
     let constraints =
-        essential_constraints_from_system(&operator, tagged, &region_map, &requirements).unwrap();
+        essential_constraints_from_system_at(&operator, tagged, &region_map, &requirements, 0.0)
+            .unwrap();
     let reduced = operator.reduced(constraints).unwrap();
     (operator, reduced)
 }

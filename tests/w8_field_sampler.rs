@@ -266,31 +266,33 @@ fn bind_single_field_plan(
             match input.source {
                 InputSourceRequirement::Basis => {}
                 InputSourceRequirement::ExternalValue => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         components,
                         mesh,
                         &element,
-                        |_, _| vec![0.0; components],
+                        |_, _| Ok(vec![0.0; components]),
                     )
                     .unwrap(),
                 ),
                 _ => {
                     let recorder = Arc::clone(recorder);
                     dynamic.push(
-                        DynamicExternalInput::new(
+                        DynamicExternalInput::try_new(
                             integral.integral_index,
                             input.id,
                             components,
                             format!("w8-f1/recording/{}/{:?}", integral.integral_index, input.id),
                             move |evaluation| {
-                                record(&recorder, evaluation);
-                                let mut value = vec![0.0; components];
-                                value[0] = 1.0;
-                                value
+                                Ok({
+                                    record(&recorder, evaluation);
+                                    let mut value = vec![0.0; components];
+                                    value[0] = 1.0;
+                                    value
+                                })
                             },
-                            move |_, _| vec![0.0; components],
+                            move |_, _| Ok(vec![0.0; components]),
                         )
                         .unwrap(),
                     );
@@ -565,19 +567,21 @@ fn recording_system_inputs(
                 let components = input.shape.iter().product::<usize>().max(1);
                 let recorder = Arc::clone(recorder);
                 constitutive.push(
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         format!("w8-f1/recording/{}/{:?}", integral.integral_index, input.id),
                         move |evaluation: &PointEvaluation| {
-                            record(&recorder, evaluation);
-                            let mut value = vec![0.0; components];
-                            value[0] = scale;
-                            value
+                            Ok({
+                                record(&recorder, evaluation);
+                                let mut value = vec![0.0; components];
+                                value[0] = scale;
+                                value
+                            })
                         },
-                        move |_: &PointEvaluation, _: &PointEvaluation| vec![0.0; components],
+                        move |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0; components]),
                     )
                     .unwrap(),
                 );

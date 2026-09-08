@@ -345,7 +345,7 @@ pub(crate) fn table_axis_point(
 /// every action -- residual, JVP, VJP, `linearize`, `assemble`, partial assembly, the
 /// agreement checks and every Methodus trait entry point (as `NumericError::Evaluation`). The
 /// first failure in cell / quadrature-point / input order wins; no action returns a non-finite
-/// value in its place. [`Self::new`] is the infallible form: its closures cannot refuse.
+/// value in its place. The sole callback constructor is [`Self::try_new`].
 #[derive(Clone)]
 pub struct DynamicExternalInput {
     pub integral_index: usize,
@@ -369,26 +369,6 @@ impl std::fmt::Debug for DynamicExternalInput {
 }
 
 impl DynamicExternalInput {
-    /// The infallible form: `value` and `direction` cannot refuse. A thin wrapper over
-    /// [`Self::try_new`] (deleted by slice F3 once every consumer has migrated).
-    pub fn new(
-        integral_index: usize,
-        input: TensorInputId,
-        component_count: usize,
-        identity: impl Into<String>,
-        value: impl Fn(&PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
-        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
-    ) -> Result<Self, FinitumError> {
-        Self::try_new(
-            integral_index,
-            input,
-            component_count,
-            identity,
-            move |point| Ok(value(point)),
-            move |point, direction_point| Ok(direction(point, direction_point)),
-        )
-    }
-
     /// The fallible form (W8 lane F2): `value` and `direction` return their own typed
     /// [`InputEvaluationError`] instead of a value when they cannot evaluate; see the type
     /// documentation for how it propagates.
@@ -568,28 +548,7 @@ impl ExternalInput {
         })
     }
 
-    /// Sample and own input values in deterministic cell/quadrature/component order. The
-    /// infallible form: `sample` cannot refuse (a thin wrapper over the same sampling as
-    /// [`Self::try_sampled`]; deleted by slice F3).
-    pub fn sampled(
-        integral_index: usize,
-        input: TensorInputId,
-        component_count: usize,
-        mesh: &Mesh,
-        element: &PreparedElement,
-        mut sample: impl FnMut(CellId, &[f64]) -> Vec<f64>,
-    ) -> Result<Self, FinitumError> {
-        let values = sample_cell_table(
-            mesh,
-            element,
-            component_count,
-            "external input",
-            |cell, point| Ok(sample(cell, point)),
-        )?;
-        Self::new(integral_index, input, component_count, values)
-    }
-
-    /// W8 lane F2: the fallible form of [`Self::sampled`] for a steady table. A refusal
+    /// W8 lane F2: samples a steady table through a fallible callback. A refusal
     /// `sample` returns is located at its cell and physical point (no time), re-labelled
     /// [`crate::InputOrigin::Table`] and returned as [`FinitumError::InputEvaluation`] -- the
     /// table is never built with a non-finite placeholder. The first refusal in cell, then
@@ -644,7 +603,7 @@ impl ExternalInput {
 
     /// SV1-C3: own the quadrature-point values a caller-owned distributed coefficient `design`
     /// induces under `layout` (see [`CoefficientLayout`]), in the same deterministic
-    /// cell/quadrature/component order as [`Self::sampled`]. The map from `design` to the
+    /// cell/quadrature/component order as [`Self::try_sampled`]. The map from `design` to the
     /// stored table is linear; [`RealizationPlan::coefficient_jacobian_vector_product`] and
     /// [`RealizationPlan::coefficient_vector_jacobian_product`] differentiate through exactly
     /// this map, so a plan bound with this input and a design vector `p` is the realization
@@ -717,32 +676,10 @@ impl ExternalInput {
         Self::new(integral_index, input, component_count, values)
     }
 
-    /// GX-C4: sample and own input values in the deterministic order of `facet_ids` (one
-    /// centroid quadrature point per facet, matching `FacetGeometry`'s single-point rule).
-    /// `facet_ids` must be exactly the facet list a `SemanticMeasure::ExteriorFacet { region }`
-    /// integral resolves through its `RegionMap`/`RegionTags` binding, in the same order the
-    /// realization itself will use -- passing a different order silently mismatches values to
-    /// facets, since this stored array carries no facet identity of its own.
-    pub fn sampled_on_facets(
-        integral_index: usize,
-        input: TensorInputId,
-        component_count: usize,
-        mesh: &Mesh,
-        facets: &FacetTopology,
-        facet_ids: &[FacetId],
-        mut sample: impl FnMut(FacetId, &[f64]) -> Vec<f64>,
-    ) -> Result<Self, FinitumError> {
-        let values = sample_facet_table(
-            mesh,
-            facets,
-            facet_ids,
-            component_count,
-            |facet, geometry| Ok(sample(facet, &geometry.physical_centroid)),
-        )?;
-        Self::new(integral_index, input, component_count, values)
-    }
-
-    /// W8 lane F2: the fallible form of [`Self::sampled_on_facets`] (steady); a refusal is
+    /// Samples one centroid point per facet in the exact supplied `facet_ids` order. The
+    /// list must match the realization's resolved exterior region: stored values carry no
+    /// independent facet identities, so a different ordering binds data to wrong facets.
+    /// W8 lane F2: samples a steady facet table through a fallible callback; a refusal is
     /// located at the facet's owning cell and centroid, re-labelled
     /// [`crate::InputOrigin::Table`], and ends the sampling.
     pub fn try_sampled_on_facets(
@@ -826,43 +763,18 @@ impl ExternalInput {
     }
 }
 
-/// GX-C3: builds `ExternalInput`/`DynamicExternalInput` bindings for every non-basis QFunction
-/// input of `factorization`'s **cell** integrals (`SemanticMeasure::Cell`) from a caller-supplied
-/// `(SymbolId, FieldSource)` table, replacing hand-written per-input closures such as the ones
-/// `fc7_runtime_state_rate_and_property_chain_rule_match_finite_differences` writes by hand.
-/// GX-C4 facet integrals build their external inputs separately, since they sample at facet
-/// points rather than cell quadrature points (see `ExternalInput::sampled_on_facets`).
+/// Builds bindings for every non-basis input of the factorization's cell integrals from
+/// `(SymbolId, FieldSource)` data. Facet inputs are sampled separately through
+/// [`ExternalInput::try_sampled_on_facets`]. Coordinate/time-only sources are sampled once
+/// into stored inputs at the requested time; they do not vary with later runtime evaluation.
+/// Nodal data refuse here because this API has no nodal reconstruction contract.
 ///
-/// A `Constant`/`Sampled`/`Fallible`/`Table` source, or a `Kernel` source whose declared inputs
-/// are all resolvable as coordinates/time (names `"x"`/`"y"`/`"z"`/`"t"`/`"time"`), is sampled
-/// once per cell quadrature point into a stored `ExternalInput` at `t = 0` -- coordinates only,
-/// so it cannot vary with the runtime evaluation time or the active field; W8 lane F2's
-/// [`external_inputs_from_at`] samples the same tables at a caller-chosen time instead. A
-/// `Nodal` source is refused (it has no coordinate sampler). A `Fallible` source's refusal is
-/// located, re-labelled [`crate::InputOrigin::Table`] and returned typed.
+/// A Kernel/Table referencing exactly one active basis field becomes a dynamic binding,
+/// evaluated at runtime coordinates, time, and field value. Its direction multiplies the
+/// exact provided tangent/slope by that field direction. Multiple active fields or a missing
+/// tangent refuse explicitly; use compiled point graphs for more general capture chains.
 ///
-/// A `Kernel` or `Table` source whose declared inputs (or axes) include the name of exactly one
-/// active, basis-sourced field of the same integral becomes a `DynamicExternalInput`: its value
-/// closure evaluates the kernel/table at the point's coordinates and the active field's current
-/// value; its direction closure evaluates the exact tangent/slope with respect to that one input
-/// and multiplies by the supplied direction (the chain rule for every other declared input is
-/// zero, since only coordinates/time and the one active field may appear). A source referencing
-/// more than one active field by name is refused (ambiguous chain-rule combination, out of
-/// bounded scope). A `Kernel` whose `DerivativeContract` supplied no tangent for that input, or a
-/// `Table` with `TableDerivativePolicy::Unavailable`, is refused at build time
-/// (`FinitumError::RealizationTangentUnavailable`) rather than silently trusted with a zero or
-/// approximate direction.
-pub fn external_inputs_from(
-    factorization: &OperatorFactorization,
-    model: &scientia::SemanticModel,
-    mesh: &Mesh,
-    element: &PreparedElement,
-    sources: &[(SymbolId, FieldSource)],
-) -> Result<(Vec<ExternalInput>, Vec<DynamicExternalInput>), FinitumError> {
-    external_inputs_from_at(factorization, model, mesh, element, sources, 0.0)
-}
-
-/// W8 lane F2: [`external_inputs_from`] with the state-independent sources sampled at `time`
+/// State-independent sources are sampled at `time`
 /// (their `"t"`/`"time"` inputs, table axes, and the `Fallible` closure's time argument), so a
 /// transient realization's stored tables carry the step's data rather than `t = 0`'s. The
 /// state-dependent (`DynamicExternalInput`) bindings are unaffected: they read the runtime
@@ -906,7 +818,7 @@ pub fn external_inputs_from_at(
             let symbol = input.binding.symbol;
             let source = *sources_by_symbol.get(&symbol).ok_or_else(|| {
                 FinitumError::InvalidRealization(format!(
-                    "external_inputs_from has no FieldSource for symbol {symbol:?}"
+                    "external_inputs_from_at has no FieldSource for symbol {symbol:?}"
                 ))
             })?;
             let components = component_count(&input.shape)?;
@@ -1122,30 +1034,21 @@ pub fn external_inputs_from_at(
                     return Err(FinitumError::UnsupportedRealization(
                         "a Nodal field source has no coordinate sampler; supply its \
                          already-projected quadrature-point values directly as an \
-                         ExternalInput instead of through external_inputs_from"
+                         ExternalInput instead of through external_inputs_from_at"
                             .into(),
                     ));
                 }
                 FieldSource::Constant(values) => {
-                    stored.push(ExternalInput::sampled(
+                    stored.push(ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         components,
                         mesh,
                         element,
-                        |_, _| values.clone(),
+                        |_, _| Ok(values.clone()),
                     )?);
                 }
-                FieldSource::Sampled(sampler) => {
-                    stored.push(ExternalInput::sampled(
-                        integral.integral_index,
-                        input.id,
-                        components,
-                        mesh,
-                        element,
-                        |_, point| sampler(point),
-                    )?);
-                }
+
                 FieldSource::Fallible(sampler) => {
                     stored.push(ExternalInput::try_sampled_at(
                         integral.integral_index,
@@ -1206,30 +1109,7 @@ impl ExternalSensitivityInput {
         })
     }
 
-    /// Sample design-direction values in deterministic cell/quadrature order.
-    ///
-    /// The sampler receives baseline physical quadrature points; authored
-    /// closures must differentiate at fixed chart identity, because a fixed
-    /// topology keeps every chart coordinate stable while positions move.
-    pub fn sampled(
-        integral_index: usize,
-        input: TensorInputId,
-        component_count: usize,
-        mesh: &Mesh,
-        element: &PreparedElement,
-        mut sample: impl FnMut(CellId, &[f64]) -> Vec<f64>,
-    ) -> Result<Self, FinitumError> {
-        let values = sample_cell_table(
-            mesh,
-            element,
-            component_count,
-            "external sensitivity",
-            |cell, point| Ok(sample(cell, point)),
-        )?;
-        Self::new(integral_index, input, component_count, values)
-    }
-
-    /// W8 lane F2: the fallible form of [`Self::sampled`]; a refusal is located at its cell
+    /// W8 lane F2: samples a sensitivity table through a fallible callback; a refusal is located at its cell
     /// and baseline point, re-labelled [`crate::InputOrigin::Table`], and ends the sampling
     /// (design derivatives are steady, so there is no `_at` form).
     pub fn try_sampled(
@@ -1541,7 +1421,7 @@ impl RealizationPlan {
     /// GX-C4: as [`Self::new_stateful`], additionally admitting `SemanticMeasure::ExteriorFacet`
     /// integrals. `facet_regions` maps each such integral's `region` to the concrete exterior
     /// [`FacetId`]s it integrates over -- resolved by the caller through a `RegionMap`/
-    /// `RegionTags` binding (mirroring [`crate::essential_constraints_from`]) before calling
+    /// `RegionTags` binding (mirroring [`crate::essential_constraints_from_at`]) before calling
     /// this constructor, since a bare [`Mesh`] carries no region tags of its own. A
     /// `SemanticMeasure::ExteriorFacet { region }` integral whose `region` has no entry (or an
     /// empty entry) here is refused (`FinitumError::RealizationRegionUnmapped`).

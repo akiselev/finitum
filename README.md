@@ -60,11 +60,12 @@ implementation contains:
   `NumericError::Evaluation` out of every operator trait, never as a non-finite value.
   `FinitumError::code()` returns the producer's code. Stored-table builders have `try_sampled`
   / `try_sampled_at(time)` forms that refuse at construction with a `Table` origin, and
-  `FieldSource::fallible(|x, t| ..)` with the `_at(time)` forms of `external_inputs_from` and
-  both essential-constraint samplers stop transient data being frozen at `t = 0`. Finitum's
-  own bound `Kernel` / `Table` sources refuse typed at a runtime point
-  (`REALIZATION_PROPERTY_UNAVAILABLE`) instead of a NaN placeholder or a panic. The infallible
-  constructors are thin wrappers, scheduled for deletion (slice F3) once Sinbad has migrated.
+  `FieldSource::fallible(|x, t| ..)` and explicit `_at(time)` sampling helpers preserve the
+  caller's time. Snapshot sampling alone does not supply a prescribed boundary rate; use
+  `with_prescribed_values` for runtime lifting. Finitum's own bound `Kernel` / `Table`
+  sources refuse typed at a runtime point (`REALIZATION_PROPERTY_UNAVAILABLE`). F3 removes
+  the legacy infallible aliases and implicit-time helpers; `try_*`, `fallible`, and `_at`
+  are the sole callback/sampling APIs.
 - a multi-instance `SystemRealizationPlan::composed` (W8 lane F-MI) over Scientia's
   `scientia-operator-system/2`: rows keyed by `SysResId`, fields by `SysVarId` (two instances of
   one model realize as distinct blocks), same-mesh `bind` chains realized at bind time -- the
@@ -111,8 +112,10 @@ kernels once, supply only external provider primitives, and use `CellFunctionalP
 quadrature, value/JVP/VJP accumulation and independent coefficient gradients. See
 `tests/w8_functional.rs` for executable examples and `STATUS.md` for the current boundaries.
 
-Validated on 2026-09-08: 232 workspace/all-target tests passed, including 14 functional
-evaluation and four prescribed-motion tests; clippy and rustdoc with warnings denied, formatting and diff checks passed.
+Isolated F3 preparation validated on 2026-09-08: 235 workspace/all-target tests passed,
+including 14 functional evaluation, five prescribed-motion, and five verification tests.
+Clippy and rustdoc with warnings denied, formatting and diff checks passed. Live integration
+remains coordinator-controlled until the consumer migration is complete.
 Sinbad consumption and end-to-end G3 acceptance remain separate integration work.
 
 Prescribed transient essential values use

@@ -27,7 +27,8 @@ use finitum::{
     FacetTopology, FieldSource, FieldSpec, FinitumError, Mesh, MeshProfile, MixedOperator,
     MixedSpace, PointEvaluation, RegionMap, RegionTagId, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemQuadrature, SystemRealizationPlan,
-    essential_constraints_from_system, facet_membership_from, quadratic_simplex_dof_map, realize,
+    essential_constraints_from_system_at, facet_membership_from, quadratic_simplex_dof_map,
+    realize,
 };
 use methodus::{
     EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector, OperatorSymmetry,
@@ -138,52 +139,56 @@ fn stokes_constitutive(
                 let integral_index = integral.integral_index;
                 let input_id = input.id;
                 let binding = if components == 4 {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         equation,
                         integral_index,
                         input_id,
                         components,
                         "sv2b4-stokes/viscosity",
                         |evaluation: &PointEvaluation| {
-                            stress(
-                                evaluation
-                                    .values(DerivativeEvaluation::SymmetricGradient)
-                                    .expect("active symmetric-gradient input"),
-                            )
+                            Ok({
+                                stress(
+                                    evaluation
+                                        .values(DerivativeEvaluation::SymmetricGradient)
+                                        .expect("active symmetric-gradient input"),
+                                )
+                            })
                         },
                         |_evaluation: &PointEvaluation, direction: &PointEvaluation| {
-                            stress(
-                                direction
-                                    .values(DerivativeEvaluation::SymmetricGradient)
-                                    .expect("active symmetric-gradient direction"),
-                            )
+                            Ok({
+                                stress(
+                                    direction
+                                        .values(DerivativeEvaluation::SymmetricGradient)
+                                        .expect("active symmetric-gradient direction"),
+                                )
+                            })
                         },
                     )
                 } else if components == 2 {
                     let body_force = body_force.clone();
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         equation,
                         integral_index,
                         input_id,
                         components,
                         "sv2b4-stokes/body-force",
                         move |evaluation: &PointEvaluation| {
-                            body_force(&evaluation.coordinates).to_vec()
+                            Ok(body_force(&evaluation.coordinates).to_vec())
                         },
                         move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                            vec![0.0; components]
+                            Ok(vec![0.0; components])
                         },
                     )
                 } else {
-                    SystemConstitutiveInput::new(
+                    SystemConstitutiveInput::try_new(
                         equation,
                         integral_index,
                         input_id,
                         components,
                         "sv2b4-stokes/no-forcing",
-                        move |_evaluation: &PointEvaluation| vec![0.0; components],
+                        move |_evaluation: &PointEvaluation| Ok(vec![0.0; components]),
                         move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                            vec![0.0; components]
+                            Ok(vec![0.0; components])
                         },
                     )
                 };
@@ -408,7 +413,7 @@ fn signed_stokes_system_matches_mixed_operator_and_minres_converges() {
         .expect("momentum declares one essential-constraint requirement (the walls boundary)")
         .clone();
     let region_map = walls_region_map(momentum_requirement.region);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         &mesh,
         &region_map,
@@ -417,6 +422,7 @@ fn signed_stokes_system_matches_mixed_operator_and_minres_converges() {
             requirement: momentum_requirement,
             value: FieldSource::constant(vec![0.0, 0.0]),
         }],
+        0.0,
     )
     .unwrap();
     assert!(constraints.constraints().next().is_some());
@@ -614,15 +620,15 @@ fn darcy_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> {
                 let binding = match input.source {
                     InputSourceRequirement::Basis => continue,
                     InputSourceRequirement::ModelDefinedConstitutive { .. } => {
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             integral_index,
                             input_id,
                             1,
                             "mobility_inverse",
-                            move |_evaluation: &PointEvaluation| vec![DARCY_MOBILITY_INVERSE],
+                            move |_evaluation: &PointEvaluation| Ok(vec![DARCY_MOBILITY_INVERSE]),
                             move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                                vec![0.0]
+                                Ok(vec![0.0])
                             },
                         )
                     }
@@ -633,15 +639,15 @@ fn darcy_constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> {
                         } else {
                             "body_force"
                         };
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             integral_index,
                             input_id,
                             components,
                             identity,
-                            move |_evaluation: &PointEvaluation| vec![0.0; components],
+                            move |_evaluation: &PointEvaluation| Ok(vec![0.0; components]),
                             move |_evaluation: &PointEvaluation, _direction: &PointEvaluation| {
-                                vec![0.0; components]
+                                Ok(vec![0.0; components])
                             },
                         )
                     }
@@ -1044,7 +1050,7 @@ fn nonzero_body_force_stokes_system_solves_to_a_nontrivial_solution_matching_an_
         .expect("momentum declares one essential-constraint requirement (the walls boundary)")
         .clone();
     let region_map = walls_region_map(momentum_requirement.region);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         &mesh,
         &region_map,
@@ -1053,6 +1059,7 @@ fn nonzero_body_force_stokes_system_solves_to_a_nontrivial_solution_matching_an_
             requirement: momentum_requirement,
             value: FieldSource::constant(vec![0.0, 0.0]),
         }],
+        0.0,
     )
     .unwrap();
     assert!(constraints.constraints().next().is_some());

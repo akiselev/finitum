@@ -284,21 +284,21 @@ fn chart_forcing_plan(
             }
             let name = model.symbols[input.binding.symbol.index()].name.clone();
             let sampled = match name.as_str() {
-                "k" => ExternalInput::sampled(
+                "k" => ExternalInput::try_sampled(
                     integral.integral_index,
                     input.id,
                     1,
                     &mesh,
                     &element,
-                    |_, _| vec![1.0],
+                    |_, _| Ok(vec![1.0]),
                 ),
-                "f" => ExternalInput::sampled(
+                "f" => ExternalInput::try_sampled(
                     integral.integral_index,
                     input.id,
                     1,
                     &mesh,
                     &element,
-                    |_, point| shape_forcing(width, height, point),
+                    |_, point| Ok(shape_forcing(width, height, point)),
                 ),
                 other => panic!("unexpected external input {other}"),
             }
@@ -348,13 +348,20 @@ fn chart_forcing_directions(
             )
             .unwrap()
         } else {
-            ExternalSensitivityInput::sampled(
+            ExternalSensitivityInput::try_sampled(
                 *integral_index,
                 *input_id,
                 1,
                 geometry.mesh(),
                 &element,
-                |_, point| shape_forcing_derivative(width, height, parameter_index, point),
+                |_, point| {
+                    Ok(shape_forcing_derivative(
+                        width,
+                        height,
+                        parameter_index,
+                        point,
+                    ))
+                },
             )
             .unwrap()
         };
@@ -630,22 +637,22 @@ fn annulus_residual_sensitivity_matches_rebuilt_centered_differences() {
                 }
                 let name = model.symbols[input.binding.symbol.index()].name.clone();
                 let sampled = match name.as_str() {
-                    "k" => ExternalInput::sampled(
+                    "k" => ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![1.0],
+                        |_, _| Ok(vec![1.0]),
                     )
                     .unwrap(),
-                    "f" => ExternalInput::sampled(
+                    "f" => ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                     other => panic!("{other}"),

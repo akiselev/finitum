@@ -1,5 +1,5 @@
 //! GX-CONTRACTS C11.22 (Sinbad lane need): essential normal-trace data on an RT0 field through
-//! `essential_constraints_from_system`, so a genuinely impermeable mixed-Darcy wall
+//! `essential_constraints_from_system_at`, so a genuinely impermeable mixed-Darcy wall
 //! (`flux . n = 0`, an essential condition on the H(div) normal trace) is realizable instead
 //! of the naturally closed zero-pressure wall the corpus now declares.
 //!
@@ -18,7 +18,7 @@ use finitum::{
     BlockLayout, CompatibleDofMaps, FacetTopology, FieldSource, FinitumError, InstanceId,
     PointEvaluation, RegionMap, RegionTagId, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemOperator, SystemRealizationPlan, TaggedMesh,
-    essential_constraints_from_system, facet_membership_from, realize,
+    essential_constraints_from_system_at, facet_membership_from, realize,
 };
 use methodus::{EvaluationContext, LinearOperator, MinresConfig, NullspaceProjector, solve_minres};
 use quantitas::UnitRegistry;
@@ -49,24 +49,24 @@ fn constitutive(system: &OperatorSystem) -> Vec<SystemConstitutiveInput> {
                 let binding = match input.source {
                     InputSourceRequirement::Basis => continue,
                     InputSourceRequirement::ModelDefinedConstitutive { .. } => {
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             1,
                             "mobility_inverse",
-                            move |_: &PointEvaluation| vec![MOBILITY_INVERSE],
-                            move |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            move |_: &PointEvaluation| Ok(vec![MOBILITY_INVERSE]),
+                            move |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         )
                     }
-                    _ => SystemConstitutiveInput::new(
+                    _ => SystemConstitutiveInput::try_new(
                         block.equation.clone(),
                         integral.integral_index,
                         input.id,
                         components,
                         "zero",
-                        move |_: &PointEvaluation| vec![0.0; components],
-                        move |_: &PointEvaluation, _: &PointEvaluation| vec![0.0; components],
+                        move |_: &PointEvaluation| Ok(vec![0.0; components]),
+                        move |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0; components]),
                     ),
                 };
                 constitutive.push(binding.unwrap());
@@ -165,11 +165,12 @@ fn wall_requirement(
 fn impermeable_walls_as_rt0_essential_constraints_restore_the_constant_pressure_kernel() {
     let realized = realize_darcy(2);
     let requirement = wall_requirement(&realized, FieldSource::constant([0.0]));
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &realized.operator,
         &realized.mesh,
         &realized.region_map,
         &[requirement],
+        0.0,
     )
     .unwrap();
     let facets = FacetTopology::from_mesh(&realized.mesh.mesh).unwrap();
@@ -265,11 +266,12 @@ fn uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total() {
         matches!(motion, FinitumError::UnsupportedRealization(message) if message.contains("RT0"))
     );
 
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &realized.operator,
         &realized.mesh,
         &realized.region_map,
         &[requirement],
+        0.0,
     )
     .unwrap();
     let dimension = realized.operator.dimension();
@@ -299,7 +301,7 @@ fn uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total() {
 
     // Refusals: a vector datum, a nodal source, and an interior facet in the region.
     assert!(matches!(
-        essential_constraints_from_system(
+        essential_constraints_from_system_at(
             &realized.operator,
             &realized.mesh,
             &realized.region_map,
@@ -307,11 +309,12 @@ fn uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total() {
                 &realized,
                 FieldSource::constant([g, 0.0, 0.0])
             )],
+            0.0
         ),
         Err(FinitumError::InvalidRealization(_))
     ));
     assert!(matches!(
-        essential_constraints_from_system(
+        essential_constraints_from_system_at(
             &realized.operator,
             &realized.mesh,
             &realized.region_map,
@@ -319,6 +322,7 @@ fn uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total() {
                 &realized,
                 FieldSource::Nodal(vec![0.0; realized.mesh.mesh.vertices().len()])
             )],
+            0.0
         ),
         Err(FinitumError::UnsupportedRealization(_))
     ));
@@ -330,11 +334,12 @@ fn uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total() {
         .facet_regions
         .insert(RegionTagId::new("x_min"), vec![interior]);
     assert!(matches!(
-        essential_constraints_from_system(
+        essential_constraints_from_system_at(
             &realized.operator,
             &tagged,
             &realized.region_map,
             &[wall_requirement(&realized, FieldSource::constant([0.0]))],
+            0.0
         ),
         Err(FinitumError::UnsupportedRealization(_))
     ));

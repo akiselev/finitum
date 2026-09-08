@@ -260,13 +260,13 @@ fn poisson_plan(with_hanging_constraint: bool) -> RealizationPlan {
                         "f" => 0.4,
                         other => panic!("unexpected external input {other}"),
                     };
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        move |_, _| vec![value],
+                        move |_, _| Ok(vec![value]),
                     )
                     .unwrap()
                 })
@@ -365,34 +365,38 @@ fn elasticity_plan() -> RealizationPlan {
             }
             match input.source {
                 InputSourceRequirement::ModelDefinedConstitutive { .. } => dynamics.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         9,
                         format!("gx_f7/isotropic-lame/{}", integral.integral_index),
                         move |evaluation| {
-                            let strain = evaluation
-                                .values(DerivativeEvaluation::SymmetricGradient)
-                                .expect("active symmetric gradient");
-                            stress(LAMBDA, MU, strain)
+                            Ok({
+                                let strain = evaluation
+                                    .values(DerivativeEvaluation::SymmetricGradient)
+                                    .expect("active symmetric gradient");
+                                stress(LAMBDA, MU, strain)
+                            })
                         },
                         move |_evaluation, direction_evaluation| {
-                            let d_strain = direction_evaluation
-                                .values(DerivativeEvaluation::SymmetricGradient)
-                                .expect("active symmetric gradient direction");
-                            stress(LAMBDA, MU, d_strain)
+                            Ok({
+                                let d_strain = direction_evaluation
+                                    .values(DerivativeEvaluation::SymmetricGradient)
+                                    .expect("active symmetric gradient direction");
+                                stress(LAMBDA, MU, d_strain)
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 _ => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         3,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0, 0.0, 0.0],
+                        |_, _| Ok(vec![0.0, 0.0, 0.0]),
                     )
                     .unwrap(),
                 ),
@@ -509,42 +513,49 @@ fn nonlinear_plan() -> RealizationPlan {
             let name = &model.symbols[input.binding.symbol.index()].name;
             match name.as_str() {
                 "capacity" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "capacity=1;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "k=1+0.2u;direction=0.2du/v1",
                         |evaluation| {
-                            vec![
-                                1.0 + 0.2
-                                    * evaluation.values(DerivativeEvaluation::Value).unwrap()[0],
-                            ]
+                            Ok({
+                                vec![
+                                    1.0 + 0.2
+                                        * evaluation.values(DerivativeEvaluation::Value).unwrap()
+                                            [0],
+                                ]
+                            })
                         },
                         |_, direction| {
-                            vec![0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0]]
+                            Ok({
+                                vec![
+                                    0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0],
+                                ]
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),

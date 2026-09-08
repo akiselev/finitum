@@ -64,8 +64,7 @@ pub use optimized::{
 };
 pub use profile::{
     ComponentSelection, FieldSource, MeshProfile, MeshProvenance, PartitionReport, RegionMap,
-    RegionTagId, RegionTags, TaggedMesh, check_boundary_partition, essential_constraints_from,
-    essential_constraints_from_at, essential_constraints_from_selected,
+    RegionTagId, RegionTags, TaggedMesh, check_boundary_partition, essential_constraints_from_at,
     essential_constraints_from_selected_at, facet_membership_from, realize, refine_uniform,
 };
 pub use realization::{
@@ -75,7 +74,7 @@ pub use realization::{
     PointBoundInput, PointEvaluation, REALIZATION_ARTIFACT_SCHEMA, REALIZATION_CAPABILITY_SCHEMA,
     REALIZATION_PROPERTY_UNAVAILABLE, RealizationArtifact, RealizationCapability,
     RealizationExternalInput, RealizationPlan, RealizationReceipt, RepresentationKind,
-    SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from, external_inputs_from_at,
+    SYMMETRY_PROOF_DIMENSION_CAP, external_inputs_from_at,
 };
 pub use sampler::{
     ExteriorFacet, FIELD_SAMPLER_SCHEMA, FacetTrace, FieldSample, FieldSampler,
@@ -95,8 +94,7 @@ pub use system::{
     SystemEssentialConstraintRequirement, SystemExternalInput, SystemFieldArtifact, SystemOperator,
     SystemPartialAssemblyOperator, SystemQuadrature, SystemRealizationArtifact,
     SystemRealizationExternalInput, SystemRealizationPlan, SystemVariableEssentialConstraint,
-    SystemVariablePrescribedValue, essential_constraints_from_system,
-    essential_constraints_from_system_at, essential_constraints_from_system_by_variable,
+    SystemVariablePrescribedValue, essential_constraints_from_system_at,
     essential_constraints_from_system_by_variable_at, prescribed_values_from_system_by_variable,
     system_constitutive_from_sources,
 };

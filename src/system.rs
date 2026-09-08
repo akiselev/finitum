@@ -1702,8 +1702,7 @@ type SystemPointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) 
 /// either callback is located (cell, point, time) and propagated as
 /// [`FinitumError::InputEvaluation`] out of every `SystemOperator` / [`ReducedSystemOperator`]
 /// action and, as `NumericError::Evaluation`, out of every Methodus trait entry point. The
-/// first failure in cell / quadrature-point / input order wins. [`Self::new`] is the
-/// infallible form.
+/// first failure in cell / quadrature-point / input order wins.
 #[derive(Clone)]
 pub struct SystemConstitutiveInput {
     /// The equation the closure binds to (display only for a keyed target -- see `target`).
@@ -1744,29 +1743,6 @@ impl std::fmt::Debug for SystemConstitutiveInput {
 }
 
 impl SystemConstitutiveInput {
-    /// The infallible form: `value` and `direction` cannot refuse. A thin wrapper over
-    /// [`Self::try_new`] (deleted by slice F3 once every consumer has migrated).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        equation: impl Into<String>,
-        integral_index: usize,
-        input: TensorInputId,
-        component_count: usize,
-        identity: impl Into<String>,
-        value: impl Fn(&PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
-        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
-    ) -> Result<Self, FinitumError> {
-        Self::try_new(
-            equation,
-            integral_index,
-            input,
-            component_count,
-            identity,
-            move |point| Ok(value(point)),
-            move |point, direction_point| Ok(direction(point, direction_point)),
-        )
-    }
-
     /// The fallible form (W8 lane F2): `value` and `direction` return their own typed
     /// [`InputEvaluationError`] instead of a value when they cannot evaluate.
     #[allow(clippy::too_many_arguments)]
@@ -6676,7 +6652,7 @@ impl BlockLinearOperator for LinearizedSystemOperator {
 
 /// Batch P / GX-A3 in the system path: builds every block's [`SystemConstitutiveInput`] from a
 /// caller-supplied `(SymbolId, FieldSource)` table, mirroring
-/// [`crate::external_inputs_from`]'s resolution rules field-for-field, so a case's bound
+/// [`crate::external_inputs_from_at`]'s resolution rules field-for-field, so a case's bound
 /// property kernels and tables carry their exact tangents into the system JVP/VJP without a
 /// hand-written closure per input:
 ///
@@ -6689,7 +6665,7 @@ impl BlockLinearOperator for LinearizedSystemOperator {
 ///   is refused (`FinitumError::RealizationTangentUnavailable`); a source naming more than one
 ///   active field, or one whose field has no `Value`-kind active input on that integral, is
 ///   refused typed;
-/// - a coordinate/time-only `Kernel`/`Table`, a `Constant`, or a `Sampled` source is a state-
+/// - a coordinate/time-only `Kernel`/`Table`, a `Constant`, or a `Fallible` source is a state-
 ///   independent closure with an identically zero direction;
 /// - a `Nodal` source has no coordinate sampler and is refused typed.
 ///
@@ -6966,28 +6942,19 @@ pub fn system_constitutive_from_sources(
                             )));
                         }
                         let values = values.clone();
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             components,
                             format!("finitum.system-field-source/1:{}", source.identity().hex),
-                            move |_: &PointEvaluation| values.clone(),
-                            move |_: &PointEvaluation, _: &PointEvaluation| vec![0.0; components],
+                            move |_: &PointEvaluation| Ok(values.clone()),
+                            move |_: &PointEvaluation, _: &PointEvaluation| {
+                                Ok(vec![0.0; components])
+                            },
                         )?
                     }
-                    FieldSource::Sampled(sampler) => {
-                        let sampler = sampler.clone();
-                        SystemConstitutiveInput::new(
-                            block.equation.clone(),
-                            integral.integral_index,
-                            input.id,
-                            components,
-                            format!("finitum.system-field-source/1:{}", source.identity().hex),
-                            move |point: &PointEvaluation| sampler(&point.coordinates),
-                            move |_: &PointEvaluation, _: &PointEvaluation| vec![0.0; components],
-                        )?
-                    }
+
                     FieldSource::Fallible(sampler) => {
                         let sampler = sampler.clone();
                         SystemConstitutiveInput::try_new(
@@ -7005,7 +6972,7 @@ pub fn system_constitutive_from_sources(
                     FieldSource::Nodal(_) => {
                         return Err(FinitumError::UnsupportedRealization(format!(
                             "a Nodal field source has no coordinate sampler; symbol {symbol} \
-                             (equation `{}` integral {}) needs a Constant, Sampled, Kernel, or \
+                             (equation `{}` integral {}) needs a Constant, Fallible, Kernel, or \
                              Table source in the system path",
                             block.equation, integral.integral_index
                         )));
@@ -7597,35 +7564,13 @@ pub struct SystemEssentialConstraintRequirement {
     pub value: FieldSource,
 }
 
-/// Region-tag-driven multi-field essential constraints (mission item 3): resolves several
-/// fields' boundary DOFs from a [`TaggedMesh`]/[`RegionMap`] into `operator`'s [`BlockLayout`]
-/// [`ConstraintSet`], reusing the same [`crate::FacetTopology`]/[`RegionMap`] region-tag
-/// resolution [`crate::essential_constraints_from`] uses and composing it with
-/// [`crate::essential_constraints_for_variables`] for the elimination-facing `ConstraintSet`
-/// construction -- rather than duplicating *that* DOF-indexing machinery.
-///
-/// This does not delegate to [`crate::essential_constraints_from`] itself, because that function is
-/// documented and typed as vertex-major only (P1 Lagrange): a P2 (Taylor-Hood velocity) field's
-/// boundary also includes the *edge* node on every tagged facet, which a vertex-only walk misses
-/// entirely (leaving a P2 boundary only partially constrained -- wrong, not merely incomplete).
-/// Node order is auto-detected from `operator.dof_map(field)`'s node count against the mesh's
-/// vertex count (P1: `dof_count() == vertex_count * components`; P2: `vertex_count + edge_count`
-/// nodes, matching [`crate::quadratic_simplex_dof_map`]/[`crate::quadratic_simplex_node_points`]'s
-/// shared vertex-then-edge convention), so this one function serves either order.
-/// [`FieldSource::Table`]/[`FieldSource::Kernel`] are refused typed (unsupported here; only
-/// `Constant`/`Nodal`/`Sampled`/`Fallible` are admitted; `Fallible` values are evaluated at
-/// `t = 0` here and at the caller's time by [`essential_constraints_from_system_at`]).
-pub fn essential_constraints_from_system(
-    operator: &SystemOperator,
-    mesh: &TaggedMesh,
-    region_map: &RegionMap,
-    requirements: &[SystemEssentialConstraintRequirement],
-) -> Result<ConstraintSet, FinitumError> {
-    essential_constraints_from_system_at(operator, mesh, region_map, requirements, 0.0)
-}
-
-/// W8 lane F2: [`essential_constraints_from_system`] with every value evaluated at `time` (a
-/// [`FieldSource::Fallible`] closure's time argument; `Constant` / `Nodal` / `Sampled` values do
+/// Resolves region-tagged essential targets into system block offsets. Lagrange fields use
+/// the owner's vertex-major P1 or vertex-then-edge P2 ordering; tagged P2 boundary edges are
+/// included so higher-order fields are completely constrained. Constant/Nodal/Fallible data
+/// are admitted; direct Table/Kernel sources refuse. RT0 uses its separate oriented normal
+/// trace contract. For composed instances use [`essential_constraints_from_system_by_variable_at`].
+/// Every value is evaluated at `time` (a
+/// [`FieldSource::Fallible`] closure's time argument; `Constant` / `Nodal` values do
 /// not depend on it). This is a value snapshot, not a transient lifting: attach
 /// [`ReducedSystemOperator::with_prescribed_values`] for runtime essential values and their
 /// analytic rate contributions. Rebuilding this set alone omits prescribed mass-rate terms.
@@ -7819,7 +7764,6 @@ pub fn prescribed_values_from_system_by_variable(
                     })?
                     .to_vec()
             }
-            FieldSource::Sampled(callback) => callback(point),
             FieldSource::Fallible(callback) => callback(point, time)?,
             FieldSource::Kernel { .. } | FieldSource::Table(_) => {
                 unreachable!("validated prescribed source")
@@ -7872,16 +7816,6 @@ pub fn prescribed_values_from_system_by_variable(
             })
         })
         .collect())
-}
-
-/// [`essential_constraints_from_system_by_variable_at`] at `t = 0`.
-pub fn essential_constraints_from_system_by_variable(
-    operator: &SystemOperator,
-    mesh: &TaggedMesh,
-    region_maps: &[(InstanceId, &RegionMap)],
-    requirements: &[SystemVariableEssentialConstraint],
-) -> Result<ConstraintSet, FinitumError> {
-    essential_constraints_from_system_by_variable_at(operator, mesh, region_maps, requirements, 0.0)
 }
 
 /// W8 lane F-MI: [`essential_constraints_from_system_at`] over a composed (multi-instance)
@@ -8030,7 +7964,7 @@ pub fn essential_constraints_from_system_by_variable_at(
                     }
                     nodal[start..start + components].to_vec()
                 }
-                FieldSource::Sampled(sampler) => sampler(coordinates),
+
                 FieldSource::Fallible(sampler) => {
                     sampler(coordinates, time).map_err(|failure| {
                         FinitumError::from(failure.at(None, coordinates, Some(time)))
@@ -8038,7 +7972,7 @@ pub fn essential_constraints_from_system_by_variable_at(
                 }
                 FieldSource::Table(_) | FieldSource::Kernel { .. } => {
                     return Err(FinitumError::UnsupportedRealization(
-                        "essential_constraints_from_system admits Constant/Nodal/Sampled/Fallible field \
+                        "essential_constraints_from_system_at admits Constant/Nodal/Fallible field \
                          sources only"
                             .into(),
                     ));
@@ -8156,19 +8090,19 @@ fn rt0_essential_values(
         };
         let datum = match &requirement.value {
             FieldSource::Constant(constant) => constant.clone(),
-            FieldSource::Sampled(sampler) => sampler(&centroid),
+
             FieldSource::Fallible(sampler) => sampler(&centroid, time)
                 .map_err(|failure| FinitumError::from(failure.at(None, &centroid, Some(time))))?,
             FieldSource::Nodal(_) => {
                 return Err(FinitumError::UnsupportedRealization(format!(
                     "RT0 field {} has no nodes; essential normal-trace data must be a \
-                     Constant or Sampled scalar",
+                     Constant or Fallible scalar",
                     field
                 )));
             }
             FieldSource::Table(_) | FieldSource::Kernel { .. } => {
                 return Err(FinitumError::UnsupportedRealization(
-                    "essential_constraints_from_system admits Constant/Nodal/Sampled/Fallible field \
+                    "essential_constraints_from_system_at admits Constant/Nodal/Fallible field \
                      sources only"
                         .into(),
                 ));

@@ -10,7 +10,7 @@
 //!
 //! `RegionTags` sits on top of [`FacetTopology`] rather than replacing it:
 //! every tag is either a per-cell region label or a set of exterior facet
-//! identities, so `essential_constraints_from` and `check_boundary_partition`
+//! identities, so `essential_constraints_from_at` and `check_boundary_partition`
 //! discharge Scientia's region-keyed requirements against real topology
 //! instead of caller-supplied index arithmetic.
 
@@ -325,7 +325,6 @@ impl RegionMap {
 /// coordinate sampler, a Scientia property table, or a validated Scientia property kernel
 /// (GX-C3, contract C7). `identity()` returns a canonical digest of the source, replacing the
 /// caller-invented strings dynamic bindings used before this landed.
-type SampledFieldFn = dyn Fn(&[f64]) -> Vec<f64> + Send + Sync;
 type FallibleFieldFn = dyn Fn(&[f64], f64) -> Result<Vec<f64>, InputEvaluationError> + Send + Sync;
 
 #[derive(Clone)]
@@ -334,13 +333,10 @@ pub enum FieldSource {
     Constant(Vec<f64>),
     /// A caller-projected vertex-major field, `components` entries per vertex.
     Nodal(Vec<f64>),
-    /// A coordinate-driven evaluator returning `components` values per call. The infallible,
-    /// time-blind form (deleted by slice F3; see [`FieldSource::Fallible`]).
-    Sampled(Arc<SampledFieldFn>),
     /// W8 lane F2: a coordinate- and time-driven evaluator returning `components` values or
     /// its own typed [`InputEvaluationError`] per call ([`FieldSource::fallible`]). Every
     /// sampling site passes the evaluation time (the `_at(time)` forms their caller's time,
-    /// the legacy forms `0.0`, the system path's constitutive closures the runtime point's)
+    /// the system path's constitutive closures the runtime point's)
     /// and locates a refusal at the point it sampled (cell when there is one, time).
     Fallible(Arc<FallibleFieldFn>),
     /// A Scientia interpolation table, validated for shape/finiteness at construction.
@@ -360,7 +356,6 @@ impl std::fmt::Debug for FieldSource {
                 formatter.debug_tuple("Constant").field(values).finish()
             }
             FieldSource::Nodal(values) => formatter.debug_tuple("Nodal").field(values).finish(),
-            FieldSource::Sampled(_) => formatter.debug_tuple("Sampled").field(&"<fn>").finish(),
             FieldSource::Fallible(_) => formatter.debug_tuple("Fallible").field(&"<fn>").finish(),
             FieldSource::Table(table) => formatter.debug_tuple("Table").field(table).finish(),
             FieldSource::Kernel { kernel, .. } => formatter
@@ -394,10 +389,6 @@ impl FieldSource {
 
     pub fn nodal(values: impl Into<Vec<f64>>) -> Self {
         Self::Nodal(values.into())
-    }
-
-    pub fn sampled(sampler: impl Fn(&[f64]) -> Vec<f64> + Send + Sync + 'static) -> Self {
-        Self::Sampled(Arc::new(sampler))
     }
 
     /// W8 lane F2: the fallible, time-aware sampled source (see [`FieldSource::Fallible`]).
@@ -437,17 +428,13 @@ impl FieldSource {
 
     /// Canonical digest of this source: for `Kernel`, the `PropertyKernel` identity Scientia
     /// already computed; for `Table`, a digest of its axes/values/policies; for `Constant`/
-    /// `Nodal`, a digest of the owned data. `Sampled` and `Fallible` wrap an opaque closure with
-    /// no structural identity, so their digest distinguishes closures only within one process
+    /// `Nodal`, a digest of the owned data. `Fallible` wraps an opaque closure with
+    /// no structural identity, so its digest distinguishes closures only within one process
     /// run (the `Arc`'s address), not across runs or processes.
     pub fn identity(&self) -> Digest {
         match self {
             FieldSource::Constant(values) => field_source_digest("constant", values),
             FieldSource::Nodal(values) => field_source_digest("nodal", values),
-            FieldSource::Sampled(sampler) => {
-                let marker = format!("sampled:{:p}", Arc::as_ptr(sampler));
-                Digest::blake3(marker.as_bytes())
-            }
             FieldSource::Fallible(sampler) => {
                 let marker = format!("fallible:{:p}", Arc::as_ptr(sampler));
                 Digest::blake3(marker.as_bytes())
@@ -807,22 +794,10 @@ pub enum ComponentSelection {
     Only(Vec<usize>),
 }
 
-/// Derives essential (Dirichlet) constraints from region tags rather than positional CAD ids or
-/// index arithmetic. `dof_map` must be a vertex-major scalar or vector map (see
-/// [`crate::vector_nodal_dof_map`]); `values` supplies one [`FieldSource`] per requirement.
-/// Every component of every tagged vertex is constrained; see
-/// [`essential_constraints_from_selected`] to constrain a subset of a vector field's components.
-pub fn essential_constraints_from(
-    mesh: &TaggedMesh,
-    dof_map: &DofMap,
-    requirements: &[scientia::EssentialConstraintRequirement],
-    region_map: &RegionMap,
-    values: &[FieldSource],
-) -> Result<ConstraintSet, FinitumError> {
-    essential_constraints_from_at(mesh, dof_map, requirements, region_map, values, 0.0)
-}
-
-/// W8 lane F2: [`essential_constraints_from`] with the sources evaluated at `time` (the
+/// Derives essential constraints from region tags for a vertex-major scalar/vector DOF map.
+/// Each requirement supplies one source, and every component of every tagged vertex is
+/// constrained. Use [`essential_constraints_from_selected_at`] to select components.
+/// Sources are evaluated at `time` (the
 /// `"t"`/`"time"` kernel inputs and table axes, and a [`FieldSource::Fallible`] closure's time
 /// argument). This returns a value snapshot; it does not supply the prescribed time
 /// derivative needed by a transient mass operator. The system path supports complete
@@ -848,37 +823,11 @@ pub fn essential_constraints_from_at(
     )
 }
 
-/// As [`essential_constraints_from`], with an explicit per-requirement [`ComponentSelection`]
-/// (GX-C6). `values` accepts [`FieldSource::Table`]/[`FieldSource::Kernel`] alongside the landed
-/// variants: both evaluate as scalars (`components` must be `1`) at the tagged vertex's physical
-/// coordinates and time `0.0` (`Kernel` inputs are resolved by name from `{"x", "y", "z", "t",
-/// "time"}` covering the mesh's coordinate axes; any other declared input name is refused, since
-/// a boundary value has no active-field state to supply). A time-dependent boundary kernel's
-/// identity ([`FieldSource::identity`]) still changes with the kernel, so callers that need a
-/// different time rebuild the constraint set with a fresh evaluation rather than mutating this
-/// one; the `t = 0.0` evaluation is this function's fixed convention --
-/// [`essential_constraints_from_selected_at`] takes the time as a parameter.
-pub fn essential_constraints_from_selected(
-    mesh: &TaggedMesh,
-    dof_map: &DofMap,
-    requirements: &[scientia::EssentialConstraintRequirement],
-    region_map: &RegionMap,
-    values: &[FieldSource],
-    selection: &[ComponentSelection],
-) -> Result<ConstraintSet, FinitumError> {
-    essential_constraints_from_selected_at(
-        mesh,
-        dof_map,
-        requirements,
-        region_map,
-        values,
-        selection,
-        0.0,
-    )
-}
-
-/// W8 lane F2: [`essential_constraints_from_selected`] evaluated at `time` (see
-/// [`essential_constraints_from_at`]).
+/// Selects components per essential requirement and samples values at actual `time`.
+/// Table/Kernel sources produce one scalar component and resolve only coordinate/time input
+/// names (`x`, `y`, `z`, `t`, `time`); active-field names refuse because boundary data have no
+/// active-field state in this contract. See
+/// [`essential_constraints_from_at`] for snapshot-versus-transient lifting semantics.
 pub fn essential_constraints_from_selected_at(
     mesh: &TaggedMesh,
     dof_map: &DofMap,
@@ -967,7 +916,7 @@ pub fn essential_constraints_from_selected_at(
                     }
                     nodal[start..start + components].to_vec()
                 }
-                FieldSource::Sampled(sampler) => sampler(coordinates),
+
                 FieldSource::Fallible(sampler) => {
                     sampler(coordinates, time).map_err(|failure| {
                         FinitumError::from(failure.at(None, coordinates, Some(time)))
@@ -1060,10 +1009,10 @@ fn named_axis_point(
 
 /// GX-C4: resolves a set of Scientia `RegionId`s into concrete exterior `FacetId` lists through
 /// `mesh`'s `RegionTags` and the caller-supplied `RegionMap`, for use with
-/// [`crate::RealizationPlan::new_with_facets`]. Mirrors [`essential_constraints_from`]'s own
+/// [`crate::RealizationPlan::new_with_facets`]. Mirrors [`essential_constraints_from_at`]'s own
 /// region-tag resolution exactly, so the same `RegionMap`/`TaggedMesh` drives both essential
 /// constraints and exterior facet integrals consistently. Refuses an unmapped or empty-mapped
-/// region (`FinitumError::RealizationRegionUnmapped`), matching `essential_constraints_from`.
+/// region (`FinitumError::RealizationRegionUnmapped`), matching `essential_constraints_from_at`.
 pub fn facet_membership_from(
     mesh: &TaggedMesh,
     region_map: &RegionMap,

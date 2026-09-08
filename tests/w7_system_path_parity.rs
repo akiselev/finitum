@@ -21,8 +21,8 @@ use finitum::{
     SYSTEM_OPERATOR_DIGEST_SCHEMA, SYSTEM_REALIZATION_ARTIFACT_SCHEMA, SysResId,
     SystemConstitutiveInput, SystemDistributedCoefficient, SystemEssentialConstraintRequirement,
     SystemExternalInput, SystemQuadrature, SystemRealizationPlan, TaggedMesh,
-    check_realization_agreement, check_system_realization_agreement, essential_constraints_from,
-    essential_constraints_from_system, realize, simplex_basis, vector_nodal_dof_map,
+    check_realization_agreement, check_system_realization_agreement, essential_constraints_from_at,
+    essential_constraints_from_system_at, realize, simplex_basis, vector_nodal_dof_map,
 };
 use methodus::{
     BdfConfig, BdfOrder, BdfState, ComparisonTolerance, EvaluationContext, LinearOperator,
@@ -202,12 +202,13 @@ fn poisson_pair(
     let element = single_model_element(rule, &quadrature);
     let dofs = vector_nodal_dof_map(&mesh, 1).unwrap();
     let region_map = walls_region_map(factorization.essential_constraints[0].region);
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         tagged,
         &dofs,
         &factorization.essential_constraints,
         &region_map,
         &[FieldSource::constant([0.0])],
+        0.0,
     )
     .unwrap();
     let residual = system_plan.system_ids().residuals()[0].id;
@@ -285,7 +286,7 @@ fn poisson_pair(
     let operator = system_plan
         .bind_kernels_with_inputs(Vec::new(), stored, BTreeMap::new(), BTreeMap::new())
         .unwrap();
-    let system_constraints = essential_constraints_from_system(
+    let system_constraints = essential_constraints_from_system_at(
         &operator,
         tagged,
         &region_map,
@@ -294,6 +295,7 @@ fn poisson_pair(
             requirement: block.factorization.essential_constraints[0].clone(),
             value: FieldSource::constant([0.0]),
         }],
+        0.0,
     )
     .unwrap();
     assert_eq!(
@@ -829,12 +831,13 @@ fn nonlinear_heat_pair(tagged: &TaggedMesh, design: &[f64], rule: SystemQuadratu
     let element = single_model_element(rule, &quadrature);
     let dofs = vector_nodal_dof_map(&mesh, 1).unwrap();
     let region_map = walls_region_map(factorization.essential_constraints[0].region);
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         tagged,
         &dofs,
         &factorization.essential_constraints,
         &region_map,
         &[FieldSource::constant([0.0])],
+        0.0,
     )
     .unwrap();
     let residual = SysResId(0);
@@ -882,25 +885,25 @@ fn nonlinear_heat_pair(tagged: &TaggedMesh, design: &[f64], rule: SystemQuadratu
                 other => panic!("unexpected external input {other}"),
             };
             dynamic_single.push(
-                DynamicExternalInput::new(
+                DynamicExternalInput::try_new(
                     integral.integral_index,
                     input.id,
                     1,
                     identity,
-                    move |evaluation| vec![value(value_of(evaluation))],
-                    move |evaluation, d| vec![direction(value_of(evaluation), value_of(d))],
+                    move |evaluation| Ok(vec![value(value_of(evaluation))]),
+                    move |evaluation, d| Ok(vec![direction(value_of(evaluation), value_of(d))]),
                 )
                 .unwrap(),
             );
             constitutive.push(
-                SystemConstitutiveInput::new(
+                SystemConstitutiveInput::try_new(
                     block.equation.clone(),
                     integral.integral_index,
                     input.id,
                     1,
                     identity,
-                    move |evaluation| vec![value(value_of(evaluation))],
-                    move |evaluation, d| vec![direction(value_of(evaluation), value_of(d))],
+                    move |evaluation| Ok(vec![value(value_of(evaluation))]),
+                    move |evaluation, d| Ok(vec![direction(value_of(evaluation), value_of(d))]),
                 )
                 .unwrap(),
             );
@@ -1322,12 +1325,13 @@ fn transient_diffusion_pair(
     let element = single_model_element(rule, &quadrature);
     let dofs = vector_nodal_dof_map(&mesh, 1).unwrap();
     let region_map = walls_region_map(factorization.essential_constraints[0].region);
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         tagged,
         &dofs,
         &factorization.essential_constraints,
         &region_map,
         &[FieldSource::constant([0.0])],
+        0.0,
     )
     .unwrap();
     let residual = SysResId(0);
@@ -1353,25 +1357,25 @@ fn transient_diffusion_pair(
                 diffusivity_key = Some((integral.integral_index, input.id));
                 if diffusivity == DiffusivityBinding::Closure {
                     dynamic_single.push(
-                        DynamicExternalInput::new(
+                        DynamicExternalInput::try_new(
                             integral.integral_index,
                             input.id,
                             1,
                             "k=1",
-                            |_evaluation| vec![1.0],
-                            |_evaluation, _direction| vec![0.0],
+                            |_evaluation| Ok(vec![1.0]),
+                            |_evaluation, _direction| Ok(vec![0.0]),
                         )
                         .unwrap(),
                     );
                     constitutive.push(
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             1,
                             "k=1",
-                            |_evaluation| vec![1.0],
-                            |_evaluation, _direction| vec![0.0],
+                            |_evaluation| Ok(vec![1.0]),
+                            |_evaluation, _direction| Ok(vec![0.0]),
                         )
                         .unwrap(),
                     );
@@ -1414,7 +1418,7 @@ fn transient_diffusion_pair(
             BTreeMap::new(),
         )
         .unwrap();
-    let system_constraints = essential_constraints_from_system(
+    let system_constraints = essential_constraints_from_system_at(
         &operator,
         tagged,
         &region_map,
@@ -1423,6 +1427,7 @@ fn transient_diffusion_pair(
             requirement: block.factorization.essential_constraints[0].clone(),
             value: FieldSource::constant([0.0]),
         }],
+        0.0,
     )
     .unwrap();
     assert_eq!(system_constraints, constraints);
@@ -1745,14 +1750,14 @@ fn nonlinear_heat_case(tagged: &TaggedMesh, rule: SystemQuadrature) -> ReducedSy
                 "Q" => sample_at_quadrature(&mesh, &quadrature, manufactured_source),
                 "k" => {
                     constitutive.push(
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             1,
                             "k=1+0.2(T-300)",
-                            move |evaluation| vec![1.0 + 0.2 * (value_of(evaluation) - 300.0)],
-                            move |_evaluation, direction| vec![0.2 * value_of(direction)],
+                            move |evaluation| Ok(vec![1.0 + 0.2 * (value_of(evaluation) - 300.0)]),
+                            move |_evaluation, direction| Ok(vec![0.2 * value_of(direction)]),
                         )
                         .unwrap(),
                     );
@@ -1771,7 +1776,7 @@ fn nonlinear_heat_case(tagged: &TaggedMesh, rule: SystemQuadrature) -> ReducedSy
         .unwrap();
     let requirement = block.factorization.essential_constraints[0].clone();
     let region_map = walls_region_map(requirement.region);
-    let constraints = essential_constraints_from_system(
+    let constraints = essential_constraints_from_system_at(
         &operator,
         tagged,
         &region_map,
@@ -1780,6 +1785,7 @@ fn nonlinear_heat_case(tagged: &TaggedMesh, rule: SystemQuadrature) -> ReducedSy
             requirement,
             value: FieldSource::constant([300.0]),
         }],
+        0.0,
     )
     .unwrap();
     operator.reduced(constraints).unwrap()

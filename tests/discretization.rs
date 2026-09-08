@@ -252,7 +252,14 @@ fn prepared_element_rejects_shape_and_nonfinite_tables() {
 #[test]
 fn dynamic_external_input_requires_an_explicit_identity() {
     assert!(matches!(
-        DynamicExternalInput::new(0, TensorInputId(0), 1, " ", |_| vec![1.0], |_, _| vec![0.0],),
+        DynamicExternalInput::try_new(
+            0,
+            TensorInputId(0),
+            1,
+            " ",
+            |_| Ok(vec![1.0]),
+            |_, _| Ok(vec![0.0])
+        ),
         Err(FinitumError::InvalidRealization(_))
     ));
 }
@@ -284,13 +291,13 @@ fn fc6_binds_generated_kernels_and_assembled_matrix_free_actions_agree() {
                         "f" => 1.0,
                         other => panic!("unexpected external input {other}"),
                     };
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        move |_, _| vec![value],
+                        move |_, _| Ok(vec![value]),
                     )
                     .unwrap()
                 })
@@ -426,13 +433,13 @@ fn fc6_linear_patch_is_exact_on_a_nonuniform_sheared_mesh() {
                         "f" => 0.0,
                         other => panic!("unexpected external input {other}"),
                     };
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        move |_, _| vec![value],
+                        move |_, _| Ok(vec![value]),
                     )
                     .unwrap()
                 })
@@ -517,42 +524,49 @@ fn fc7_runtime_state_rate_and_property_chain_rule_match_finite_differences() {
             let name = &model.symbols[input.binding.symbol.index()].name;
             match name.as_str() {
                 "capacity" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "capacity=1;direction=0/v1",
-                        |_| vec![1.0],
-                        |_, _| vec![0.0],
+                        |_| Ok(vec![1.0]),
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 "k" => dynamic.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         1,
                         "k=1+0.2u;direction=0.2du/v1",
                         |evaluation| {
-                            vec![
-                                1.0 + 0.2
-                                    * evaluation.values(DerivativeEvaluation::Value).unwrap()[0],
-                            ]
+                            Ok({
+                                vec![
+                                    1.0 + 0.2
+                                        * evaluation.values(DerivativeEvaluation::Value).unwrap()
+                                            [0],
+                                ]
+                            })
                         },
                         |_, direction| {
-                            vec![0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0]]
+                            Ok({
+                                vec![
+                                    0.2 * direction.values(DerivativeEvaluation::Value).unwrap()[0],
+                                ]
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),

@@ -31,9 +31,8 @@ use finitum::{
     ReducedSystemOperator, RegionMap, RegionTagId, SysResId, SystemConstitutiveInput,
     SystemEssentialConstraintRequirement, SystemExternalInput, SystemOperator, SystemQuadrature,
     SystemRealizationPlan, TaggedMesh, VertexId, cell_centroid, check_realization_agreement,
-    essential_constraints_from, essential_constraints_from_at, essential_constraints_from_system,
-    essential_constraints_from_system_at, external_inputs_from, external_inputs_from_at, realize,
-    system_constitutive_from_sources, vector_nodal_dof_map,
+    essential_constraints_from_at, essential_constraints_from_system_at, external_inputs_from_at,
+    realize, system_constitutive_from_sources, vector_nodal_dof_map,
 };
 use methodus::{
     BdfConfig, BdfOrder, BdfState, ComparisonTolerance, DaeOperator, EvaluationContext,
@@ -88,8 +87,6 @@ const POINT_TOLERANCE: f64 = 1.0e-12;
 type Refuse = Arc<dyn Fn(&PointEvaluation) -> bool + Send + Sync>;
 
 enum Binding {
-    /// The infallible constructor.
-    Infallible,
     /// The fallible constructor, refusing wherever the predicate says so.
     Fallible(Refuse),
 }
@@ -292,10 +289,6 @@ fn diffusivity(
 ) -> DynamicExternalInput {
     const IDENTITY: &str = "k=1+0.2u;direction=0.2du/v1";
     match binding {
-        Binding::Infallible => {
-            DynamicExternalInput::new(integral_index, input, 1, IDENTITY, k_value, k_direction)
-                .unwrap()
-        }
         Binding::Fallible(refuse) => {
             let value_refuse = refuse.clone();
             let direction_refuse = refuse.clone();
@@ -373,13 +366,13 @@ fn p1_plan(degree: u16, binding: &Binding, capacity_refuse: Option<Refuse>) -> R
                 }
                 "k" => dynamic.push(diffusivity(integral.integral_index, input.id, binding)),
                 "f" => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
@@ -533,52 +526,83 @@ fn among_inputs_refusing_at_the_same_point_the_first_in_declaration_order_wins()
     assert_eq!(again, error);
 }
 
-#[test]
-fn the_infallible_p1_constructor_is_the_fallible_one_with_ok_bitwise_and_digest_equal() {
-    let infallible = p1_plan(1, &Binding::Infallible, None);
-    let fallible = p1_plan(1, &never(), None);
-    assert_eq!(infallible.digest(), fallible.digest());
-    let dimension = infallible.dimension();
-    let state = probe_vector(dimension, 0.4, 1.0);
-    let rate = probe_vector(dimension, 2.2, 0.7);
-    let direction = probe_vector(dimension, 1.1, 1.0);
-    let rate_direction = probe_vector(dimension, 3.3, 0.8);
-    let mut left = vec![0.0; dimension];
-    let mut right = vec![0.0; dimension];
-    infallible.residual(0.3, &state, &rate, &mut left).unwrap();
-    fallible.residual(0.3, &state, &rate, &mut right).unwrap();
-    assert!(left.iter().any(|value| *value != 0.0));
-    assert_eq!(bits(&left), bits(&right), "residual");
-    infallible
-        .jacobian_vector_product(0.3, &state, &rate, &direction, &rate_direction, &mut left)
-        .unwrap();
-    fallible
-        .jacobian_vector_product(0.3, &state, &rate, &direction, &rate_direction, &mut right)
-        .unwrap();
-    assert_eq!(bits(&left), bits(&right), "jvp");
-    infallible
-        .vector_jacobian_product(0.3, &state, &rate, &direction, &mut left)
-        .unwrap();
-    fallible
-        .vector_jacobian_product(0.3, &state, &rate, &direction, &mut right)
-        .unwrap();
-    assert_eq!(bits(&left), bits(&right), "vjp");
-    let context = EvaluationContext::reproducible();
-    infallible
-        .assemble()
-        .unwrap()
-        .apply(&context, &direction, &mut left)
-        .unwrap();
-    fallible
-        .assemble()
-        .unwrap()
-        .apply(&context, &direction, &mut right)
-        .unwrap();
-    assert_eq!(bits(&left), bits(&right), "assembled action");
+// These two tests replaced alias-to-alias parity when F3 removed the aliases. They
+// retain nonzero primal, state/rate products, transpose, and assembly obligations, now
+// checked against residual finite differences and independent operator representations.
+macro_rules! check_callback_products {
+    ($operator:expr, $time:expr) => {{
+        let operator = $operator;
+        let dimension = operator.dimension();
+        let state = probe_vector(dimension, 0.4, 1.0);
+        let rate = probe_vector(dimension, 2.2, 0.7);
+        let direction = probe_vector(dimension, 1.1, 1.0);
+        let rate_direction = probe_vector(dimension, 3.3, 0.8);
+        let seed = probe_vector(dimension, 0.9, 0.4);
+        let mut value = vec![0.0; dimension];
+        operator.residual($time, &state, &rate, &mut value).unwrap();
+        assert!(value.iter().all(|v| v.is_finite()));
+        assert!(value.iter().any(|v| v.abs() > 1e-10));
+        let mut action = vec![0.0; dimension];
+        operator
+            .jacobian_vector_product(
+                $time,
+                &state,
+                &rate,
+                &direction,
+                &rate_direction,
+                &mut action,
+            )
+            .unwrap();
+        let eps = 1e-6;
+        let mut plus = vec![0.0; dimension];
+        let mut minus = vec![0.0; dimension];
+        for (sign, output) in [(1.0, &mut plus), (-1.0, &mut minus)] {
+            let moved_state = state
+                .iter()
+                .zip(&direction)
+                .map(|(a, b)| a + sign * eps * b)
+                .collect::<Vec<_>>();
+            let moved_rate = rate
+                .iter()
+                .zip(&rate_direction)
+                .map(|(a, b)| a + sign * eps * b)
+                .collect::<Vec<_>>();
+            operator
+                .residual($time, &moved_state, &moved_rate, output)
+                .unwrap();
+        }
+        for ((jvp, plus), minus) in action.iter().zip(plus).zip(minus) {
+            assert!((jvp - (plus - minus) / (2.0 * eps)).abs() < 1e-7);
+        }
+        let zero = vec![0.0; dimension];
+        operator
+            .jacobian_vector_product($time, &state, &rate, &direction, &zero, &mut action)
+            .unwrap();
+        let mut transpose = vec![0.0; dimension];
+        operator
+            .vector_jacobian_product($time, &state, &rate, &seed, &mut transpose)
+            .unwrap();
+        let lhs: f64 = action.iter().zip(&seed).map(|(a, b)| a * b).sum();
+        let rhs: f64 = transpose.iter().zip(&direction).map(|(a, b)| a * b).sum();
+        assert!((lhs - rhs).abs() < 1e-10);
+        let context = EvaluationContext::reproducible();
+        operator
+            .assemble()
+            .unwrap()
+            .apply(&context, &direction, &mut action)
+            .unwrap();
+        operator
+            .jacobian_vector_product(0.0, &zero, &zero, &direction, &zero, &mut value)
+            .unwrap();
+        for (a, b) in action.iter().zip(&value) {
+            assert!((a - b).abs() < 1e-10);
+        }
+    }};
 }
 
-fn bits(values: &[f64]) -> Vec<u64> {
-    values.iter().map(|value| value.to_bits()).collect()
+#[test]
+fn fallible_p1_products_match_finite_differences_transpose_and_assembly() {
+    check_callback_products!(p1_plan(1, &never(), None), 0.3);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -670,15 +694,6 @@ fn coupled_constitutive(compiled: &Compiled, binding: &Binding) -> Vec<SystemCon
                             ]
                         };
                         match binding {
-                            Binding::Infallible => SystemConstitutiveInput::new(
-                                equation,
-                                index,
-                                input.id,
-                                1,
-                                "w8_f2/ka=1+0.3b^2",
-                                ka,
-                                d_ka,
-                            ),
                             Binding::Fallible(refuse) => {
                                 let value_refuse = refuse.clone();
                                 let direction_refuse = refuse.clone();
@@ -710,50 +725,54 @@ fn coupled_constitutive(compiled: &Compiled, binding: &Binding) -> Vec<SystemCon
                     }
                     "kb" => {
                         let a = value_input("a");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w8_f2/kb=1+0.5a",
                             move |point: &PointEvaluation| {
-                                vec![1.0 + 0.5 * point.input_values(a).unwrap()[0]]
+                                Ok(vec![1.0 + 0.5 * point.input_values(a).unwrap()[0]])
                             },
                             move |_: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![0.5 * direction.input_values(a).unwrap()[0]]
+                                Ok(vec![0.5 * direction.input_values(a).unwrap()[0]])
                             },
                         )
                     }
                     "ca" => {
                         let a = value_input("a");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w8_f2/ca=1+0.2a^2",
                             move |point: &PointEvaluation| {
-                                let a = point.input_values(a).unwrap()[0];
-                                vec![1.0 + 0.2 * a * a]
+                                Ok({
+                                    let a = point.input_values(a).unwrap()[0];
+                                    vec![1.0 + 0.2 * a * a]
+                                })
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![
-                                    0.4 * point.input_values(a).unwrap()[0]
-                                        * direction.input_values(a).unwrap()[0],
-                                ]
+                                Ok({
+                                    vec![
+                                        0.4 * point.input_values(a).unwrap()[0]
+                                            * direction.input_values(a).unwrap()[0],
+                                    ]
+                                })
                             },
                         )
                     }
                     "fa" | "fb" => {
                         let value = if name == "fa" { 1.0 } else { 0.5 };
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             format!("w8_f2/{name}={value}"),
-                            move |_: &PointEvaluation| vec![value],
-                            |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            move |_: &PointEvaluation| Ok(vec![value]),
+                            |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         )
                     }
                     other => panic!("unexpected non-basis input {other}"),
@@ -794,7 +813,8 @@ fn coupled_operators(
         }
     }
     let constraints =
-        essential_constraints_from_system(&operator, tagged, &region_map, &requirements).unwrap();
+        essential_constraints_from_system_at(&operator, tagged, &region_map, &requirements, 0.0)
+            .unwrap();
     let reduced = operator.reduced(constraints).unwrap();
     (operator, reduced)
 }
@@ -922,45 +942,15 @@ fn a_system_constitutive_refusal_is_located_and_carried_through_the_reduced_dae_
 }
 
 #[test]
-fn the_infallible_system_constructor_is_the_fallible_one_with_ok_bitwise_and_digest_equal() {
+fn fallible_system_products_match_finite_differences_transpose_and_assembly() {
     let compiled = compile_coupled();
     let tagged = unit_square(3);
-    let (infallible, _) = coupled_operators(
-        &compiled,
-        &tagged,
-        coupled_constitutive(&compiled, &Binding::Infallible),
-    );
-    let (fallible, _) = coupled_operators(
+    let (operator, _) = coupled_operators(
         &compiled,
         &tagged,
         coupled_constitutive(&compiled, &never()),
     );
-    assert_eq!(infallible.digest(), fallible.digest());
-    let dimension = infallible.dimension();
-    let state = probe_vector(dimension, 0.4, 1.0);
-    let rate = probe_vector(dimension, 2.2, 0.7);
-    let direction = probe_vector(dimension, 1.1, 1.0);
-    let rate_direction = probe_vector(dimension, 3.3, 0.8);
-    let mut left = vec![0.0; dimension];
-    let mut right = vec![0.0; dimension];
-    infallible.residual(0.2, &state, &rate, &mut left).unwrap();
-    fallible.residual(0.2, &state, &rate, &mut right).unwrap();
-    assert!(left.iter().any(|value| *value != 0.0));
-    assert_eq!(bits(&left), bits(&right), "system residual");
-    infallible
-        .jacobian_vector_product(0.2, &state, &rate, &direction, &rate_direction, &mut left)
-        .unwrap();
-    fallible
-        .jacobian_vector_product(0.2, &state, &rate, &direction, &rate_direction, &mut right)
-        .unwrap();
-    assert_eq!(bits(&left), bits(&right), "system jvp");
-    infallible
-        .vector_jacobian_product(0.2, &state, &rate, &direction, &mut left)
-        .unwrap();
-    fallible
-        .vector_jacobian_product(0.2, &state, &rate, &direction, &mut right)
-        .unwrap();
-    assert_eq!(bits(&left), bits(&right), "system vjp");
+    check_callback_products!(operator, 0.2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1132,7 +1122,7 @@ fn transient_dirichlet_data_g_of_t_is_sampled_at_the_requested_time_on_both_path
     let (operator, _) = coupled_operators(
         &compiled,
         &tagged,
-        coupled_constitutive(&compiled, &Binding::Infallible),
+        coupled_constitutive(&compiled, &never()),
     );
     let mut requirements = Vec::new();
     let mut region_map = RegionMap::new();
@@ -1159,10 +1149,11 @@ fn transient_dirichlet_data_g_of_t_is_sampled_at_the_requested_time_on_both_path
         constrained += 1;
     }
     assert!(constrained > 0);
-    let legacy =
-        essential_constraints_from_system(&operator, &tagged, &region_map, &requirements).unwrap();
-    assert_eq!(legacy.constraints().count(), constrained);
-    for constraint in legacy.constraints() {
+    let at_zero =
+        essential_constraints_from_system_at(&operator, &tagged, &region_map, &requirements, 0.0)
+            .unwrap();
+    assert_eq!(at_zero.constraints().count(), constrained);
+    for constraint in at_zero.constraints() {
         assert_eq!(constraint.offset, 0.0);
     }
 
@@ -1223,16 +1214,17 @@ fn transient_dirichlet_data_g_of_t_is_sampled_at_the_requested_time_on_both_path
     for constraint in at_half.constraints() {
         assert_eq!(constraint.offset, 0.5);
     }
-    let legacy = essential_constraints_from(
+    let at_zero = essential_constraints_from_at(
         &tagged,
         &dofs,
         &factorization.essential_constraints,
         &region_map,
         &values,
+        0.0,
     )
     .unwrap();
-    assert_eq!(legacy.constraints().count(), at_half.constraints().count());
-    for constraint in legacy.constraints() {
+    assert_eq!(at_zero.constraints().count(), at_half.constraints().count());
+    for constraint in at_zero.constraints() {
         assert_eq!(constraint.offset, 0.0);
     }
 }
@@ -1273,10 +1265,10 @@ fn fallible_field_sources_feed_time_sampled_tables_and_runtime_time_constitutive
     let f_table = stored.iter().find(|table| is_f(table)).unwrap();
     assert_eq!(f_table.values().len(), mesh.cells().len());
     assert!(f_table.values().iter().all(|value| *value == 0.5));
-    let (legacy, _) =
-        external_inputs_from(&factorization, model, &mesh, &element, &sources).unwrap();
-    let legacy_f = legacy.iter().find(|table| is_f(table)).unwrap();
-    assert!(legacy_f.values().iter().all(|value| *value == 0.0));
+    let (at_zero, _) =
+        external_inputs_from_at(&factorization, model, &mesh, &element, &sources, 0.0).unwrap();
+    let zero_f = at_zero.iter().find(|table| is_f(table)).unwrap();
+    assert!(zero_f.values().iter().all(|value| *value == 0.0));
 
     // A refusing source is a typed, located, table-labelled failure at the first offending
     // cell in cell order.
@@ -1490,7 +1482,7 @@ fn finitum_s_own_bound_property_table_refuses_typed_at_runtime_instead_of_nan_or
         (symbol(model, "f"), FieldSource::constant([0.0])),
     ];
     let (stored, dynamic) =
-        external_inputs_from(&factorization, model, &mesh, &element, &sources).unwrap();
+        external_inputs_from_at(&factorization, model, &mesh, &element, &sources, 0.0).unwrap();
     assert_eq!(dynamic.len(), 1);
     let plan = RealizationPlan::new_stateful(
         requirements,

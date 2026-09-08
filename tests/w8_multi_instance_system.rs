@@ -14,7 +14,7 @@ use finitum::{
     RegionMap, RegionTagId, SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA, SysResId, SysVarId,
     SystemConstitutiveInput, SystemDistributedCoefficient, SystemEssentialConstraintRequirement,
     SystemExternalInput, SystemOperator, SystemQuadrature, SystemRealizationPlan,
-    SystemVariableEssentialConstraint, TaggedMesh, essential_constraints_from_system,
+    SystemVariableEssentialConstraint, TaggedMesh, essential_constraints_from_system_at,
     essential_constraints_from_system_by_variable_at, realize,
 };
 use methodus::{LinearOperator, OperatorStructureHint, OperatorSymmetry};
@@ -205,77 +205,90 @@ fn monolithic_08(tagged: &TaggedMesh, quadrature: SystemQuadrature) -> Monolithi
                         // `-sigma(T) grad V`, the constitutive law as one opaque vector input.
                         let t_in = active_input(integral, t, DerivativeEvaluation::Value);
                         let gv_in = active_input(integral, v, DerivativeEvaluation::Gradient);
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             2,
                             "mono/current_density",
                             move |point: &PointEvaluation| {
-                                let t = point.input_values(t_in).unwrap()[0];
-                                let gv = point.input_values(gv_in).unwrap();
-                                gv.iter().map(|g| -sigma(t) * g).collect()
+                                Ok({
+                                    let t = point.input_values(t_in).unwrap()[0];
+                                    let gv = point.input_values(gv_in).unwrap();
+                                    gv.iter().map(|g| -sigma(t) * g).collect()
+                                })
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                let t = point.input_values(t_in).unwrap()[0];
-                                let dt = direction.input_values(t_in).unwrap()[0];
-                                let gv = point.input_values(gv_in).unwrap();
-                                let dgv = direction.input_values(gv_in).unwrap();
-                                gv.iter()
-                                    .zip(dgv)
-                                    .map(|(g, dg)| -(d_sigma(t, dt) * g + sigma(t) * dg))
-                                    .collect()
+                                Ok({
+                                    let t = point.input_values(t_in).unwrap()[0];
+                                    let dt = direction.input_values(t_in).unwrap()[0];
+                                    let gv = point.input_values(gv_in).unwrap();
+                                    let dgv = direction.input_values(gv_in).unwrap();
+                                    gv.iter()
+                                        .zip(dgv)
+                                        .map(|(g, dg)| -(d_sigma(t, dt) * g + sigma(t) * dg))
+                                        .collect()
+                                })
                             },
                         )
                     }
                     "k" => {
                         let t_in = active_input(integral, t, DerivativeEvaluation::Value);
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "mono/k",
                             move |point: &PointEvaluation| {
-                                vec![conductivity(point.input_values(t_in).unwrap()[0])]
+                                Ok(vec![conductivity(point.input_values(t_in).unwrap()[0])])
                             },
                             move |_: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_conductivity(direction.input_values(t_in).unwrap()[0])]
+                                Ok({
+                                    vec![d_conductivity(direction.input_values(t_in).unwrap()[0])]
+                                })
                             },
                         )
                     }
                     "rho" | "cp" => {
                         let value = if name == "rho" { RHO } else { CP };
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             format!("mono/{name}"),
-                            move |_: &PointEvaluation| vec![value],
-                            |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            move |_: &PointEvaluation| Ok(vec![value]),
+                            |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         )
                     }
                     "joule" => {
                         let t_in = active_input(integral, t, DerivativeEvaluation::Value);
                         let gv_in = active_input(integral, v, DerivativeEvaluation::Gradient);
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "mono/joule",
                             move |point: &PointEvaluation| {
-                                let t = point.input_values(t_in).unwrap()[0];
-                                let gv = point.input_values(gv_in).unwrap();
-                                vec![sigma(t) * dot(gv, gv)]
+                                Ok({
+                                    let t = point.input_values(t_in).unwrap()[0];
+                                    let gv = point.input_values(gv_in).unwrap();
+                                    vec![sigma(t) * dot(gv, gv)]
+                                })
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                let t = point.input_values(t_in).unwrap()[0];
-                                let dt = direction.input_values(t_in).unwrap()[0];
-                                let gv = point.input_values(gv_in).unwrap();
-                                let dgv = direction.input_values(gv_in).unwrap();
-                                vec![d_sigma(t, dt) * dot(gv, gv) + 2.0 * sigma(t) * dot(gv, dgv)]
+                                Ok({
+                                    let t = point.input_values(t_in).unwrap()[0];
+                                    let dt = direction.input_values(t_in).unwrap()[0];
+                                    let gv = point.input_values(gv_in).unwrap();
+                                    let dgv = direction.input_values(gv_in).unwrap();
+                                    vec![
+                                        d_sigma(t, dt) * dot(gv, gv)
+                                            + 2.0 * sigma(t) * dot(gv, dgv),
+                                    ]
+                                })
                             },
                         )
                     }
@@ -1226,14 +1239,14 @@ fn two_instances_of_one_model_realize_as_distinct_blocks() {
         }
     }
     // An equation-name key is ambiguous on this plan and refused typed.
-    let ambiguous = SystemConstitutiveInput::new(
+    let ambiguous = SystemConstitutiveInput::try_new(
         "thermal",
         0,
         closures[0].input,
         1,
         "ambiguous",
-        |_: &PointEvaluation| vec![0.0],
-        |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+        |_: &PointEvaluation| Ok(vec![0.0]),
+        |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
     )
     .unwrap();
     let mut with_ambiguous = closures.clone();
@@ -1294,37 +1307,41 @@ fn two_instances_of_one_model_realize_as_distinct_blocks() {
                     let built = match name.as_str() {
                         "k" => {
                             let t_in = t_in_of(integral);
-                            SystemConstitutiveInput::new(
+                            SystemConstitutiveInput::try_new(
                                 block.equation.clone(),
                                 integral.integral_index,
                                 input.id,
                                 1,
                                 "one/k",
                                 move |point: &PointEvaluation| {
-                                    vec![conductivity(point.input_values(t_in).unwrap()[0])]
+                                    Ok(vec![conductivity(point.input_values(t_in).unwrap()[0])])
                                 },
                                 move |_: &PointEvaluation, direction: &PointEvaluation| {
-                                    vec![d_conductivity(direction.input_values(t_in).unwrap()[0])]
+                                    Ok({
+                                        vec![d_conductivity(
+                                            direction.input_values(t_in).unwrap()[0],
+                                        )]
+                                    })
                                 },
                             )
                         }
-                        "rho" | "cp" => SystemConstitutiveInput::new(
+                        "rho" | "cp" => SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             1,
                             "one/c",
-                            |_: &PointEvaluation| vec![1.0],
-                            |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            |_: &PointEvaluation| Ok(vec![1.0]),
+                            |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         ),
-                        "Q" => SystemConstitutiveInput::new(
+                        "Q" => SystemConstitutiveInput::try_new(
                             block.equation.clone(),
                             integral.integral_index,
                             input.id,
                             1,
                             "one/Q",
-                            move |_: &PointEvaluation| vec![q_value],
-                            |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            move |_: &PointEvaluation| Ok(vec![q_value]),
+                            |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         ),
                         other => panic!("unexpected input {other}"),
                     };
@@ -1440,7 +1457,7 @@ fn keyed_essential_constraints_touch_only_the_named_instance_and_reduce() {
             .symbol
     );
     assert!(matches!(
-        essential_constraints_from_system(
+        essential_constraints_from_system_at(
             operator,
             &tagged,
             &region_map,
@@ -1452,6 +1469,7 @@ fn keyed_essential_constraints_touch_only_the_named_instance_and_reduce() {
                     value: requirement.value.clone(),
                 })
                 .collect::<Vec<_>>(),
+            0.0
         ),
         Err(FinitumError::InvalidRealization(_))
     ));

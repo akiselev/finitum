@@ -203,16 +203,18 @@ fn p2_poisson_converges_at_order_three_in_l2_on_a_manufactured_solution() {
                     .filter(|input| input.source != InputSourceRequirement::Basis)
                     .map(|input| {
                         let name = &model.symbols[input.binding.symbol.index()].name;
-                        ExternalInput::sampled(
+                        ExternalInput::try_sampled(
                             integral.integral_index,
                             input.id,
                             1,
                             &mesh,
                             &element,
-                            move |_, physical| match name.as_str() {
-                                "k" => vec![1.0],
-                                "f" => vec![manufactured_source(physical)],
-                                other => panic!("unexpected external input {other}"),
+                            move |_, physical| {
+                                Ok(match name.as_str() {
+                                    "k" => vec![1.0],
+                                    "f" => vec![manufactured_source(physical)],
+                                    other => panic!("unexpected external input {other}"),
+                                })
                             },
                         )
                         .unwrap()

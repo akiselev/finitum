@@ -3,7 +3,7 @@
 //!
 //! Manufactured problem: `u(x, y) = sin(pi*x) * cos(pi*y)` on the unit square, `k = 1`. Since
 //! `-Δu = 2*pi^2*u`, `f = 2*pi^2*sin(pi*x)*cos(pi*y)` (sampled per point, not a compile-time
-//! constant, exercising the same cell `ExternalInput::sampled` path as every other cell fixture).
+//! constant, exercising the same cell `ExternalInput::try_sampled` path as every other cell fixture).
 //! A transcendental exact solution is deliberately chosen over a low-degree polynomial: this
 //! structured "criss-cross" `SimplexBox` triangulation is P1-superconvergent (exactly, to machine
 //! precision) for polynomial data up to at least degree two, which would make every mesh
@@ -15,7 +15,7 @@
 
 use finitum::{
     DofMap, ExternalInput, FacetTopology, FieldSource, MeshProfile, PreparedElement,
-    RealizationPlan, RegionMap, RegionTagId, TaggedMesh, essential_constraints_from,
+    RealizationPlan, RegionMap, RegionTagId, TaggedMesh, essential_constraints_from_at,
     facet_membership_from, realize, vector_nodal_dof_map,
 };
 use methodus::{
@@ -110,14 +110,15 @@ fn neumann_plan(n: usize) -> (RealizationPlan, TaggedMesh, DofMap) {
         .first()
         .expect("NeumannPoisson declares one Dirichlet condition on u")
         .clone();
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         &tagged,
         &dof_map,
         &[essential_requirement],
         &region_map,
-        &[FieldSource::sampled(|coordinates| {
-            vec![exact_u(coordinates)]
+        &[FieldSource::fallible(|coordinates, _time| {
+            Ok(vec![exact_u(coordinates)])
         })],
+        0.0,
     )
     .unwrap();
 
@@ -133,24 +134,24 @@ fn neumann_plan(n: usize) -> (RealizationPlan, TaggedMesh, DofMap) {
             let name = model.symbols[input.binding.symbol.index()].name.clone();
             match (&integral.measure, name.as_str()) {
                 (SemanticMeasure::Cell { .. }, "k") => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, _| vec![1.0],
+                        |_, _| Ok(vec![1.0]),
                     )
                     .unwrap(),
                 ),
                 (SemanticMeasure::Cell { .. }, "f") => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, point| vec![source_f(point)],
+                        |_, point| Ok(vec![source_f(point)]),
                     )
                     .unwrap(),
                 ),
@@ -159,14 +160,14 @@ fn neumann_plan(n: usize) -> (RealizationPlan, TaggedMesh, DofMap) {
                         .get(region)
                         .expect("load region was resolved above");
                     stored.push(
-                        ExternalInput::sampled_on_facets(
+                        ExternalInput::try_sampled_on_facets(
                             integral.integral_index,
                             input.id,
                             1,
                             &tagged.mesh,
                             &facet_topology,
                             facet_ids,
-                            |_, point| vec![flux_g(point)],
+                            |_, point| Ok(vec![flux_g(point)]),
                         )
                         .unwrap(),
                     );
@@ -303,12 +304,13 @@ fn facet_load_vector_contribution_matches_the_hand_computed_single_facet_value()
     region_map.insert(load_region, [RegionTagId::new("x_max")]);
 
     let essential_requirement = requirements.essential_constraints.first().unwrap().clone();
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         &tagged,
         &dof_map,
         &[essential_requirement],
         &region_map,
         &[FieldSource::constant(vec![0.0])],
+        0.0,
     )
     .unwrap();
 
@@ -325,38 +327,38 @@ fn facet_load_vector_contribution_matches_the_hand_computed_single_facet_value()
             let name = model.symbols[input.binding.symbol.index()].name.clone();
             match (&integral.measure, name.as_str()) {
                 (SemanticMeasure::Cell { .. }, "k") => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, _| vec![1.0],
+                        |_, _| Ok(vec![1.0]),
                     )
                     .unwrap(),
                 ),
                 (SemanticMeasure::Cell { .. }, "f") => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, _| vec![0.0],
+                        |_, _| Ok(vec![0.0]),
                     )
                     .unwrap(),
                 ),
                 (SemanticMeasure::ExteriorFacet { region }, "g") => {
                     let facet_ids = facet_regions.get(region).unwrap();
                     stored.push(
-                        ExternalInput::sampled_on_facets(
+                        ExternalInput::try_sampled_on_facets(
                             integral.integral_index,
                             input.id,
                             1,
                             &tagged.mesh,
                             &facet_topology,
                             facet_ids,
-                            |_, _| vec![flux],
+                            |_, _| Ok(vec![flux]),
                         )
                         .unwrap(),
                     );
@@ -522,14 +524,15 @@ fn unmapped_facet_region_is_refused() {
         ],
     );
     let essential_requirement = requirements.essential_constraints.first().unwrap().clone();
-    let constraints = essential_constraints_from(
+    let constraints = essential_constraints_from_at(
         &tagged,
         &dof_map,
         &[essential_requirement],
         &region_map,
-        &[FieldSource::sampled(|coordinates| {
-            vec![exact_u(coordinates)]
+        &[FieldSource::fallible(|coordinates, _time| {
+            Ok(vec![exact_u(coordinates)])
         })],
+        0.0,
     )
     .unwrap();
 
@@ -543,24 +546,24 @@ fn unmapped_facet_region_is_refused() {
             let name = model.symbols[input.binding.symbol.index()].name.clone();
             match (&integral.measure, name.as_str()) {
                 (SemanticMeasure::Cell { .. }, "k") => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, _| vec![1.0],
+                        |_, _| Ok(vec![1.0]),
                     )
                     .unwrap(),
                 ),
                 (SemanticMeasure::Cell { .. }, "f") => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &tagged.mesh,
                         &element,
-                        |_, _| vec![-2.0],
+                        |_, _| Ok(vec![-2.0]),
                     )
                     .unwrap(),
                 ),
@@ -606,14 +609,14 @@ fn interior_facet_is_refused_by_sampled_on_facets() {
         .next()
         .expect("a 2x2 SimplexBox has interior facets")
         .id;
-    let result = ExternalInput::sampled_on_facets(
+    let result = ExternalInput::try_sampled_on_facets(
         0,
         scientia::TensorInputId(0),
         1,
         &tagged.mesh,
         &facet_topology,
         &[interior_facet_id],
-        |_, _| vec![1.0],
+        |_, _| Ok(vec![1.0]),
     );
     assert!(
         result.is_err(),

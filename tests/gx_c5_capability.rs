@@ -120,13 +120,13 @@ fn poisson_plan(with_hanging_constraint: bool) -> RealizationPlan {
                         "f" => 0.4,
                         other => panic!("unexpected external input {other}"),
                     };
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         1,
                         &mesh,
                         &element,
-                        move |_, _| vec![value],
+                        move |_, _| Ok(vec![value]),
                     )
                     .unwrap()
                 })

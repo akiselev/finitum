@@ -87,12 +87,13 @@ fn kernel_valued_boundary_matches_closed_form_at_vertices() {
         region: RegionId(0),
         condition: DeclarationId(0),
     };
-    let constraints = finitum::essential_constraints_from(
+    let constraints = finitum::essential_constraints_from_at(
         &mesh,
         &dof_map,
         &[requirement],
         &region_map,
         &[source],
+        0.0,
     )
     .unwrap();
 
@@ -133,13 +134,14 @@ fn per_component_selection_constrains_only_the_selected_components() {
     let source = FieldSource::constant(vec![7.0, 9.0]);
 
     // Only component 0 (the x-component) is selected.
-    let constraints = finitum::essential_constraints_from_selected(
+    let constraints = finitum::essential_constraints_from_selected_at(
         &mesh,
         &dof_map,
         std::slice::from_ref(&requirement),
         &region_map,
         std::slice::from_ref(&source),
         &[ComponentSelection::Only(vec![0])],
+        0.0,
     )
     .unwrap();
 
@@ -165,13 +167,14 @@ fn per_component_selection_constrains_only_the_selected_components() {
         );
     }
 
-    // `ComponentSelection::All` (the default via `essential_constraints_from`) constrains both.
-    let both = finitum::essential_constraints_from(
+    // `ComponentSelection::All` (the default via `essential_constraints_from_at`) constrains both.
+    let both = finitum::essential_constraints_from_at(
         &mesh,
         &dof_map,
         &[requirement],
         &region_map,
         &[source],
+        0.0,
     )
     .unwrap();
     for vertex in &x_min_vertices {
@@ -198,13 +201,14 @@ fn conflicting_and_unmapped_refusals_still_hold() {
         region: RegionId(0),
         condition: DeclarationId(0),
     };
-    let result = finitum::essential_constraints_from_selected(
+    let result = finitum::essential_constraints_from_selected_at(
         &mesh,
         &dof_map,
         &[requirement],
         &region_map,
         &[FieldSource::constant(vec![1.0])],
         &[ComponentSelection::All],
+        0.0,
     );
     assert!(matches!(
         result,

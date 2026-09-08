@@ -160,34 +160,38 @@ fn plan_with(
             }
             match input.source {
                 InputSourceRequirement::ModelDefinedConstitutive { .. } => dynamics.push(
-                    DynamicExternalInput::new(
+                    DynamicExternalInput::try_new(
                         integral.integral_index,
                         input.id,
                         9,
                         format!("sv2a/isotropic-lame/{}", integral.integral_index),
                         move |evaluation| {
-                            let strain = evaluation
-                                .values(scientia::DerivativeEvaluation::SymmetricGradient)
-                                .expect("active symmetric gradient");
-                            stress(LAMBDA, MU, strain)
+                            Ok({
+                                let strain = evaluation
+                                    .values(scientia::DerivativeEvaluation::SymmetricGradient)
+                                    .expect("active symmetric gradient");
+                                stress(LAMBDA, MU, strain)
+                            })
                         },
                         move |_evaluation, direction_evaluation| {
-                            let d_strain = direction_evaluation
-                                .values(scientia::DerivativeEvaluation::SymmetricGradient)
-                                .expect("active symmetric gradient direction");
-                            stress(LAMBDA, MU, d_strain)
+                            Ok({
+                                let d_strain = direction_evaluation
+                                    .values(scientia::DerivativeEvaluation::SymmetricGradient)
+                                    .expect("active symmetric gradient direction");
+                                stress(LAMBDA, MU, d_strain)
+                            })
                         },
                     )
                     .unwrap(),
                 ),
                 _ => stored.push(
-                    ExternalInput::sampled(
+                    ExternalInput::try_sampled(
                         integral.integral_index,
                         input.id,
                         3,
                         mesh,
                         &element,
-                        |_, point| body_force(point),
+                        |_, point| Ok(body_force(point)),
                     )
                     .unwrap(),
                 ),

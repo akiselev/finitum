@@ -151,71 +151,77 @@ fn closure_constitutive(compiled: &Compiled) -> Vec<SystemConstitutiveInput> {
                 let built = match name {
                     "ka" => {
                         let b = value_input("b");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w7_sc_w1/ka",
                             move |point: &PointEvaluation| {
-                                vec![ka(point.input_values(b).unwrap()[0])]
+                                Ok(vec![ka(point.input_values(b).unwrap()[0])])
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_ka(
-                                    point.input_values(b).unwrap()[0],
-                                    direction.input_values(b).unwrap()[0],
-                                )]
+                                Ok({
+                                    vec![d_ka(
+                                        point.input_values(b).unwrap()[0],
+                                        direction.input_values(b).unwrap()[0],
+                                    )]
+                                })
                             },
                         )
                     }
                     "kb" => {
                         let a = value_input("a");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w7_sc_w1/kb",
                             move |point: &PointEvaluation| {
-                                vec![kb(point.input_values(a).unwrap()[0])]
+                                Ok(vec![kb(point.input_values(a).unwrap()[0])])
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_kb(
-                                    point.input_values(a).unwrap()[0],
-                                    direction.input_values(a).unwrap()[0],
-                                )]
+                                Ok({
+                                    vec![d_kb(
+                                        point.input_values(a).unwrap()[0],
+                                        direction.input_values(a).unwrap()[0],
+                                    )]
+                                })
                             },
                         )
                     }
                     "ca" => {
                         let a = value_input("a");
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             "w7_sc_w1/ca",
                             move |point: &PointEvaluation| {
-                                vec![ca(point.input_values(a).unwrap()[0])]
+                                Ok(vec![ca(point.input_values(a).unwrap()[0])])
                             },
                             move |point: &PointEvaluation, direction: &PointEvaluation| {
-                                vec![d_ca(
-                                    point.input_values(a).unwrap()[0],
-                                    direction.input_values(a).unwrap()[0],
-                                )]
+                                Ok({
+                                    vec![d_ca(
+                                        point.input_values(a).unwrap()[0],
+                                        direction.input_values(a).unwrap()[0],
+                                    )]
+                                })
                             },
                         )
                     }
                     "fa" | "fb" => {
                         let value = if name == "fa" { 1.0 } else { 0.5 };
-                        SystemConstitutiveInput::new(
+                        SystemConstitutiveInput::try_new(
                             equation,
                             index,
                             input.id,
                             1,
                             format!("w7_sc_w1/{name}"),
-                            move |_: &PointEvaluation| vec![value],
-                            |_: &PointEvaluation, _: &PointEvaluation| vec![0.0],
+                            move |_: &PointEvaluation| Ok(vec![value]),
+                            |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0]),
                         )
                     }
                     other => panic!("unexpected non-basis input {other}"),

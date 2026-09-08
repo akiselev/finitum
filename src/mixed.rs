@@ -206,7 +206,7 @@ pub struct BlockEssentialValue {
 /// block-local declarations, lifting each `(block, entity, component)` into `layout`'s
 /// monolithic degree-of-freedom numbering via each block's `offset` and the same
 /// `entity * component_count + component` convention [`BlockLayout::gather`]/
-/// [`BlockLayout::scatter_add`] use. Mirrors [`crate::essential_constraints_from`]'s
+/// [`BlockLayout::scatter_add`] use. Mirrors [`crate::essential_constraints_from_at`]'s
 /// DOF-indexing convention at the block level; unlike it, this function has no region-tag or
 /// mesh dependency, since [`MixedSpace`] carries no `TaggedMesh` wiring today (see the SV2-B4
 /// realization inventory). Refuses an unknown block, an out-of-range entity or component, a
