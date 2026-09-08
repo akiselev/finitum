@@ -244,6 +244,27 @@ fn uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total() {
     let realized = realize_darcy(2);
     let g = 0.7;
     let requirement = wall_requirement(&realized, FieldSource::constant([g]));
+    let motion = finitum::prescribed_values_from_system_by_variable(
+        &realized.operator,
+        &realized.mesh,
+        &[(InstanceId(0), &realized.region_map)],
+        &[finitum::SystemVariablePrescribedValue {
+            variable: realized
+                .operator
+                .system_ids()
+                .variable(InstanceId(0), realized.flux)
+                .unwrap(),
+            requirement: requirement.requirement.clone(),
+            value: FieldSource::constant([g]),
+            rate: FieldSource::constant([0.0]),
+            origin: finitum::InputOrigin::Slot("wall-flux".into()),
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(motion, FinitumError::UnsupportedRealization(message) if message.contains("RT0"))
+    );
+
     let constraints = essential_constraints_from_system(
         &realized.operator,
         &realized.mesh,

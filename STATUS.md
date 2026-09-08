@@ -46,6 +46,19 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 
 ## Implemented
 
+- W8 prescribed-source projection (2026-09-08, implemented and validated):
+  `prescribed_values_from_system_by_variable` maps paired value/rate `FieldSource`s and
+  system-keyed essential requirements to `PrescribedEssentialValue` callbacks using the
+  existing owner target selection. Product consumers need no P1/P2 edge-node, block-offset,
+  or vector-component arithmetic. Shared targets check both value/rate agreement at runtime;
+  shape/finiteness errors and callback failures retain point/time/origin. RT0 motion refuses
+  explicitly. New vector-P2 regression covers edge targets in a nonzero block offset,
+  duplicate agreeing requirements, conflict and analytic-rate refusal. Existing RT0 test
+  now also checks the new typed motion refusal. Relevant owner tests passed 20/20 across
+  motion, P2 block actions, RT0 essentials, and composed realization. Final motion 5/5
+  includes a time-varying analytic rate callback; workspace clippy with warnings denied,
+  strict rustdoc, scoped formatting and diff checks passed. The prior full owner gate
+  remains 232 before this one added test; no new full-suite count is claimed here.
 - W8 prescribed time-data prerequisite (2026-09-08, implemented and validated):
   `ReducedSystemOperator::with_prescribed_values` attaches pure, typed per-target value and
   analytic rate callbacks on fixed essential targets. At every actual DAE evaluation time,

@@ -125,3 +125,8 @@ provide the same data for initialization and sampling. Missing rates must return
 failure; affine dependency constraints remain unsupported in this path. Explicit-time
 linearization is required for linear/assembled views with prescribed motion. Static
 artifact serialization and identities are unchanged.
+
+`prescribed_values_from_system_by_variable` projects paired value/rate `FieldSource`s through
+owner-selected essential targets. `SystemVariablePrescribedValue` names the variable,
+requirement, two sources, and error origin; P1/P2 vector component and edge-node indexing
+remain inside Finitum. Shared targets must agree at runtime. RT0 motion is explicitly refused.

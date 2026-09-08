@@ -95,9 +95,10 @@ pub use system::{
     SystemEssentialConstraintRequirement, SystemExternalInput, SystemFieldArtifact, SystemOperator,
     SystemPartialAssemblyOperator, SystemQuadrature, SystemRealizationArtifact,
     SystemRealizationExternalInput, SystemRealizationPlan, SystemVariableEssentialConstraint,
-    essential_constraints_from_system, essential_constraints_from_system_at,
-    essential_constraints_from_system_by_variable,
-    essential_constraints_from_system_by_variable_at, system_constitutive_from_sources,
+    SystemVariablePrescribedValue, essential_constraints_from_system,
+    essential_constraints_from_system_at, essential_constraints_from_system_by_variable,
+    essential_constraints_from_system_by_variable_at, prescribed_values_from_system_by_variable,
+    system_constitutive_from_sources,
 };
 pub use system_ids::{
     InstanceId, InstanceRecord, SYSTEM_ID_MAP_SCHEMA, SysRes, SysResId, SysVar, SysVarId,

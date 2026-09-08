@@ -318,3 +318,155 @@ fn fixed_topology_and_nonfinite_rates_are_checked() {
     assert_eq!(error.code, "PRESCRIBED_VALUE_NONFINITE");
     assert_eq!(error.time(), Some(0.3));
 }
+
+#[test]
+fn paired_sources_project_vector_p2_edge_targets_and_check_overlap() {
+    let source = r#"module project; model Fields {
+      domain body { dimension = 2; coordinates = cartesian; }
+      field a: unknown scalar H1(order=1) on body;
+      field u: unknown vector(2) H1(order=2) on body;
+      source f: ForceDensity;
+      equation first on body { -div(grad(a)) = 0; }
+      equation second on body { -div(grad(u)) = f; }
+      boundary walls on boundary("walls") { dirichlet u = [0,0]; }
+    }"#;
+    let c = compile_semantics(source, &UnitRegistry::si_bootstrap()).unwrap();
+    let model = &c.semantic.models[0];
+    let symbol = |name: &str| model.symbols.iter().find(|s| s.name == name).unwrap().id;
+    let system = compile_operator_system(&c.semantic, "Fields", &["first", "second"]).unwrap();
+    let requirement = system
+        .blocks
+        .iter()
+        .find(|b| b.equation == "second")
+        .unwrap()
+        .factorization
+        .essential_constraints[0]
+        .clone();
+    let sources = system_constitutive_from_sources(
+        &system,
+        model,
+        &[(symbol("f"), FieldSource::constant(vec![0.0; 2]))],
+    )
+    .unwrap();
+    let mesh = realize(&MeshProfile::SimplexBox {
+        dimension: 2,
+        extent: vec![[0.0, 1.0]; 2],
+        subdivisions: vec![2, 2],
+    })
+    .unwrap();
+    let points = quadratic_simplex_node_points(&mesh.mesh);
+    let layout = BlockLayout::new([
+        (symbol("a"), mesh.mesh.vertices().len(), 1),
+        (symbol("u"), points.len(), 2),
+    ])
+    .unwrap();
+    let plan = SystemRealizationPlan::new(system, mesh.mesh.clone(), layout).unwrap();
+    let op = plan.bind_kernels(sources, BTreeMap::new()).unwrap();
+    let variable = op
+        .system_ids()
+        .variable(InstanceId(0), symbol("u"))
+        .unwrap();
+    let block = op.layout().block_by_variable(variable).unwrap();
+    let offset = block.offset;
+    let mut regions = RegionMap::new();
+    regions.insert(
+        requirement.region,
+        ["x_min", "x_max", "y_min", "y_max"].map(RegionTagId::new),
+    );
+    let region_maps = [(InstanceId(0), &regions)];
+    let zero = SystemVariableEssentialConstraint {
+        variable,
+        requirement: requirement.clone(),
+        value: FieldSource::constant(vec![0.0; 2]),
+    };
+    let base = op
+        .reduced(
+            essential_constraints_from_system_by_variable_at(
+                &op,
+                &mesh,
+                &region_maps,
+                &[zero],
+                0.0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let paired = SystemVariablePrescribedValue {
+        variable,
+        requirement,
+        value: FieldSource::fallible(|x, t| Ok(vec![x[0] + t * t, x[1] + 2.0 * t * t])),
+        rate: FieldSource::fallible(|_, t| Ok(vec![2.0 * t, 4.0 * t])),
+        origin: InputOrigin::Slot("u/walls".into()),
+    };
+    let values = prescribed_values_from_system_by_variable(
+        &op,
+        &mesh,
+        &region_maps,
+        &[paired.clone(), paired.clone()],
+    )
+    .unwrap();
+    let moving = base
+        .clone()
+        .with_prescribed_values("paired", values)
+        .unwrap();
+    let n = op.dimension();
+    let (state, rate) = moving
+        .physical_state_and_rate(0.4, &vec![0.0; n], &vec![0.0; n])
+        .unwrap();
+    assert!(state[..offset].iter().all(|v| *v == 0.0));
+    let mut edge_seen = false;
+    for c in base.constraints().constraints() {
+        let local = c.target.0 - offset;
+        let node = local / 2;
+        let component = local % 2;
+        edge_seen |= node >= mesh.mesh.vertices().len();
+        assert_eq!(
+            state[c.target.0],
+            points[node][component] + (0.4 * 0.4) * (component + 1) as f64
+        );
+        assert_eq!(rate[c.target.0], 0.8 * (component + 1) as f64);
+    }
+    assert!(edge_seen);
+    let mut conflicting = paired.clone();
+    conflicting.rate = FieldSource::constant(vec![3.0, 2.0]);
+    let values = prescribed_values_from_system_by_variable(
+        &op,
+        &mesh,
+        &region_maps,
+        &[paired.clone(), conflicting],
+    )
+    .unwrap();
+    let error = base
+        .clone()
+        .with_prescribed_values("conflict", values)
+        .unwrap()
+        .constraints_at(0.6)
+        .unwrap_err();
+    let FinitumError::InputEvaluation(error) = error else {
+        panic!("{error}")
+    };
+    assert_eq!(error.code, "PRESCRIBED_SOURCE_CONFLICT");
+    assert_eq!(error.time(), Some(0.6));
+    let mut refusing = paired;
+    refusing.rate = FieldSource::fallible(|_, _| {
+        Err(InputEvaluationError::new(
+            "ANALYTIC_RATE_MISSING",
+            InputOrigin::Provider("u_rate".into()),
+            "missing rate",
+        ))
+    });
+    let values =
+        prescribed_values_from_system_by_variable(&op, &mesh, &region_maps, &[refusing]).unwrap();
+    let error = base
+        .with_prescribed_values("missing", values)
+        .unwrap()
+        .constraints_at(0.7)
+        .unwrap_err();
+    let FinitumError::InputEvaluation(error) = error else {
+        panic!("{error}")
+    };
+    assert_eq!(error.code, "ANALYTIC_RATE_MISSING");
+    assert_eq!(error.time(), Some(0.7));
+    assert_eq!(error.origin, InputOrigin::Provider("u_rate".into()));
+    assert!(error.point().is_some());
+}

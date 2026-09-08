@@ -7679,6 +7679,201 @@ pub struct SystemVariableEssentialConstraint {
     pub value: FieldSource,
 }
 
+/// Prescribed value and analytic rate sources for one system essential requirement. Both
+/// sources use the same component layout and physical sampling point; unavailable analytic
+/// rates must be a fallible source returning a typed error.
+#[derive(Clone, Debug)]
+pub struct SystemVariablePrescribedValue {
+    pub variable: SysVarId,
+    pub requirement: EssentialConstraintRequirement,
+    pub value: FieldSource,
+    pub rate: FieldSource,
+    pub origin: InputOrigin,
+}
+
+/// Projects paired prescribed sources onto the owner's exact essential target selection.
+/// P1/P2 scalar and vector node coordinates/components are owned here; callers do not infer
+/// DOF conventions. Requirements sharing a target must agree on both value and rate at every
+/// runtime evaluation. Include static requirements sharing targets with moving ones, using
+/// a zero rate source, so a later conflict at a shared corner cannot be hidden. Passing all
+/// essential requirements is sufficient. RT0 normal-flux motion is refused until its rate/orientation contract
+/// is implemented. Kernel/Table sources use the same refusal boundary as system essential
+/// sampling; compiled consumer callbacks can be supplied as `FieldSource::Fallible`.
+pub fn prescribed_values_from_system_by_variable(
+    operator: &SystemOperator,
+    mesh: &TaggedMesh,
+    region_maps: &[(InstanceId, &RegionMap)],
+    requirements: &[SystemVariablePrescribedValue],
+) -> Result<Vec<PrescribedEssentialValue>, FinitumError> {
+    if &mesh.mesh != operator.plan().mesh() {
+        return Err(FinitumError::InvalidRealization(
+            "prescribed source mesh differs from the realized mesh".into(),
+        ));
+    }
+    #[derive(Clone)]
+    struct Contribution {
+        value: FieldSource,
+        rate: FieldSource,
+        origin: InputOrigin,
+        node: usize,
+        component: usize,
+        components: usize,
+    }
+    let mut targets = BTreeMap::<DofId, (Vec<f64>, Vec<Contribution>)>::new();
+    for requirement in requirements {
+        let field = operator
+            .data
+            .fields
+            .get(&requirement.variable)
+            .ok_or_else(|| {
+                FinitumError::InvalidRealization(
+                    "prescribed source variable is not realized".into(),
+                )
+            })?;
+        if matches!(field.kind, FieldKind::Hdiv0 { .. }) {
+            return Err(FinitumError::UnsupportedRealization(
+                "prescribed RT0 normal-flux motion is not implemented".into(),
+            ));
+        }
+        let block = operator
+            .layout()
+            .block_by_variable(requirement.variable)
+            .expect("realized field block");
+        let components = block.component_count;
+        for source in [&requirement.value, &requirement.rate] {
+            if matches!(source, FieldSource::Kernel { .. } | FieldSource::Table(_)) {
+                return Err(FinitumError::UnsupportedRealization(
+                    "prescribed system sources require Constant/Nodal/Fallible sampling".into(),
+                ));
+            }
+        }
+        // The existing owner helper remains the authority on which region/edge/component
+        // targets are essential. Zero data select topology without evaluating user sources.
+        let selected = essential_constraints_from_system_by_variable_at(
+            operator,
+            mesh,
+            region_maps,
+            &[SystemVariableEssentialConstraint {
+                variable: requirement.variable,
+                requirement: requirement.requirement.clone(),
+                value: FieldSource::constant(vec![0.0; components]),
+            }],
+            0.0,
+        )?;
+        let count = block.extent / components;
+        let points = if count == mesh.mesh.vertices().len() {
+            mesh.mesh.vertices().to_vec()
+        } else {
+            crate::quadratic_simplex_node_points(&mesh.mesh)
+        };
+        if count != points.len() {
+            return Err(FinitumError::UnsupportedRealization(
+                "prescribed motion requires a P1/P2 nodal field".into(),
+            ));
+        }
+        for constraint in selected.constraints() {
+            let local = constraint
+                .target
+                .0
+                .checked_sub(block.offset)
+                .filter(|local| *local < block.extent)
+                .ok_or_else(|| {
+                    FinitumError::InvalidRealization(
+                        "essential target is outside the selected variable".into(),
+                    )
+                })?;
+            let node = local / components;
+            let entry = targets
+                .entry(constraint.target)
+                .or_insert_with(|| (points[node].clone(), Vec::new()));
+            entry.1.push(Contribution {
+                value: requirement.value.clone(),
+                rate: requirement.rate.clone(),
+                origin: requirement.origin.clone(),
+                node,
+                component: local % components,
+                components,
+            });
+        }
+    }
+    fn sample(
+        source: &FieldSource,
+        point: &[f64],
+        time: f64,
+        node: usize,
+        components: usize,
+        origin: &InputOrigin,
+    ) -> Result<Vec<f64>, InputEvaluationError> {
+        let values = match source {
+            FieldSource::Constant(values) => values.clone(),
+            FieldSource::Nodal(values) => {
+                let start = node * components;
+                values
+                    .get(start..start + components)
+                    .ok_or_else(|| {
+                        InputEvaluationError::new(
+                            "PRESCRIBED_SOURCE_SHAPE",
+                            origin.clone(),
+                            "nodal source does not cover the essential node",
+                        )
+                    })?
+                    .to_vec()
+            }
+            FieldSource::Sampled(callback) => callback(point),
+            FieldSource::Fallible(callback) => callback(point, time)?,
+            FieldSource::Kernel { .. } | FieldSource::Table(_) => {
+                unreachable!("validated prescribed source")
+            }
+        };
+        if values.len() != components || values.iter().any(|value| !value.is_finite()) {
+            return Err(InputEvaluationError::new(
+                "PRESCRIBED_SOURCE_SHAPE",
+                origin.clone(),
+                "prescribed source shape mismatch or nonfinite component",
+            ));
+        }
+        Ok(values)
+    }
+    Ok(targets
+        .into_iter()
+        .map(|(target, (point, contributions))| {
+            let origin = contributions[0].origin.clone();
+            let sampling_point = point.clone();
+            PrescribedEssentialValue::new(target, point, origin, move |time| {
+                let mut result: Option<PrescribedValueAndRate> = None;
+                for contribution in &contributions {
+                    let value = sample(
+                        &contribution.value,
+                        &sampling_point,
+                        time,
+                        contribution.node,
+                        contribution.components,
+                        &contribution.origin,
+                    )?[contribution.component];
+                    let rate = sample(
+                        &contribution.rate,
+                        &sampling_point,
+                        time,
+                        contribution.node,
+                        contribution.components,
+                        &contribution.origin,
+                    )?[contribution.component];
+                    let next = PrescribedValueAndRate { value, rate };
+                    if result.is_some_and(|old| old != next) {
+                        return Err(InputEvaluationError::new(
+                            "PRESCRIBED_SOURCE_CONFLICT",
+                            contribution.origin.clone(),
+                            "overlapping essential requirements disagree on value or analytic rate",
+                        ));
+                    }
+                    result = Some(next);
+                }
+                Ok(result.expect("target has contributors"))
+            })
+        })
+        .collect())
+}
+
 /// [`essential_constraints_from_system_by_variable_at`] at `t = 0`.
 pub fn essential_constraints_from_system_by_variable(
     operator: &SystemOperator,
