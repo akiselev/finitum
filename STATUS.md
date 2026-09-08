@@ -25,6 +25,12 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
   and exterior-facet traces of P1/P2 Lagrange (scalar and vector), P0 and RT0 fields at
   physical points with the crate's own bases and Piola maps, the plan's named quadrature rule
   and a degree-exact rule selector (new degree-5 triangle and tetrahedron rules)
++ W8 lane F2 (Finitum, a transition inside one wave): fallible external-input and constitutive
+  callbacks -- `InputEvaluationError { code, origin: InputOrigin, message, location }`,
+  `FinitumError::InputEvaluation` with `code()` returning the producer's own code, `try_new` on
+  `DynamicExternalInput` / `SystemConstitutiveInput` (the infallible `new` is a thin wrapper),
+  every Methodus boundary mapping it to `NumericError::Evaluation` verbatim; the infallible
+  forms are deleted by slice F3 after Sinbad 7d-2 migrates
 
 ## Implemented
 
@@ -677,6 +683,86 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
     facet integrals still refuse P2 (unchanged); the sampler digest covers conventions, not the
     mesh or values.
 
+- W8 lane F2 (2026-09-07, PLAN §6 W8 decision 3, gate G3): fallible external-input and
+  constitutive callbacks, a transition inside one wave -- every existing constructor, signature,
+  default and digest value keeps working (Sinbad lane A2 builds against this tree through a
+  path dependency the whole time); the fallible forms land beside them and the infallible ones
+  become thin wrappers; slice F3 (see "Next") deletes the infallible forms after Sinbad 7d-2
+  migrates. This is not a compatibility layer: it has a named deletion slice.
+  - Types (`src/error.rs`): `InputOrigin { Slot, ExpressionPath, Provider, Table }` as F1
+    proposed (`Provider(p)` displays `provider/p`, `Table(t)` displays `t (stored table)`,
+    the other two display their string); `InputEvaluationError { code, origin, message,
+    location: Option<Box<InputLocation>> }` with `InputLocation { cell: Option<CellId>,
+    point: Vec<f64>, time: Option<f64> }` -- F1's proposal plus the cell, with the
+    Finitum-filled location boxed into one record so the error stays under clippy's 128-byte
+    `Err` threshold in every callback's `Result` (flat: 136 bytes; consumer closures would
+    trip `result_large_err`); `new(code, origin, message)`, accessors `cell()` / `point()` /
+    `time()`, `location_text()`, Display `<code> at <origin>, point (x, y), t = 0.1, cell 3:
+    <message>` with absent parts omitted; `FinitumError::InputEvaluation(Box<InputEvaluationError>)`
+    (`#[error(transparent)]`, `From<InputEvaluationError>`; boxed for the same lint on
+    `FinitumError` itself); `FinitumError::code() -> Option<&str>` (the original
+    producer code for `InputEvaluation`, never a Finitum one; the static code of
+    `RepresentationUnsupported` / `RealizationTangentUnavailable` / `SamplingUnsupported` /
+    `InfSupUnstable`; `None` for structural errors); `impl From<FinitumError> for
+    methodus::NumericError` -- `InputEvaluation` becomes `NumericError::Evaluation { code,
+    origin: origin.to_string(), message: "<location>: <message>" }` (Methodus `bec099f`),
+    everything else the flat `NumericError::Operator { message }` it always was. Every Methodus
+    boundary goes through it (the `numeric_error` helpers in `realization.rs` / `system.rs` /
+    `method.rs`, the inline `map_err`s in `optimized.rs`, `mixed.rs`, `interface.rs`,
+    `system.rs`).
+  - Fallible dynamic callbacks: `DynamicExternalInput::try_new(integral, input, components,
+    identity, value: Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>,
+    direction: Fn(&PointEvaluation, &PointEvaluation) -> Result<..>)` and
+    `SystemConstitutiveInput::try_new(equation, ..)` likewise. Naming: F1 proposed reusing the
+    plain names with the fallible closure types, which the concurrent-build constraint forbids;
+    `try_` is the Rust idiom for the fallible form of an operation and is the name that
+    survives F3 (no second rename for consumers). `new` on both is `try_new` with `Ok`, proven
+    bitwise (equal digest, equal residual / JVP / VJP / assembled actions on both paths).
+    Finitum locates a returned failure at the evaluation's cell, physical point and time
+    (overwriting whatever the callback set; Finitum is the authority on where it evaluated)
+    and propagates it as `FinitumError::InputEvaluation`. The first failure in cell, then
+    quadrature-point, then declared-input order wins, deterministically (same error on every
+    repeat).
+  - Carrying mechanism, per entry point: **propagated everywhere, nothing recorded**. Every
+    Methodus operator trait entry point returns `Result<(), NumericError>` and
+    `NumericError::Evaluation` carries the typed payload, so no `last_evaluation_failure()`
+    cell exists or is needed. `RealizationPlan` and `SystemOperator` / `ReducedSystemOperator`:
+    `residual`, `jacobian_vector_product`, `vector_jacobian_product[_shifted]`, `load_vector`,
+    `assemble` (eager, at `t = 0`, zero state), `element_assembly` (eager), the coefficient
+    products (through the same point evaluators), `linearize` (lazy: the failure surfaces on
+    the linearized operator's first `apply`, as `NumericError::Evaluation`); the Methodus impls
+    `LinearOperator::apply`, `TransposableOperator::apply_transpose`, `NonlinearOperator::*`,
+    `DaeOperator::{residual, jacobian_vector_product}` -- so a whole `bdf_step` returns
+    `SolveError::Numeric(NumericError::Evaluation { code, origin, .. })`; and
+    `check_realization_agreement` / `check_system_realization_agreement`, which now drive the
+    crate's own representations through a crate-private `TypedAction` so the located error
+    reaches the caller as itself instead of flattened through the Methodus trait boundary and
+    back. `check_global_transpose` (caller-supplied `&dyn LinearOperator`) recovers a
+    `NumericError::Evaluation` as a typed `InputEvaluation` with exact code and origin and the
+    location as message text (`InputEvaluationError::from_numeric`; a `Slot` and an
+    `ExpressionPath` display identically, so that round trip yields `Slot`). Partial assembly
+    refuses dynamic inputs before any callback runs (unchanged). No entry point returns a
+    non-finite value in place of a callback failure.
+  - Evidence: 4 unit tests in `src/error.rs` (display order, `code()`, the Methodus mapping and
+    its round trip, origin displays) and 5 integration tests in `tests/w8_fallible_inputs.rs`:
+    a P1 input refusing at the second and third quadrature points of cell 3 and everywhere on
+    cell 5 (degree-2 rule, 8 cells) reports cell 3 and the second point's coordinates (equal to
+    the plan's own `QuadratureView` point) with the callback's code / origin / message and the
+    action's time from `residual`, JVP, VJP, `linearize` + `apply`, `assemble`, `load_vector`,
+    `element_assembly`, the matrix-free Methodus action and `check_realization_agreement`
+    (`a_p1_input_refusing_at_one_quadrature_point_is_located_and_carried_by_every_action`);
+    two inputs refusing at one point yield the first in the factorization's declaration order
+    (`among_inputs_refusing_at_the_same_point_the_first_in_declaration_order_wins`); the
+    system-path `ka` refusing on cells 4 and 2 reports cell 2's first quadrature point through
+    every `SystemOperator` action, the reduced `DaeOperator` / `LinearOperator` impls and a
+    Methodus BDF step
+    (`a_system_constitutive_refusal_is_located_and_carried_through_the_reduced_dae_operator`);
+    the infallible constructors reproduce the fallible-with-`Ok` ones bitwise with equal
+    digests on both paths (`the_infallible_*_constructor_is_the_fallible_one_with_ok_bitwise_and_digest_equal`).
+    The pre-existing 191 tests are unchanged and pass, which is the proof that the wrappers
+    change no behaviour and that none of `finitum-system-realization/2`,
+    `finitum-system-operator/2`, `finitum-field-sampler/1` moved.
+
 ## Boundary
 
 Scientia owns the abstract space and form meaning. Malleus owns executable local kernels.
@@ -745,7 +831,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 191 passed, 0 failed across 29 binaries (W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 200 passed, 0 failed across 30 binaries (W8 F2 fallible callbacks, +4 unit +5 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models
@@ -924,7 +1010,23 @@ Next work, demand-pulled by E6 Stokes (workspace `PLAN.md` §6 batch E6):
      `FinitumError::InputEvaluation(InputEvaluationError)` that `residual` / JVP / VJP /
      `load_vector` / assembly return unchanged (code and origin preserved; never NaN). Changing
      the existing closure types is the non-additive step; a parallel `*_fallible` constructor
-     pair would leave two paths and is not proposed.
+     pair would leave two paths and is not proposed. **Landed as item 8** with `try_` names
+     and a named deletion slice (F3), because Sinbad A2 builds against the tree concurrently.
+8. W8 lane F2 landed (2026-09-07): fallible callbacks (see "Implemented"). Follow-ups:
+   - **Slice F3** (after Sinbad 7d-2 has migrated; a deletion, not a compatibility layer):
+     delete `DynamicExternalInput::new` and `SystemConstitutiveInput::new` (the infallible
+     wrappers; `try_new` stays as the only form, no rename). The stored-table and
+     `FieldSource` items of this lane extend this list below as they land.
+   - Cross-repo needs: (a) **Krasis K1** -- pass Methodus's typed `NumericError::Evaluation
+     { code, origin, message }` through unchanged at its three
+     `map_err(.. NumericError::Operator { message })` sites (`coupled.rs`, `coupled_system.rs`)
+     so a failure raised inside `attempt_step_with` reaches the transaction outcome as a typed
+     refusal rather than a rolled-back "non-finite" step; (b) **Sinbad 7d-2** -- switch
+     `system_inputs.rs`'s `SystemConstitutiveInput::new` closures to `try_new` returning
+     `InputEvaluationError::new(refusal.code, InputOrigin::Slot(slot) | ExpressionPath(origin),
+     refusal.message)` (Finitum fills point / time / cell), then `src/evaluation_failure.rs`
+     shrinks to reading `FinitumError::InputEvaluation` / `NumericError::Evaluation` (the
+     `EvaluationFailureCell` and the `ClosureSite::fail` NaN placeholder go away).
 
 Extend method topology only from concrete acceptance cases, keeping
 local-kernel meaning, backend policy, and realization identity explicit.

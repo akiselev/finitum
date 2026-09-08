@@ -25,8 +25,8 @@ use crate::profile::{
     partition_report_for,
 };
 use crate::{
-    CellId, ConstraintSet, DofMap, FacetId, FacetIncidence, FacetTopology, FinitumError, Mesh,
-    PreparedElement, QuadraturePoint, simplex_basis,
+    CellId, ConstraintSet, DofMap, FacetId, FacetIncidence, FacetTopology, FinitumError,
+    InputEvaluationError, Mesh, PreparedElement, QuadraturePoint, simplex_basis,
 };
 
 pub const REALIZATION_ARTIFACT_SCHEMA: &str = "finitum-realization-plan/2";
@@ -170,8 +170,26 @@ impl PointEvaluation {
     }
 }
 
-type PointValueEvaluator = dyn Fn(&PointEvaluation) -> Vec<f64> + Send + Sync;
-type PointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync;
+type PointValueEvaluator =
+    dyn Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError> + Send + Sync;
+type PointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+    + Send
+    + Sync;
+
+/// Locate a callback's failure where Finitum evaluated it: the evaluation's cell, physical
+/// point and time replace whatever the callback set (W8 lane F2).
+pub(crate) fn locate_failure(
+    failure: InputEvaluationError,
+    evaluation: &PointEvaluation,
+) -> FinitumError {
+    failure
+        .at(
+            Some(evaluation.cell),
+            &evaluation.coordinates,
+            Some(evaluation.time),
+        )
+        .into()
+}
 
 /// A non-basis QFunction input evaluated from the current point state.
 ///
@@ -180,6 +198,14 @@ type PointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) -> Vec
 /// `identity` must change whenever either callback's semantics change. The direction callback is
 /// trusted to return the exact directional derivative of the value callback; products should
 /// retain centered-difference acceptance checks for every authored dynamic binding.
+///
+/// W8 lane F2: the callbacks are fallible ([`Self::try_new`]). A callback that meets a typed
+/// refusal returns an [`InputEvaluationError`] (its own code, origin and message); Finitum
+/// locates it (cell, point, time) and propagates it as [`FinitumError::InputEvaluation`] out of
+/// every action -- residual, JVP, VJP, `linearize`, `assemble`, partial assembly, the
+/// agreement checks and every Methodus trait entry point (as `NumericError::Evaluation`). The
+/// first failure in cell / quadrature-point / input order wins; no action returns a non-finite
+/// value in its place. [`Self::new`] is the infallible form: its closures cannot refuse.
 #[derive(Clone)]
 pub struct DynamicExternalInput {
     pub integral_index: usize,
@@ -203,6 +229,8 @@ impl std::fmt::Debug for DynamicExternalInput {
 }
 
 impl DynamicExternalInput {
+    /// The infallible form: `value` and `direction` cannot refuse. A thin wrapper over
+    /// [`Self::try_new`] (deleted by slice F3 once every consumer has migrated).
     pub fn new(
         integral_index: usize,
         input: TensorInputId,
@@ -210,6 +238,33 @@ impl DynamicExternalInput {
         identity: impl Into<String>,
         value: impl Fn(&PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
         direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
+    ) -> Result<Self, FinitumError> {
+        Self::try_new(
+            integral_index,
+            input,
+            component_count,
+            identity,
+            move |point| Ok(value(point)),
+            move |point, direction_point| Ok(direction(point, direction_point)),
+        )
+    }
+
+    /// The fallible form (W8 lane F2): `value` and `direction` return their own typed
+    /// [`InputEvaluationError`] instead of a value when they cannot evaluate; see the type
+    /// documentation for how it propagates.
+    pub fn try_new(
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: impl Into<String>,
+        value: impl Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Result<Self, FinitumError> {
         if component_count == 0 {
             return Err(FinitumError::InvalidRealization(
@@ -230,6 +285,24 @@ impl DynamicExternalInput {
             value: Arc::new(value),
             direction: Arc::new(direction),
         })
+    }
+
+    /// The value callback at `evaluation`, a failure located there.
+    pub(crate) fn evaluate_value(
+        &self,
+        evaluation: &PointEvaluation,
+    ) -> Result<Vec<f64>, FinitumError> {
+        (self.value)(evaluation).map_err(|failure| locate_failure(failure, evaluation))
+    }
+
+    /// The direction callback at `evaluation` along `direction`, a failure located there.
+    pub(crate) fn evaluate_direction(
+        &self,
+        evaluation: &PointEvaluation,
+        direction: &PointEvaluation,
+    ) -> Result<Vec<f64>, FinitumError> {
+        (self.direction)(evaluation, direction)
+            .map_err(|failure| locate_failure(failure, evaluation))
     }
 }
 
@@ -2157,7 +2230,11 @@ impl RealizationPlan {
         Ok(residual)
     }
 
-    fn apply_direction(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+    pub(crate) fn apply_direction(
+        &self,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
         self.validate_action(input, output)?;
         let homogeneous = self.data.constraints.expand_homogeneous(input)?;
         let mut physical_output = vec![0.0; self.dimension()];
@@ -2857,7 +2934,7 @@ impl RealizationPlan {
                 ExternalBinding::Stored(stored) => {
                     stored.facet_point_values(facet_position).to_vec()
                 }
-                ExternalBinding::Dynamic(dynamic) => (dynamic.value)(&evaluation),
+                ExternalBinding::Dynamic(dynamic) => dynamic.evaluate_value(&evaluation)?,
             };
             validate_components(input, &values, "facet external input")?;
             inputs.insert(input.id, values);
@@ -2913,7 +2990,7 @@ impl RealizationPlan {
             let values = match binding {
                 ExternalBinding::Stored(stored) => vec![0.0; stored.component_count],
                 ExternalBinding::Dynamic(dynamic) => {
-                    (dynamic.direction)(evaluation, &direction_evaluation)
+                    dynamic.evaluate_direction(evaluation, &direction_evaluation)?
                 }
             };
             validate_components(input, &values, "facet external input direction")?;
@@ -3115,7 +3192,7 @@ impl RealizationPlan {
                 ExternalBinding::Stored(stored) => stored
                     .point_values(cell, point, self.data.element.quadrature().len())
                     .to_vec(),
-                ExternalBinding::Dynamic(dynamic) => (dynamic.value)(&evaluation),
+                ExternalBinding::Dynamic(dynamic) => dynamic.evaluate_value(&evaluation)?,
             };
             validate_components(input, &values, "external input")?;
             inputs.insert(input.id, values);
@@ -3171,7 +3248,7 @@ impl RealizationPlan {
             let values = match binding {
                 ExternalBinding::Stored(stored) => vec![0.0; stored.component_count],
                 ExternalBinding::Dynamic(dynamic) => {
-                    (dynamic.direction)(evaluation, &direction_evaluation)
+                    dynamic.evaluate_direction(evaluation, &direction_evaluation)?
                 }
             };
             validate_components(input, &values, "external input direction")?;
@@ -3484,7 +3561,7 @@ impl RealizationPlan {
                         probe_input.id,
                         component,
                     )?;
-                    let response = (dynamic.direction)(evaluation, &probe);
+                    let response = dynamic.evaluate_direction(evaluation, &probe)?;
                     if response.len() != grad.len() {
                         return Err(FinitumError::InvalidRealization(format!(
                             "dynamic external input {input_id:?} direction returned {} \
@@ -3710,7 +3787,7 @@ impl RealizationPlan {
                         probe_input.id,
                         component,
                     )?;
-                    let response = (dynamic.direction)(evaluation, &probe);
+                    let response = dynamic.evaluate_direction(evaluation, &probe)?;
                     if response.len() != grad.len() {
                         return Err(FinitumError::InvalidRealization(format!(
                             "dynamic external input {input_id:?} direction returned {} \
@@ -3874,6 +3951,12 @@ impl LinearOperator for MatrixFreeOperator {
         self.plan
             .apply_direction(input, output)
             .map_err(numeric_error)
+    }
+}
+
+impl MatrixFreeOperator {
+    pub(crate) fn plan(&self) -> &RealizationPlan {
+        &self.plan
     }
 }
 
@@ -5331,9 +5414,7 @@ pub(crate) fn validate_finite(operation: &str, values: &[f64]) -> Result<(), Fin
 }
 
 fn numeric_error(error: FinitumError) -> NumericError {
-    NumericError::Operator {
-        message: error.to_string(),
-    }
+    NumericError::from(error)
 }
 
 #[derive(Clone, Debug)]

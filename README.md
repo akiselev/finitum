@@ -53,6 +53,13 @@ implementation contains:
   plus `QuadratureView`/`QuadratureRule` exposing a plan's named cell rule and selecting the
   smallest rule exact to a requested polynomial degree (segments to degree 15, triangles and
   tetrahedra to degree 5). Consumers sample through it instead of restating DOF conventions.
+- fallible external-input and constitutive callbacks (W8 lane F2): a callback returns its own
+  typed `InputEvaluationError` (refusal code, `InputOrigin`, message); Finitum locates it at
+  the cell, physical point and time it evaluated and propagates it as
+  `FinitumError::InputEvaluation` out of every action and as Methodus's
+  `NumericError::Evaluation` out of every operator trait, never as a non-finite value.
+  `FinitumError::code()` returns the producer's code. The infallible constructors are thin
+  wrappers, scheduled for deletion (slice F3) once Sinbad has migrated.
 
 The globally executable operator path deliberately remains scalar H1(order=1) cell integration
 with affine essential and algebraic dependency constraints. FC8's mixed/facet/compatible path is a deterministic reference

@@ -1134,10 +1134,7 @@ impl LinearOperator for InterfaceOperator {
         input: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
-        self.apply_action(input, output)
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+        self.apply_action(input, output).map_err(NumericError::from)
     }
 }
 
@@ -1150,9 +1147,7 @@ impl TransposableOperator for InterfaceOperator {
     ) -> Result<(), NumericError> {
         let zero = vec![0.0; self.dimension()];
         self.vector_jacobian_product(&zero, input, output)
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+            .map_err(NumericError::from)
     }
 }
 

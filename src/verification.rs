@@ -9,9 +9,12 @@ use methodus::{
 use scientia::Digest;
 use serde::{Deserialize, Serialize};
 
+use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator};
+use crate::realization::{AssembledOperator, MatrixFreeOperator};
+use crate::system::SystemPartialAssemblyOperator;
 use crate::{
-    ConstraintSet, ExactSequence, FinitumError, Mesh, NonmatchingTransfer, RealizationPlan,
-    ReducedSystemOperator,
+    ConstraintSet, ExactSequence, FinitumError, InputEvaluationError, Mesh, NonmatchingTransfer,
+    RealizationPlan, ReducedSystemOperator,
 };
 
 pub const VERIFICATION_REPORT_SCHEMA: &str = "finitum.verification-report/v1";
@@ -402,11 +405,10 @@ pub fn check_realization_agreement(
             plan.dimension()
         )));
     }
-    let context = EvaluationContext::reproducible();
-    let matrix_free_output = apply(&plan.matrix_free(), &context, probe)?;
-    let assembled_output = apply(&plan.assemble()?, &context, probe)?;
-    let element_assembled_output = apply(&plan.element_assembly(lane_width)?, &context, probe)?;
-    let partial_assembled_output = apply(&plan.partial_assembly(lane_width)?, &context, probe)?;
+    let matrix_free_output = apply_typed(&plan.matrix_free(), probe)?;
+    let assembled_output = apply_typed(&plan.assemble()?, probe)?;
+    let element_assembled_output = apply_typed(&plan.element_assembly(lane_width)?, probe)?;
+    let partial_assembled_output = apply_typed(&plan.partial_assembly(lane_width)?, probe)?;
     let body = RealizationAgreementBody {
         tolerance,
         lane_width,
@@ -444,11 +446,10 @@ pub fn check_system_realization_agreement(
             operator.rows()
         )));
     }
-    let context = EvaluationContext::reproducible();
-    let matrix_free_output = apply(operator, &context, probe)?;
-    let assembled_output = apply(&operator.assemble()?, &context, probe)?;
-    let element_assembled_output = apply(&operator.element_assembly(lane_width)?, &context, probe)?;
-    let partial_assembled_output = apply(&operator.partial_assembly(lane_width)?, &context, probe)?;
+    let matrix_free_output = apply_typed(operator, probe)?;
+    let assembled_output = apply_typed(&operator.assemble()?, probe)?;
+    let element_assembled_output = apply_typed(&operator.element_assembly(lane_width)?, probe)?;
+    let partial_assembled_output = apply_typed(&operator.partial_assembly(lane_width)?, probe)?;
     let body = RealizationAgreementBody {
         tolerance,
         lane_width,
@@ -784,6 +785,8 @@ fn maximum_cell_diameter(mesh: &Mesh) -> Result<f64, FinitumError> {
     }
 }
 
+/// A caller-supplied Methodus operator's action; a typed evaluation failure it returns is
+/// recovered through [`numeric`] (code and origin exact, location as message text).
 fn apply(
     operator: &dyn LinearOperator,
     context: &EvaluationContext,
@@ -793,6 +796,95 @@ fn apply(
     operator
         .apply(context, input, &mut output)
         .map_err(numeric)?;
+    Ok(output)
+}
+
+/// The Finitum-typed action of an operator this crate builds itself (W8 lane F2): its
+/// `FinitumError` -- a located `InputEvaluation` included -- reaches the check's caller
+/// unchanged instead of being flattened through the Methodus trait boundary and back.
+pub(crate) trait TypedAction {
+    fn typed_rows(&self) -> usize;
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError>;
+}
+
+impl TypedAction for MatrixFreeOperator {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.plan().apply_direction(input, output)
+    }
+}
+
+/// The CSR action holds no callback; its only failures are Methodus shape errors.
+impl TypedAction for AssembledOperator {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.apply(&EvaluationContext::reproducible(), input, output)
+            .map_err(numeric)
+    }
+}
+
+/// The reduced system's CSR assembly; likewise callback-free.
+impl TypedAction for methodus::CsrMatrix {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.apply(&EvaluationContext::reproducible(), input, output)
+            .map_err(numeric)
+    }
+}
+
+impl TypedAction for ElementAssemblyOperator {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.apply_inner(input, output)
+    }
+}
+
+impl TypedAction for PartialAssemblyOperator {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.apply_inner(input, output)
+    }
+}
+
+impl TypedAction for SystemPartialAssemblyOperator {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.apply_inner(input, output)
+    }
+}
+
+impl TypedAction for ReducedSystemOperator {
+    fn typed_rows(&self) -> usize {
+        self.rows()
+    }
+
+    fn apply_typed(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+        self.operator()
+            .apply_reduced_action(self.constraints(), input, output)
+    }
+}
+
+fn apply_typed(operator: &dyn TypedAction, input: &[f64]) -> Result<Vec<f64>, FinitumError> {
+    let mut output = vec![0.0; operator.typed_rows()];
+    operator.apply_typed(input, &mut output)?;
     Ok(output)
 }
 
@@ -818,8 +910,17 @@ fn compare(
     check_solve_strategy_agreement(left, right, tolerance).map_err(numeric)
 }
 
+/// A Methodus failure as a Finitum one: a typed evaluation failure keeps its code and origin
+/// (W8 lane F2); anything else is the flat message it always was.
 fn numeric(error: methodus::NumericError) -> FinitumError {
-    invalid(error.to_string())
+    match error {
+        methodus::NumericError::Evaluation {
+            code,
+            origin,
+            message,
+        } => InputEvaluationError::from_numeric(code, &origin, message).into(),
+        other => invalid(other.to_string()),
+    }
 }
 fn invalid(message: impl Into<String>) -> FinitumError {
     FinitumError::InvalidRealization(message.into())

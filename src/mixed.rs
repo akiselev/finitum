@@ -683,9 +683,7 @@ impl LinearOperator for MixedOperator {
         output: &mut [f64],
     ) -> Result<(), methodus::NumericError> {
         self.apply_action(input, output)
-            .map_err(|error| methodus::NumericError::Operator {
-                message: error.to_string(),
-            })
+            .map_err(methodus::NumericError::from)
     }
 }
 
@@ -755,9 +753,7 @@ impl LinearOperator for ReducedMixedOperator {
     ) -> Result<(), methodus::NumericError> {
         self.operator
             .apply_reduced_action(&self.constraints, input, output)
-            .map_err(|error| methodus::NumericError::Operator {
-                message: error.to_string(),
-            })
+            .map_err(methodus::NumericError::from)
     }
 }
 

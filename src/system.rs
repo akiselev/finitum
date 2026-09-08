@@ -1,4 +1,5 @@
 use crate::CellBatchLayout;
+use crate::InputEvaluationError;
 use crate::element::{
     barycenter_quadrature, rt0_basis_count, rt0_reference_basis, simplex_basis,
     simplex_basis_count, simplex_quadrature,
@@ -19,7 +20,7 @@ use crate::realization::{
     RealizationCapability, RealizationExternalInput, RealizationReceipt, RepresentationKind,
     active_probe_inputs, apply_basis_adjoint, bind_kernels, build_capability, component_count,
     evaluate_basis_input, execute_jvp_values, execute_parameter_jvp_values, execute_primal_values,
-    execute_vjp_values, gather_test_adjoint, point_parameter_cotangents,
+    execute_vjp_values, gather_test_adjoint, locate_failure, point_parameter_cotangents,
     probe_direction_evaluation, transpose_scatter_shape, validate_finite,
 };
 use crate::space::{
@@ -890,9 +891,11 @@ fn apply_rt0_normal_trace_adjoint(
     Ok(())
 }
 
-type SystemPointValueEvaluator = dyn Fn(&PointEvaluation) -> Vec<f64> + Send + Sync;
-type SystemPointDirectionEvaluator =
-    dyn Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync;
+type SystemPointValueEvaluator =
+    dyn Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError> + Send + Sync;
+type SystemPointDirectionEvaluator = dyn Fn(&PointEvaluation, &PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+    + Send
+    + Sync;
 
 /// Caller-supplied closure resolution of one block's non-`Basis`-sourced primal input.
 ///
@@ -905,6 +908,14 @@ type SystemPointDirectionEvaluator =
 /// `Stored`/regional material-property tensor table bound per block (the analogue of
 /// `RealizationPlan`'s `ExternalInput`) remains deferred future work; only closure-based
 /// resolution is admitted here.
+///
+/// W8 lane F2: the callbacks are fallible ([`Self::try_new`]), exactly as
+/// [`crate::realization::DynamicExternalInput`]'s: a typed [`InputEvaluationError`] returned by
+/// either callback is located (cell, point, time) and propagated as
+/// [`FinitumError::InputEvaluation`] out of every `SystemOperator` / [`ReducedSystemOperator`]
+/// action and, as `NumericError::Evaluation`, out of every Methodus trait entry point. The
+/// first failure in cell / quadrature-point / input order wins. [`Self::new`] is the
+/// infallible form.
 #[derive(Clone)]
 pub struct SystemConstitutiveInput {
     pub equation: String,
@@ -930,6 +941,8 @@ impl std::fmt::Debug for SystemConstitutiveInput {
 }
 
 impl SystemConstitutiveInput {
+    /// The infallible form: `value` and `direction` cannot refuse. A thin wrapper over
+    /// [`Self::try_new`] (deleted by slice F3 once every consumer has migrated).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         equation: impl Into<String>,
@@ -939,6 +952,35 @@ impl SystemConstitutiveInput {
         identity: impl Into<String>,
         value: impl Fn(&PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
         direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Vec<f64> + Send + Sync + 'static,
+    ) -> Result<Self, FinitumError> {
+        Self::try_new(
+            equation,
+            integral_index,
+            input,
+            component_count,
+            identity,
+            move |point| Ok(value(point)),
+            move |point, direction_point| Ok(direction(point, direction_point)),
+        )
+    }
+
+    /// The fallible form (W8 lane F2): `value` and `direction` return their own typed
+    /// [`InputEvaluationError`] instead of a value when they cannot evaluate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        equation: impl Into<String>,
+        integral_index: usize,
+        input: TensorInputId,
+        component_count: usize,
+        identity: impl Into<String>,
+        value: impl Fn(&PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+        direction: impl Fn(&PointEvaluation, &PointEvaluation) -> Result<Vec<f64>, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Result<Self, FinitumError> {
         let equation = equation.into();
         if equation.trim().is_empty() {
@@ -966,6 +1008,24 @@ impl SystemConstitutiveInput {
             value: Arc::new(value),
             direction: Arc::new(direction),
         })
+    }
+
+    /// The value callback at `evaluation`, a failure located there.
+    pub(crate) fn evaluate_value(
+        &self,
+        evaluation: &PointEvaluation,
+    ) -> Result<Vec<f64>, FinitumError> {
+        (self.value)(evaluation).map_err(|failure| locate_failure(failure, evaluation))
+    }
+
+    /// The direction callback at `evaluation` along `direction`, a failure located there.
+    pub(crate) fn evaluate_direction(
+        &self,
+        evaluation: &PointEvaluation,
+        direction: &PointEvaluation,
+    ) -> Result<Vec<f64>, FinitumError> {
+        (self.direction)(evaluation, direction)
+            .map_err(|failure| locate_failure(failure, evaluation))
     }
 }
 
@@ -3278,9 +3338,7 @@ fn validate_rate_shift(rate_shift: f64) -> Result<(), FinitumError> {
 }
 
 fn numeric_error(error: FinitumError) -> NumericError {
-    NumericError::Operator {
-        message: error.to_string(),
-    }
+    NumericError::from(error)
 }
 
 fn bound_kernel<'a>(
@@ -3345,10 +3403,7 @@ impl LinearOperator for SystemOperator {
         input: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
-        self.apply_action(input, output)
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+        self.apply_action(input, output).map_err(NumericError::from)
     }
 }
 
@@ -3547,9 +3602,7 @@ impl LinearOperator for ReducedSystemOperator {
     ) -> Result<(), NumericError> {
         self.operator
             .apply_reduced_action(&self.constraints, input, output)
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+            .map_err(NumericError::from)
     }
 }
 
@@ -4173,7 +4226,11 @@ impl SystemPartialAssemblyOperator {
         self.point_actions.iter().map(Vec::len).sum()
     }
 
-    fn apply_inner(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+    pub(crate) fn apply_inner(
+        &self,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
         let dimension = self.operator.dimension();
         if input.len() != dimension || output.len() != dimension {
             return Err(FinitumError::InvalidRealization(format!(
@@ -5107,7 +5164,7 @@ fn accumulate_parameter_cotangents_system(
                     probe_input.id,
                     component,
                 )?;
-                let response = (binding.direction)(evaluation, &probe);
+                let response = binding.evaluate_direction(evaluation, &probe)?;
                 if response.len() != grad.len() {
                     return Err(FinitumError::InvalidRealization(format!(
                         "constitutive input {input_id:?} direction returned {} components, \
@@ -5199,7 +5256,7 @@ fn point_inputs_system(
             SystemInputBinding::Stored(stored) => stored
                 .point_values(cell, point, bindings.point_count)
                 .to_vec(),
-            SystemInputBinding::Constitutive(binding) => (binding.value)(&evaluation),
+            SystemInputBinding::Constitutive(binding) => binding.evaluate_value(&evaluation)?,
         };
         if values.len() != component_count(&input.shape)? {
             return Err(FinitumError::InvalidRealization(format!(
@@ -5282,7 +5339,7 @@ fn point_directions_system(
         let values = match bindings.resolve(key)? {
             SystemInputBinding::Stored(stored) => vec![0.0; stored.component_count()],
             SystemInputBinding::Constitutive(binding) => {
-                (binding.direction)(evaluation, &direction_evaluation)
+                binding.evaluate_direction(evaluation, &direction_evaluation)?
             }
         };
         if values.len() != component_count(&input.shape)? {

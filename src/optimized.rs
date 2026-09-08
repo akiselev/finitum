@@ -261,7 +261,11 @@ impl ElementAssemblyOperator {
         &self.local_matrices
     }
 
-    fn apply_inner(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+    pub(crate) fn apply_inner(
+        &self,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
         validate_finite_length("element-assembly input", input, self.dimension)?;
         if output.len() != self.dimension {
             return Err(FinitumError::InvalidRealization(format!(
@@ -326,10 +330,7 @@ impl LinearOperator for ElementAssemblyOperator {
         input: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
-        self.apply_inner(input, output)
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+        self.apply_inner(input, output).map_err(NumericError::from)
     }
 }
 
@@ -395,7 +396,11 @@ impl PartialAssemblyOperator {
         self.point_actions.iter().map(Vec::len).sum()
     }
 
-    fn apply_inner(&self, input: &[f64], output: &mut [f64]) -> Result<(), FinitumError> {
+    pub(crate) fn apply_inner(
+        &self,
+        input: &[f64],
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
         validate_finite_length("partial-assembly input", input, self.dimension)?;
         if output.len() != self.dimension {
             return Err(FinitumError::InvalidRealization(format!(
@@ -495,10 +500,7 @@ impl LinearOperator for PartialAssemblyOperator {
         input: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
-        self.apply_inner(input, output)
-            .map_err(|error| NumericError::Operator {
-                message: error.to_string(),
-            })
+        self.apply_inner(input, output).map_err(NumericError::from)
     }
 }
 

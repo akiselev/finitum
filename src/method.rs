@@ -871,9 +871,7 @@ impl DaeOperator for DiscreteOperator {
 }
 
 fn numeric_error(error: FinitumError) -> NumericError {
-    NumericError::Operator {
-        message: error.to_string(),
-    }
+    NumericError::from(error)
 }
 
 fn require_lengths(
