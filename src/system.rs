@@ -33,6 +33,7 @@ use crate::{
     AffineMap, BlockLayout, CompatibleDofMaps, ConstraintSet, ExactSequence, FacetId,
     FacetTopology, FieldBlock, FieldSource, FinitumError, Mesh, PreparedElement, QuadraturePoint,
 };
+use crate::{DofId, InputOrigin};
 use methodus::{
     BlockLinearOperator, CsrMatrix, DaeOperator, Definiteness, EvaluationContext, LinearOperator,
     NonlinearOperator, NumericError, OperatorProperties, OperatorStructureHint, OperatorSymmetry,
@@ -4289,6 +4290,7 @@ impl SystemOperator {
         Ok(ReducedSystemOperator {
             operator: self.clone(),
             constraints,
+            motion: None,
         })
     }
 
@@ -5284,12 +5286,71 @@ impl TransposableOperator for SystemBlockOperator {
     }
 }
 
+/// One prescribed essential target's value and analytic time derivative. Both are required;
+/// an unavailable rate must be a typed callback failure, never an implicit zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrescribedValueAndRate {
+    pub value: f64,
+    pub rate: f64,
+}
+
+type PrescribedEvaluator =
+    dyn Fn(f64) -> Result<PrescribedValueAndRate, InputEvaluationError> + Send + Sync;
+
+/// A time-dependent prescribed value on an existing fixed essential target. The coordinates
+/// locate callback failures; the caller's motion identity authenticates the scientific data.
+#[derive(Clone)]
+pub struct PrescribedEssentialValue {
+    target: DofId,
+    coordinates: Vec<f64>,
+    origin: InputOrigin,
+    evaluator: Arc<PrescribedEvaluator>,
+}
+
+impl std::fmt::Debug for PrescribedEssentialValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrescribedEssentialValue")
+            .field("target", &self.target)
+            .field("coordinates", &self.coordinates)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrescribedEssentialValue {
+    /// Binds a pure evaluator of prescribed value and analytic rate at the requested time.
+    /// Finitum validates the target and coordinates when attaching it to a reduced operator.
+    pub fn new(
+        target: DofId,
+        coordinates: Vec<f64>,
+        origin: InputOrigin,
+        evaluator: impl Fn(f64) -> Result<PrescribedValueAndRate, InputEvaluationError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            target,
+            coordinates,
+            origin,
+            evaluator: Arc::new(evaluator),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PrescribedMotion {
+    identity: String,
+    values: Vec<PrescribedEssentialValue>,
+}
+
 /// A [`SystemOperator`] with essential (Dirichlet) constraints eliminated through
 /// [`SystemOperator::apply_reduced_action`] -- mirroring `crate::mixed::ReducedMixedOperator`.
 #[derive(Clone, Debug)]
 pub struct ReducedSystemOperator {
     operator: SystemOperator,
     constraints: ConstraintSet,
+    motion: Option<PrescribedMotion>,
 }
 
 impl ReducedSystemOperator {
@@ -5299,6 +5360,155 @@ impl ReducedSystemOperator {
 
     pub fn constraints(&self) -> &ConstraintSet {
         &self.constraints
+    }
+
+    /// Adds prescribed time-dependent offsets/rates on fixed essential targets. Targets not
+    /// listed retain their static offsets and zero prescribed rates. Affine constraints and
+    /// duplicate/missing targets are refused. The identity must describe both value and rate
+    /// data; callbacks must be pure because solver retries may revisit times.
+    pub fn with_prescribed_values(
+        mut self,
+        identity: impl Into<String>,
+        values: Vec<PrescribedEssentialValue>,
+    ) -> Result<Self, FinitumError> {
+        let identity = identity.into();
+        if identity.trim().is_empty() || values.is_empty() {
+            return Err(FinitumError::InvalidRealization(
+                "prescribed motion requires identity and targets".into(),
+            ));
+        }
+        if self.constraints.has_affine_dependencies() {
+            return Err(FinitumError::UnsupportedRealization(
+                "prescribed motion supports fixed essential targets only".into(),
+            ));
+        }
+        let targets = self
+            .constraints
+            .constraints()
+            .map(|c| c.target)
+            .collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        for value in &values {
+            if !targets.contains(&value.target) || !seen.insert(value.target) {
+                return Err(FinitumError::InvalidRealization(
+                    "prescribed motion has missing or duplicate essential target".into(),
+                ));
+            }
+            if value.coordinates.len() != self.operator.data.plan.mesh().dimension()
+                || value.coordinates.iter().any(|x| !x.is_finite())
+            {
+                return Err(FinitumError::InvalidRealization(
+                    "prescribed motion coordinates do not match mesh".into(),
+                ));
+            }
+        }
+        self.motion = Some(PrescribedMotion { identity, values });
+        Ok(self)
+    }
+
+    /// Whether this operator has prescribed runtime essential data.
+    pub fn has_prescribed_motion(&self) -> bool {
+        self.motion.is_some()
+    }
+
+    /// The essential values at `time`, evaluated together with their required analytic rates.
+    /// `constraints()` remains the topology/reference snapshot for legacy static consumers.
+    pub fn constraints_at(&self, time: f64) -> Result<ConstraintSet, FinitumError> {
+        Ok(self.prescribed_at(time)?.0)
+    }
+
+    fn prescribed_at(&self, time: f64) -> Result<(ConstraintSet, Vec<f64>), FinitumError> {
+        if !time.is_finite() {
+            return Err(FinitumError::InvalidRealization(
+                "prescribed evaluation time must be finite".into(),
+            ));
+        }
+        if self.motion.is_none() {
+            return Ok((
+                self.constraints.clone(),
+                vec![0.0; self.operator.dimension()],
+            ));
+        }
+        let mut constraints = self.constraints.constraints().cloned().collect::<Vec<_>>();
+        let indices = constraints
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.target, i))
+            .collect::<BTreeMap<_, _>>();
+        let mut rates = vec![0.0; self.operator.dimension()];
+        if let Some(motion) = &self.motion {
+            for value in &motion.values {
+                let evaluated = (value.evaluator)(time).map_err(|error| {
+                    FinitumError::from(error.at(None, &value.coordinates, Some(time)))
+                })?;
+                if !evaluated.value.is_finite() || !evaluated.rate.is_finite() {
+                    return Err(InputEvaluationError::new(
+                        "PRESCRIBED_VALUE_NONFINITE",
+                        value.origin.clone(),
+                        "prescribed value or analytic rate is nonfinite",
+                    )
+                    .at(None, &value.coordinates, Some(time))
+                    .into());
+                }
+                constraints[indices[&value.target]].offset = evaluated.value;
+                rates[value.target.0] = evaluated.rate;
+            }
+        }
+        Ok((
+            ConstraintSet::new(self.operator.dimension(), constraints)?,
+            rates,
+        ))
+    }
+
+    /// Expands the state and rate into physical coordinates at actual time. Prescribed rates
+    /// contribute to interior mass terms. Use this for initialization and field/observable
+    /// sampling instead of independently expanding the static constraint snapshot.
+    pub fn physical_state_and_rate(
+        &self,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+    ) -> Result<(Vec<f64>, Vec<f64>), FinitumError> {
+        let (constraints, lifting_rate) = self.prescribed_at(time)?;
+        let physical_state = constraints.expand(state)?;
+        let mut physical_rate = constraints.expand_homogeneous(state_rate)?;
+        for (rate, lifting) in physical_rate.iter_mut().zip(lifting_rate) {
+            *rate += lifting;
+        }
+        validate_finite("prescribed physical rate", &physical_rate)?;
+        Ok((physical_state, physical_rate))
+    }
+
+    fn require_static_view(&self) -> Result<(), FinitumError> {
+        if self.motion.is_some() {
+            Err(FinitumError::UnsupportedRealization(
+                "prescribed motion requires an explicit-time residual or linearization".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Motion-aware realization identity. Static operators return their underlying operator
+    /// digest unchanged; consumers must use this when authenticating a reduced trajectory.
+    pub fn realization_digest(&self) -> Digest {
+        match &self.motion {
+            None => self.operator.data.digest.clone(),
+            Some(motion) => Digest::blake3(
+                &serde_json::to_vec(&(
+                    "finitum-prescribed-motion/1",
+                    &self.operator.data.digest,
+                    &self.constraints,
+                    &motion.identity,
+                    motion
+                        .values
+                        .iter()
+                        .map(|v| (v.target, &v.coordinates, v.origin.to_string()))
+                        .collect::<Vec<_>>(),
+                ))
+                .expect("motion receipt serializes"),
+            ),
+        }
     }
 
     /// The elimination-ready right-hand side for `self` (mission item 2): the exact multi-block
@@ -5339,6 +5549,7 @@ impl ReducedSystemOperator {
     pub fn load_vector(&self) -> Result<Vec<f64>, FinitumError> {
         let dimension = self.operator.dimension();
         let load = self.operator.load_vector()?;
+        self.require_static_view()?;
         let lifting = self.constraints.expand(&vec![0.0; dimension])?;
         let mut lifted_action = vec![0.0; dimension];
         self.operator.apply_action(&lifting, &mut lifted_action)?;
@@ -5384,6 +5595,7 @@ impl LinearOperator for ReducedSystemOperator {
         input: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
+        self.require_static_view().map_err(NumericError::from)?;
         self.operator
             .apply_reduced_action(&self.constraints, input, output)
             .map_err(NumericError::from)
@@ -5399,9 +5611,10 @@ impl BlockLinearOperator for ReducedSystemOperator {
 impl ReducedSystemOperator {
     /// Batch P: the essential-constraint-eliminated residual at `(t, u, u_t)`, mirroring
     /// `RealizationPlan::residual` exactly: the state is expanded through the constraints (a
-    /// constrained coordinate takes its Dirichlet value), the rate homogeneously, the physical
-    /// residual is restricted back, and every constrained row becomes its own constraint
-    /// residual `u_t - value` -- the `F(t, y, y') = 0` shape a Krasis transaction or a
+    /// constrained coordinate takes its Dirichlet value), the rate homogeneously plus any
+    /// prescribed analytic rate lifting. The physical residual is restricted back, and every
+    /// constrained row becomes `state[target] - prescribed_value(time)` -- the
+    /// `F(t, y, y') = 0` shape a Krasis transaction or a
     /// Methodus BDF step consumes (this type implements [`DaeOperator`] and
     /// [`NonlinearOperator`] over these actions).
     pub fn residual(
@@ -5418,16 +5631,20 @@ impl ReducedSystemOperator {
                 output.len()
             )));
         }
-        let physical_state = self.constraints.expand(state)?;
-        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let (constraints, lifting_rate) = self.prescribed_at(time)?;
+        let physical_state = constraints.expand(state)?;
+        let mut physical_rate = constraints.expand_homogeneous(state_rate)?;
+        for (rate, lifting) in physical_rate.iter_mut().zip(lifting_rate) {
+            *rate += lifting;
+        }
+        validate_finite("prescribed physical rate", &physical_rate)?;
         let mut physical_output = vec![0.0; dimension];
         self.operator
             .residual(time, &physical_state, &physical_rate, &mut physical_output)?;
         output.copy_from_slice(&self.constraints.restrict_transpose(&physical_output)?);
         for constraint in self.constraints.constraints() {
-            output[constraint.target.0] = self
-                .constraints
-                .equation_residual(state, constraint.target)?;
+            output[constraint.target.0] =
+                constraints.equation_residual(state, constraint.target)?;
         }
         validate_finite("reduced system residual", output)
     }
@@ -5451,8 +5668,13 @@ impl ReducedSystemOperator {
                 output.len()
             )));
         }
-        let physical_state = self.constraints.expand(state)?;
-        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let (constraints, lifting_rate) = self.prescribed_at(time)?;
+        let physical_state = constraints.expand(state)?;
+        let mut physical_rate = constraints.expand_homogeneous(state_rate)?;
+        for (rate, lifting) in physical_rate.iter_mut().zip(lifting_rate) {
+            *rate += lifting;
+        }
+        validate_finite("prescribed physical rate", &physical_rate)?;
         let physical_state_direction = self.constraints.expand_homogeneous(state_direction)?;
         let physical_rate_direction = self.constraints.expand_homogeneous(rate_direction)?;
         let mut physical_output = vec![0.0; dimension];
@@ -5516,8 +5738,13 @@ impl ReducedSystemOperator {
                     .into(),
             ));
         }
-        let physical_state = self.constraints.expand(state)?;
-        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let (constraints, lifting_rate) = self.prescribed_at(time)?;
+        let physical_state = constraints.expand(state)?;
+        let mut physical_rate = constraints.expand_homogeneous(state_rate)?;
+        for (rate, lifting) in physical_rate.iter_mut().zip(lifting_rate) {
+            *rate += lifting;
+        }
+        validate_finite("prescribed physical rate", &physical_rate)?;
         let mut restricted_adjoint = adjoint.to_vec();
         for constraint in self.constraints.constraints() {
             restricted_adjoint[constraint.target.0] = 0.0;
@@ -5628,8 +5855,13 @@ impl ReducedSystemOperator {
                 output.len()
             )));
         }
-        let physical_state = self.constraints.expand(state)?;
-        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let (constraints, lifting_rate) = self.prescribed_at(time)?;
+        let physical_state = constraints.expand(state)?;
+        let mut physical_rate = constraints.expand_homogeneous(state_rate)?;
+        for (rate, lifting) in physical_rate.iter_mut().zip(lifting_rate) {
+            *rate += lifting;
+        }
+        validate_finite("prescribed physical rate", &physical_rate)?;
         let mut physical_output = vec![0.0; dimension];
         self.operator.coefficient_jacobian_vector_product(
             time,
@@ -5674,8 +5906,13 @@ impl ReducedSystemOperator {
                     .into(),
             ));
         }
-        let physical_state = self.constraints.expand(state)?;
-        let physical_rate = self.constraints.expand_homogeneous(state_rate)?;
+        let (constraints, lifting_rate) = self.prescribed_at(time)?;
+        let physical_state = constraints.expand(state)?;
+        let mut physical_rate = constraints.expand_homogeneous(state_rate)?;
+        for (rate, lifting) in physical_rate.iter_mut().zip(lifting_rate) {
+            *rate += lifting;
+        }
+        validate_finite("prescribed physical rate", &physical_rate)?;
         let mut restricted_adjoint = adjoint.to_vec();
         for constraint in self.constraints.constraints() {
             restricted_adjoint[constraint.target.0] = 0.0;
@@ -5704,6 +5941,7 @@ impl ReducedSystemOperator {
         &self,
         lane_width: usize,
     ) -> Result<ElementAssemblyOperator, FinitumError> {
+        self.require_static_view()?;
         self.operator
             .element_assembly_with(self.constraints.clone(), lane_width)
     }
@@ -5713,6 +5951,7 @@ impl ReducedSystemOperator {
         &self,
         lane_width: usize,
     ) -> Result<SystemPartialAssemblyOperator, FinitumError> {
+        self.require_static_view()?;
         self.operator
             .partial_assembly_with(self.constraints.clone(), lane_width)
     }
@@ -5763,7 +6002,10 @@ impl ReducedSystemOperator {
             RepresentationKind::MatrixFree,
             RepresentationKind::Assembled,
         ];
-        if data.facet_regions.is_empty() {
+        if self.motion.is_some() {
+            representation_kinds = vec![RepresentationKind::MatrixFree];
+        }
+        if self.motion.is_none() && data.facet_regions.is_empty() {
             representation_kinds.push(RepresentationKind::ElementAssembly);
             if data.constitutive.is_empty() && data.binds.is_empty() {
                 representation_kinds.push(RepresentationKind::PartialAssembly);
@@ -5796,7 +6038,7 @@ impl ReducedSystemOperator {
                     .rows()
                     .map(|(_, _, block)| &block.kernels.artifact_digest),
             ),
-            realization_digest: data.digest.clone(),
+            realization_digest: self.realization_digest(),
         };
         build_capability(
             data.plan.mesh().dimension(),
@@ -5871,7 +6113,7 @@ impl ReducedSystemOperator {
         };
         SystemRealizationArtifact {
             schema: SYSTEM_REALIZATION_ARTIFACT_SCHEMA.into(),
-            artifact_digest: data.digest.clone(),
+            artifact_digest: self.realization_digest(),
             plan_digest: data.plan.artifact_digest().clone(),
             system_ids_identity: ids.identity().clone(),
             blocks,
@@ -5881,6 +6123,7 @@ impl ReducedSystemOperator {
             external_inputs,
             instances,
             binds: self.operator.binds(),
+            prescribed_motion_identity: self.motion.as_ref().map(|m| m.identity.clone()),
         }
     }
 }
@@ -5953,7 +6196,8 @@ pub struct SystemRealizationExternalInput {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SystemRealizationArtifact {
     pub schema: String,
-    /// [`SystemOperator::digest`] (`finitum-system-operator/2`).
+    /// [`SystemOperator::digest`] for static data; includes prescribed motion identity and
+    /// target descriptors when runtime essential values are attached.
     pub artifact_digest: Digest,
     pub plan_digest: Digest,
     /// [`SystemIdMap::identity`] (`finitum-system-ids/1`).
@@ -5970,6 +6214,9 @@ pub struct SystemRealizationArtifact {
     /// W8 F-MI: every same-mesh bind the operator realizes (empty on a one-instance plan).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub binds: Vec<SystemBindReceipt>,
+    /// Optional prescribed value/rate identity; absent on static artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prescribed_motion_identity: Option<String>,
 }
 
 /// One same-mesh bind of a composed [`SystemOperator`] (W8 lane F-MI): which slot it closes,
@@ -6210,6 +6457,7 @@ impl NonlinearOperator for ReducedSystemOperator {
         state: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
+        self.require_static_view().map_err(numeric_error)?;
         let zero = vec![0.0; self.operator.dimension()];
         ReducedSystemOperator::residual(self, 0.0, state, &zero, output).map_err(numeric_error)
     }
@@ -6221,6 +6469,7 @@ impl NonlinearOperator for ReducedSystemOperator {
         direction: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
+        self.require_static_view().map_err(numeric_error)?;
         let zero = vec![0.0; self.operator.dimension()];
         ReducedSystemOperator::jacobian_vector_product(
             self, 0.0, state, &zero, direction, &zero, output,
@@ -6237,6 +6486,7 @@ impl TransposableOperator for ReducedSystemOperator {
         input: &[f64],
         output: &mut [f64],
     ) -> Result<(), NumericError> {
+        self.require_static_view().map_err(numeric_error)?;
         let zero = vec![0.0; self.operator.dimension()];
         self.vector_jacobian_product(0.0, &zero, &zero, input, output)
             .map_err(numeric_error)
@@ -7376,8 +7626,10 @@ pub fn essential_constraints_from_system(
 
 /// W8 lane F2: [`essential_constraints_from_system`] with every value evaluated at `time` (a
 /// [`FieldSource::Fallible`] closure's time argument; `Constant` / `Nodal` / `Sampled` values do
-/// not depend on it), so transient Dirichlet data on the system path stop being frozen at
-/// `t = 0`: rebuild the constraint set (and `reduced(..)`) per step. A `Fallible` refusal is
+/// not depend on it). This is a value snapshot, not a transient lifting: attach
+/// [`ReducedSystemOperator::with_prescribed_values`] for runtime essential values and their
+/// analytic rate contributions. Rebuilding this set alone omits prescribed mass-rate terms.
+/// A `Fallible` refusal is
 /// located at the node's coordinates (or the RT0 facet centroid) and `time`, without a cell,
 /// and returned as [`FinitumError::InputEvaluation`].
 pub fn essential_constraints_from_system_at(

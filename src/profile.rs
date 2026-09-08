@@ -824,8 +824,10 @@ pub fn essential_constraints_from(
 
 /// W8 lane F2: [`essential_constraints_from`] with the sources evaluated at `time` (the
 /// `"t"`/`"time"` kernel inputs and table axes, and a [`FieldSource::Fallible`] closure's time
-/// argument), so transient Dirichlet data stop being frozen at `t = 0`; rebuild the constraint
-/// set per step. A `Fallible` refusal is located at the node's coordinates and `time` (no
+/// argument). This returns a value snapshot; it does not supply the prescribed time
+/// derivative needed by a transient mass operator. The system path supports complete
+/// lifting through [`crate::ReducedSystemOperator::with_prescribed_values`]. A `Fallible`
+/// refusal is located at the node's coordinates and `time` (no
 /// cell) and returned as [`FinitumError::InputEvaluation`].
 pub fn essential_constraints_from_at(
     mesh: &TaggedMesh,

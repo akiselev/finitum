@@ -88,14 +88,15 @@ pub use space::{
     vector_nodal_dof_map,
 };
 pub use system::{
-    BindPath, LinearizedSystemOperator, ReducedSystemOperator, SYSTEM_OPERATOR_DIGEST_SCHEMA,
-    SYSTEM_REALIZATION_ARTIFACT_SCHEMA, SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA,
-    SystemBindReceipt, SystemBlockOperator, SystemBlockReceipt, SystemConstitutiveInput,
-    SystemDistributedCoefficient, SystemEssentialConstraintRequirement, SystemExternalInput,
-    SystemFieldArtifact, SystemOperator, SystemPartialAssemblyOperator, SystemQuadrature,
-    SystemRealizationArtifact, SystemRealizationExternalInput, SystemRealizationPlan,
-    SystemVariableEssentialConstraint, essential_constraints_from_system,
-    essential_constraints_from_system_at, essential_constraints_from_system_by_variable,
+    BindPath, LinearizedSystemOperator, PrescribedEssentialValue, PrescribedValueAndRate,
+    ReducedSystemOperator, SYSTEM_OPERATOR_DIGEST_SCHEMA, SYSTEM_REALIZATION_ARTIFACT_SCHEMA,
+    SYSTEM_REALIZATION_COMPOSED_DIGEST_SCHEMA, SystemBindReceipt, SystemBlockOperator,
+    SystemBlockReceipt, SystemConstitutiveInput, SystemDistributedCoefficient,
+    SystemEssentialConstraintRequirement, SystemExternalInput, SystemFieldArtifact, SystemOperator,
+    SystemPartialAssemblyOperator, SystemQuadrature, SystemRealizationArtifact,
+    SystemRealizationExternalInput, SystemRealizationPlan, SystemVariableEssentialConstraint,
+    essential_constraints_from_system, essential_constraints_from_system_at,
+    essential_constraints_from_system_by_variable,
     essential_constraints_from_system_by_variable_at, system_constitutive_from_sources,
 };
 pub use system_ids::{

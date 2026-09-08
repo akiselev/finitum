@@ -46,6 +46,25 @@ H(div)/RT0 + P0 compatible realization — the real Stokes and mixed-Darcy corpu
 
 ## Implemented
 
+- W8 prescribed time-data prerequisite (2026-09-08, implemented and validated):
+  `ReducedSystemOperator::with_prescribed_values` attaches pure, typed per-target value and
+  analytic rate callbacks on fixed essential targets. At every actual DAE evaluation time,
+  physical state uses `g(t)` and physical rate uses the homogeneous rate plus `gdot(t)`;
+  residual/JVP/VJP and coefficient products evaluate the same lifted point. State/rate
+  directions remain homogeneous because prescribed data are independent of unknowns.
+  `physical_state_and_rate` / `constraints_at` expose current data to initialization and
+  sampling. Affine dependencies, invalid/duplicate targets, unavailable/nonfinite callback
+  products, and implicit-time linear/assembly views refuse; callback failures retain origin,
+  coordinates, and actual time. Motion augments realization identity; static artifacts omit
+  the optional metadata and retain their original identities. No Krasis algorithm change
+  is required; product integration remains Sinbad's gate.
+  Focused `w8_prescribed_motion`: 4 passed, including a nonlinear-capacity manufactured BDF1
+  trajectory with nonzero interior boundary-rate mass contribution, state/rate finite
+  differences and shifted transpose at two times, callback provenance, static identity,
+  topology refusal, and varying analytic rates. Full workspace/all-target gate passed
+  232 tests across 33 binaries; clippy and rustdoc with warnings denied, scoped formatting
+  and diff checks passed. Krasis must consume `realization_digest()` in checkpoint identity;
+  that consumer gate is coordinated separately.
 - W8 F-EVAL (2026-09-08, implemented and validated):
   `finitum::functional::BoundPointExpression` consumes Scientia's authenticated point kernel
   artifact and compiled argument DAG. Graph-local inputs resolve by semantic symbol/evaluation;
@@ -1089,7 +1108,7 @@ rectangle and its two declared parameters.
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets           # 228 passed, 0 failed across 32 binaries (W8 F-EVAL functional evaluation, +14 integration; 214 at W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
+cargo test --locked --workspace --all-targets           # 232 passed, 0 failed across 33 binaries (W8 prescribed motion, +4 integration; 228 at W8 F-EVAL functional evaluation, +14 integration; 214 at W8 F-MI multi-instance plan, +9 integration, every pre-existing test unchanged; 205 at W8 F2 fallible callbacks, +5 unit +9 integration, every pre-existing test unchanged; 191 at W8 F1 field sampler, +13 unit +6 integration, every pre-existing test unchanged; 172 at W7 7c C typed representation refusal; 170 at W7 7c B proof-aware symmetry; 168 at W7 7c A per-plan quadrature; 164 at SC-W1 Scientia ids + typed inf-sup; 161 at SC-W1 system-path parity; 156 at W7 follow-ups; 153 at SC-W1 interface, 148 at SC-W1 ids/block actions, 144 at W7 package 3, 136 at W7 SV1-C1/C3 + P, 122 at the E6 close, 103 at SV2-B1 head fae5675, 52 at the R3D-era transcript)
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 git diff --check
 python3 ../sinbad/scripts/check-physics-corpus.py        # 50 models

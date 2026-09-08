@@ -111,6 +111,17 @@ kernels once, supply only external provider primitives, and use `CellFunctionalP
 quadrature, value/JVP/VJP accumulation and independent coefficient gradients. See
 `tests/w8_functional.rs` for executable examples and `STATUS.md` for the current boundaries.
 
-Validated on 2026-09-08: 228 workspace/all-target tests passed, including 14 functional
-evaluation tests; clippy and rustdoc with warnings denied, formatting and diff checks passed.
+Validated on 2026-09-08: 232 workspace/all-target tests passed, including 14 functional
+evaluation and four prescribed-motion tests; clippy and rustdoc with warnings denied, formatting and diff checks passed.
 Sinbad consumption and end-to-end G3 acceptance remain separate integration work.
+
+Prescribed transient essential values use
+`ReducedSystemOperator::with_prescribed_values(identity, values)`. Each
+`PrescribedEssentialValue` supplies a fixed target, coordinates, origin, and a fallible
+callback returning **both** value and analytic time derivative. Finitum adds the rate
+lifting to physical rates before residual and derivative evaluation, including interior
+mass contributions. `physical_state_and_rate(time, state, rate)` and `constraints_at(time)`
+provide the same data for initialization and sampling. Missing rates must return a typed
+failure; affine dependency constraints remain unsupported in this path. Explicit-time
+linearization is required for linear/assembled views with prescribed motion. Static
+artifact serialization and identities are unchanged.
