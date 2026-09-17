@@ -12,8 +12,11 @@ Indexed stress trace/shear covectors are verified to sum into one semantic tenso
 Final focused `w8_functional`: 16/16 under Malleus `9828694` and Scientia `6ab0a28`;
 clippy (all targets/features, warnings denied), rustdoc (warnings denied), scoped fmt pass.
 Full `cargo test --locked --workspace --all-targets` exited 0: 237 tests across 33 binaries.
-That full build started under Malleus `02164b3`; the final focused/check/doc gate above was
-rebuilt under its read-write-proof correction `9828694`. No full-current-tuple claim.
+That September 8 build started under Malleus `02164b3`; its final focused/check/doc gate
+was rebuilt under `9828694`. September 17 reconciliation: the retained W8 closure
+owner suite at Finitum `e77a96c`, Malleus `9828694`, Scientia `6ab0a28` and Methodus
+`4f52d38` passed 237 tests across 33 targets with zero failures/ignored tests.
+The consumer full suite remains pending; owner success does not close W8.
 
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization

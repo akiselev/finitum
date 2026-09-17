@@ -1,8 +1,8 @@
 # Agent instructions
 
 Finitum owns concrete discretization and global operator realization. It may depend on
-Scientia scientific compiler artifacts and Malleus executable kernels. Add Methodus only when
-a real realized operator can implement its traits directly. Stateful nonlinear, block,
+Scientia scientific compiler artifacts and Malleus executable kernels. Realized operators
+implement Methodus-owned traits directly; Methodus is an existing dependency. Stateful nonlinear, block,
 and DAE composition belongs to Krasis.
 
 Do not add scientific parsing, weak-form meaning, kernel scheduling/code generation,
