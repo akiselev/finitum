@@ -23,9 +23,10 @@ Raw test output is in [focused.log](focused.log) and [full.log](full.log).
 
 The mixed-case input-evaluation count fell from 2,832 to 720. Focused wall times
 are diagnostic samples under concurrent host load, not a reproducible full-case
-speedup claim. The unchanged Sinbad full suite is running in an isolated consumer
-checkout; its complete elasticity, derivative, mutation and oracle results are
-still required before integration. W8 remains open on the primary source tuple.
+speedup claim. The unchanged Sinbad full suite passed 195 tests across 30 targets in the isolated
+consumer checkout, including elasticity, derivative, mutation and live/recorded
+oracle gates. Source hashes stayed unchanged. Sinbad retains the full consumer
+record under docs/validation/2026-09-17-w8. W8 G1–G3 are closed.
 
 Exterior-facet and empty-mesh operators keep exhaustive probing. Reduced and
 linearized operator assembly is unchanged. Symmetry tolerance, the 4096-DOF proof

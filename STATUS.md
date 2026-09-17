@@ -1,14 +1,14 @@
 # Finitum status
 
 Updated: 2026-09-17
-M-CPU-S isolated candidate (2026-09-17): cell-local CSR assembly and scratch reuse
-pass the full owner gate (243 tests across 33 targets), six focused assembly/symmetry
-comparisons, fmt, warnings-denied all-target/all-feature clippy and rustdoc, and
-doctests. [Validation record](docs/validation/2026-09-17-mcpu-s/README.md).
-The mixed-case assembly input evaluations drop from 2,832 to 720. No whole-case
-speedup is claimed. Exterior-facet/empty-mesh probing, reduced/linearized assembly,
-proof tolerance and dimension cap are unchanged. The isolated Sinbad consumer gate
-is pending; this candidate does not close W8 or advance the primary source tuple.
+M-CPU-S integrated (2026-09-17): `3689e19` cell-local CSR assembly and scratch reuse
+pass 243 owner tests across 33 targets, six focused comparisons, fmt, strict
+all-target/all-feature clippy and rustdoc, and doctests. The unchanged Sinbad
+consumer also passes 195 tests across 30 targets with unchanged source hashes.
+[Owner record](docs/validation/2026-09-17-mcpu-s/README.md). Mixed-case input
+evaluations drop from 2,832 to 720. Exterior-facet/empty-mesh probing,
+reduced/linearized assembly, proof tolerance and dimension cap are unchanged.
+W8 G1–G3 are closed; saved-result inspection is the active next step.
 
 Current W8 follow-up (2026-09-08): `BoundPointExpression::require_derivatives()` uses a
 construction-cached structural activity proof over the compiler argument DAG, semantic fields,
@@ -25,7 +25,8 @@ That September 8 build started under Malleus `02164b3`; its final focused/check/
 was rebuilt under `9828694`. September 17 reconciliation: the retained W8 closure
 owner suite at Finitum `e77a96c`, Malleus `9828694`, Scientia `6ab0a28` and Methodus
 `4f52d38` passed 237 tests across 33 targets with zero failures/ignored tests.
-The consumer full suite remains pending; owner success does not close W8.
+The September 17 consumer retry subsequently passed 195 tests across 30 targets;
+see Sinbad docs/validation/2026-09-17-w8 for the W8 closure tuple.
 
 Milestone: SV0-B3 checks + R3D/SV1-G0B geometry derivatives + SV2-A vector H1 elasticity +
 SV2-B1/B4 P2 elements and mixed product layouts + E6 executable system realization
