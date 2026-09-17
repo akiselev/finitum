@@ -121,3 +121,8 @@ pub use verification::{
 
 /// Compiler-kernel point evaluation and functional integration.
 pub mod functional;
+
+mod results;
+pub use results::{
+    DisplayPoint, DisplaySurface, LinearFieldSamples, ResultMesh, inspection_surface,
+};

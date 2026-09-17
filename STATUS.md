@@ -1,6 +1,14 @@
 # Finitum status
 
 Updated: 2026-09-17
+SHOW-1 inspection primitives (2026-09-17): validated portable simplex meshes,
+exact P1 cell-vertex samples via FieldSampler, and clipped exterior/cap geometry
+with owner sampling coordinates. Non-P1 representations refuse explicitly.
+Full gate: 245 tests across 34 targets, fmt, strict all-target/all-feature clippy,
+strict rustdoc and doctests pass; source hashes unchanged during each gate.
+[Evidence](docs/validation/2026-09-17-show1/README.md). Sinbad owns saved-run
+identity, units/provenance, retention and the offline presentation.
+
 M-CPU-S integrated (2026-09-17): `3689e19` cell-local CSR assembly and scratch reuse
 pass 243 owner tests across 33 targets, six focused comparisons, fmt, strict
 all-target/all-feature clippy and rustdoc, and doctests. The unchanged Sinbad
