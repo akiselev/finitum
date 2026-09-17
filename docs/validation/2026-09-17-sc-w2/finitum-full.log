@@ -1,0 +1,460 @@
+   Compiling finitum v0.1.0 (/projects/sinbad/finitum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 15s
+     Running unittests src/lib.rs (/projects/sinbad/.show-build/debug/deps/finitum-243e7c3ffe70be4f)
+
+running 35 tests
+test element::tests::rt0_reference_basis_divergence_matches_a_finite_difference_of_the_values ... ok
+test element::p1_mass_tests::linear_simplex_degree_two_integrates_the_p1_mass_matrix_exactly ... ok
+test infsup::tests::cholesky_solve_inverts_spd_matrix ... ok
+test error::tests::finitum_error_code_is_the_original_code_and_the_methodus_mapping_keeps_it ... ok
+test error::tests::every_origin_kind_displays_as_the_consumer_names_it ... ok
+test realization::gx_c4_facets::reference_facet_weight_admits_only_dimension_two_and_three ... ok
+test element::tests::rt0_reference_basis_refuses_wrong_dimension_and_nonfinite_points ... ok
+test realization::gx_c4_facets::facet_geometry_normal_points_away_from_the_opposite_vertex ... ok
+test element::tests::rt0_reference_basis_reproduces_the_defining_flux_biorthogonality_on_the_triangle ... ok
+test error::tests::a_located_failure_displays_its_code_origin_point_time_and_cell_in_that_order ... ok
+test error::tests::a_methodus_evaluation_error_round_trips_its_code_and_origin ... ok
+test error::tests::a_table_relabel_keeps_a_table_origin_and_wraps_any_other ... ok
+test infsup::tests::congruence_matches_direct_product ... ok
+test infsup::tests::jacobi_recovers_known_spectrum ... ok
+test realization::gx_c4_facets::p1_trace_basis_values_vanish_at_the_omitted_vertex_reference ... ok
+test sampler::tests::conventions_digest_is_stable_per_family_and_dimension ... ok
+test sampler::tests::every_named_rule_verifies_its_declared_degree_against_closed_form_moments ... ok
+test sampler::tests::a_degree_two_rule_integrates_dot_u_u_of_a_p1_interpolant_exactly_and_barycenter_does_not ... ok
+test realization::gx_c4_facets::facet_evaluation_refuses_gradient_traces_but_admits_value_and_time_derivative ... ok
+test realization::sv2_vector_probes::symmetric_gradient_direction_is_nonzero_for_unit_nodal_direction ... ok
+test sampler::tests::geometry_measures_centroids_and_containment ... ok
+test sampler::tests::one_dimensional_exterior_facets_carry_signed_unit_normals ... ok
+test sampler::tests::p0_samples_the_cell_constant_with_zero_gradient ... ok
+test realization::gx_c4_facets::facet_geometry_matches_hand_computation_on_a_unit_right_triangle ... ok
+test sampler::tests::quadrature_views_refuse_dimension_mismatch_and_non_finite_integrands ... ok
+test sampler::tests::p2_scalar_and_vector_reproduce_quadratic_fields_to_roundoff ... ok
+test sampler::tests::caller_tables_are_probed_and_the_richest_system_rules_are_named ... ok
+test system::rt0_tests::rt0_normal_flux_is_continuous_across_a_shared_interior_facet_using_a_single_fixed_normal ... ok
+test system::rt0_tests::rt0_normal_trace_adjoint_matches_the_orientation_times_output_closed_form ... ok
+test system::rt0_tests::rt0_value_and_divergence_adjoints_are_the_exact_algebraic_transpose_of_their_evaluators ... ok
+test sampler::tests::unsupported_families_and_malformed_values_are_refused_typed ... ok
+test sampler::tests::p1_scalar_and_vector_reproduce_affine_fields_to_roundoff ... ok
+test verification::tests::rehashed_inconsistent_acceptance_is_refused ... ok
+test sampler::tests::rt0_reproduces_a_constant_flux_through_the_piola_map_on_skewed_cells ... ok
+test sampler::tests::rt0_normal_trace_of_one_facet_dof_is_its_flux_density ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/cad_derivatives.rs (/projects/sinbad/.show-build/debug/deps/cad_derivatives-d43a7e71a6e48010)
+
+running 8 tests
+test rectangle_design_velocities_match_centered_positions ... ok
+test annulus_design_velocities_match_centered_positions ... ok
+test annulus_realization_is_deterministic_oriented_and_boundary_stable ... ok
+test non_annulus_families_and_stale_revisions_are_refused ... ok
+test incomplete_or_extra_sensitivity_inputs_are_refused ... ok
+test annulus_residual_sensitivity_matches_rebuilt_centered_differences ... ok
+test adjoint_identity_gradient_matches_rebuilt_centered_differences ... ok
+test residual_geometry_sensitivity_matches_rebuilt_centered_differences ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests/cad_primal.rs (/projects/sinbad/.show-build/debug/deps/cad_primal-52765334dae7ba84)
+
+running 4 tests
+test embedded_rectangle_is_refused_instead_of_dropping_a_coordinate ... ok
+test stale_missing_and_ambiguous_cad_associations_are_refused ... ok
+test same_provider_revision_recreates_every_primal_association ... ok
+test scientia_poisson_uses_cad_boundary_ids_and_both_primal_paths_agree ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/connection_matching.rs (/projects/sinbad/.show-build/debug/deps/connection_matching-d4e0d2c22c2aa20d)
+
+running 1 test
+test matching_checks_coverage_normals_mesh_identity_and_open_boundary_admission ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/discretization.rs (/projects/sinbad/.show-build/debug/deps/discretization-324ed23abcacf42a)
+
+running 10 tests
+test dof_map_rejects_empty_and_repeated_local_restrictions ... ok
+test constraint_set_rejects_ambiguous_or_nonfinite_data ... ok
+test dynamic_external_input_requires_an_explicit_identity ... ok
+test mesh_rejects_repeated_simplex_vertices_and_nonfinite_coordinates ... ok
+test prepared_element_rejects_shape_and_nonfinite_tables ... ok
+test fixture_triangle_and_constraints_validate ... ok
+test fc6_refuses_a_kernel_bundle_from_another_factorization ... ok
+test fc6_linear_patch_is_exact_on_a_nonuniform_sheared_mesh ... ok
+test fc6_binds_generated_kernels_and_assembled_matrix_free_actions_agree ... ok
+test fc7_runtime_state_rate_and_property_chain_rule_match_finite_differences ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/fc10_methods.rs (/projects/sinbad/.show-build/debug/deps/fc10_methods-666bf976436947a2)
+
+running 5 tests
+test network_fixture_matches_its_independent_dense_dae_equations ... ok
+test finite_difference_fixture_matches_a_periodic_centered_stencil ... ok
+test particle_fixture_has_equal_opposite_pair_forces_and_an_energy_gradient ... ok
+test finite_volume_fixture_is_locally_conservative_and_uses_the_compiled_flux ... ok
+test boundary_integral_fixture_preserves_caller_supplied_quadrature_semantics ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/fc8_realization.rs (/projects/sinbad/.show-build/debug/deps/fc8_realization-0617f0279b7fa9e3)
+
+running 5 tests
+test darcy_hdiv_mapping_preserves_flux_and_oriented_shared_facets ... ok
+test elasticity_vector_tensor_blocks_preserve_component_ownership ... ok
+test stokes_product_layout_and_static_condensation_match_the_full_local_system ... ok
+test maxwell_hcurl_mapping_and_exact_sequence_commute ... ok
+test dg_transport_uses_each_interior_facet_once_with_conservative_oriented_scatter ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/fc9_realization.rs (/projects/sinbad/.show-build/debug/deps/fc9_realization-86b6a6f07bd045c0)
+
+running 7 tests
+test embedded_segment_quadrature_integrates_the_clipped_domain ... ok
+test fc9_contracts_refuse_ambiguous_or_malformed_data ... ok
+test sum_factorization_and_accelerator_packing_match_dense_meaning ... ok
+test variable_order_segments_and_affine_dependencies_preserve_polynomials ... ok
+test nonmatching_mortar_reproduces_traces_and_preserves_interface_work ... ok
+test partial_assembly_preserves_interpreter_jvp_and_affine_constraints ... ok
+test sv0_b3_provider_checks_all_global_realizations_and_transpose ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/gx_c1_mesh_profile.rs (/projects/sinbad/.show-build/debug/deps/gx_c1_mesh_profile-9b55ea346425ac9a)
+
+running 9 tests
+test box_realization_refuses_the_one_million_item_cap ... ok
+test box_realization_refuses_invalid_extent_and_subdivisions ... ok
+test refine_uniform_refuses_non_simplex_and_inconsistent_tags ... ok
+test segment_box_has_expected_topology_and_orientation ... ok
+test cad_rectangle_profile_tags_boundaries_and_regions ... ok
+test square_box_matches_sinbad_square_discretization ... ok
+test cube_box_matches_kuhn_decomposition_as_tet_vertex_sets ... ok
+test cad_family_profile_tags_annulus_boundaries_as_closed_loops ... ok
+test refine_uniform_preserves_measure_and_tag_partition_across_dimensions ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+
+     Running tests/gx_c2_region_tags.rs (/projects/sinbad/.show-build/debug/deps/gx_c2_region_tags-b30e46ebb91d1984)
+
+running 5 tests
+test essential_constraints_from_refuses_conflicting_corner_values ... ok
+test essential_constraints_from_refuses_unmapped_region ... ok
+test essential_constraints_from_supports_vector_fields_and_sampled_sources ... ok
+test essential_constraints_from_tags_matches_index_arithmetic_boundary_set ... ok
+test check_boundary_partition_accepts_a_full_cover_and_refuses_gaps_and_overlaps ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/gx_c3_field_source.rs (/projects/sinbad/.show-build/debug/deps/gx_c3_field_source-b288584cf7c50c36)
+
+running 4 tests
+test table_field_source_interpolates_linearly_and_refuses_out_of_range ... ok
+test field_source_identity_digests_differ_for_different_data ... ok
+test kernel_field_source_refuses_missing_tangent ... ok
+test kernel_field_source_reproduces_hand_closure_residual_and_jvp ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/gx_c4_facet_integrals.rs (/projects/sinbad/.show-build/debug/deps/gx_c4_facet_integrals-d54363d5c491ee9b)
+
+running 5 tests
+test interior_facet_is_refused_by_sampled_on_facets ... ok
+test unmapped_facet_region_is_refused ... ok
+test facet_load_vector_contribution_matches_the_hand_computed_single_facet_value ... ok
+test adjoint_identity_holds_with_a_facet_term_present ... ok
+test manufactured_neumann_problem_converges_at_the_p1_rate has been running for over 60 seconds
+test manufactured_neumann_problem_converges_at_the_p1_rate ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 97.61s
+
+     Running tests/gx_c5_capability.rs (/projects/sinbad/.show-build/debug/deps/gx_c5_capability-24ea1f9c10472fa8)
+
+running 3 tests
+test matrix_free_stays_nonsymmetric_with_an_affine_dependency_constraint ... ok
+test capability_reports_admitted_shape_and_symmetry_with_a_canonical_digest ... ok
+test matrix_free_and_assembled_declare_symmetric_when_provable ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/gx_c6_essential_constraints.rs (/projects/sinbad/.show-build/debug/deps/gx_c6_essential_constraints-4bcf85e19ccd80f0)
+
+running 3 tests
+test conflicting_and_unmapped_refusals_still_hold ... ok
+test per_component_selection_constrains_only_the_selected_components ... ok
+test kernel_valued_boundary_matches_closed_form_at_vertices ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/gx_f7_vjp.rs (/projects/sinbad/.show-build/debug/deps/gx_f7_vjp-60d63340f7705aab)
+
+running 7 tests
+test vjp_refuses_affine_dependency_constraints ... ok
+test vjp_passes_check_global_transpose ... ok
+test vjp_matches_jvp_adjoint_identity_for_nonlinear_dynamic_input ... ok
+test vjp_matches_jvp_adjoint_identity_for_scalar_poisson ... ok
+test capability_reports_vjp_only_when_executable ... ok
+test vjp_agrees_with_assembled_transpose ... ok
+test vjp_matches_jvp_adjoint_identity_for_vector_elasticity ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/result_inspection.rs (/projects/sinbad/.show-build/debug/deps/result_inspection-dda5ef551f818b76)
+
+running 2 tests
+test mismatched_mesh_invalid_extents_and_unsupported_basis_refuse ... ok
+test saved_scalar_and_vector_fields_and_cut_surfaces_match_owner_sampling ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/sv0_verification.rs (/projects/sinbad/.show-build/debug/deps/sv0_verification-7e09fbefaf57eace)
+
+running 5 tests
+test fallible_patch_stops_at_first_error_with_source_and_vertex_location ... ok
+test synthetic_checks_detect_wrong_values_transpose_and_nonrefinement ... ok
+test exact_sequence_reports_dimension_complete_stages ... ok
+test fallible_patch_preserves_the_numeric_report_and_identity ... ok
+test reports_are_canonical_kind_bound_and_tamper_evident ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sv1_c1_transpose.rs (/projects/sinbad/.show-build/debug/deps/sv1_c1_transpose-14647ce5941e6e53)
+
+running 7 tests
+test capability_reports_coefficient_products_for_a_stored_cell_coefficient ... ok
+test poisson_linearized_jacobian_satisfies_the_adjoint_identity_to_1e12 ... ok
+test nonlinear_shifted_jacobian_satisfies_the_adjoint_identity_at_a_nonzero_state ... ok
+test coefficient_jvp_matches_centered_differences_of_rebuilt_realizations ... ok
+test coefficient_jvp_and_vjp_are_exact_transposes_for_every_layout ... ok
+test matrix_free_and_assembled_transposes_agree_with_the_materialized_csr_transpose ... ok
+test adjoint_gradient_of_the_objective_matches_centered_differences_with_tightening_error ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+     Running tests/sv2_elasticity.rs (/projects/sinbad/.show-build/debug/deps/sv2_elasticity-35cb7ba42ff4e60f)
+
+running 7 tests
+test analytic_body_force_matches_numeric_divergence ... ok
+test load_vector_matches_hand_for_single_tet ... ok
+test rotations_about_the_clamped_vertex_are_exact_nullspace_modes ... ok
+test single_tet_stiffness_matches_hand_formula ... ok
+test elasticity_patch_test_recovers_the_linear_field_exactly ... ok
+test jacobian_matches_residual_finite_differences_on_elasticity ... ok
+test manufactured_displacement_converges_second_order ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.68s
+
+     Running tests/sv2b1_p2_element.rs (/projects/sinbad/.show-build/debug/deps/sv2b1_p2_element-76f0b6d80b1999af)
+
+running 5 tests
+test p2_element_and_dof_map_refuse_malformed_shapes ... ok
+test p2_basis_is_a_partition_of_unity_with_a_consistent_zero_gradient_sum ... ok
+test p2_dof_map_has_no_overlap_or_gap_and_orders_deterministically ... ok
+test p2_basis_is_kronecker_delta_nodal_and_gradients_match_finite_differences ... ok
+test p2_poisson_converges_at_order_three_in_l2_on_a_manufactured_solution ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.23s
+
+     Running tests/sv2b4_system_stokes.rs (/projects/sinbad/.show-build/debug/deps/sv2b4_system_stokes-5d88d0f7904e10b1)
+
+running 10 tests
+test mcpu_s_empty_mesh_preserves_zero_operator_assembly ... ok
+test system_operator_load_vector_zero_source_is_zero_and_nonzero_source_matches_partition_of_unity ... ok
+test equation_sign_flips_the_load_vectors_row_consistently_with_the_operator ... ok
+test unsigned_stokes_operator_reports_unknown_symmetry_and_minres_refuses_it ... ok
+test mcpu_s_exterior_facet_assembly_retains_the_reference_route ... ok
+test mcpu_s_three_dimensional_elasticity_assembly_matches_global_columns ... ok
+test signed_stokes_system_matches_mixed_operator_and_minres_converges ... ok
+test nonzero_body_force_stokes_system_solves_to_a_nontrivial_solution_matching_an_independent_dense_solve ... ok
+test mcpu_s_mixed_assembly_matches_every_global_column_and_reduces_kernel_calls ... ok
+test mixed_darcy_rt0_p0_system_realizes_and_minres_converges_matching_an_independent_dense_reference ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.24s
+
+     Running tests/sv2b_mixed.rs (/projects/sinbad/.show-build/debug/deps/sv2b_mixed-54ce25b7ff0dbfc9)
+
+running 13 tests
+test essential_constraints_for_blocks_refuses_unknown_blocks_out_of_range_entries_and_conflicts ... ok
+test mixed_space_refuses_malformed_field_shapes ... ok
+test mixed_layout_has_no_overlap_or_gap_and_orders_deterministically ... ok
+test mixed_operator_refuses_malformed_couplings ... ok
+test nullspace_candidate_refuses_unknown_or_non_scalar_blocks_and_bad_tolerances ... ok
+test digest_is_content_addressed_over_space_and_couplings ... ok
+test reduced_refuses_a_constraint_set_of_the_wrong_dimension ... ok
+test pressure_like_nullspace_candidate_round_trips_and_matches_expected_structure ... ok
+test symmetric_gradient_gradient_coupling_agrees_with_independent_reference_and_differs_from_plain_gradient_gradient ... ok
+test dirichlet_elimination_makes_the_pressure_nullspace_candidate_verify_against_the_reduced_operator ... ok
+test block_apply_agrees_with_an_independently_assembled_monolithic_reference ... ok
+test divergence_value_coupling_agrees_with_reference_for_a_p2_scalar_trial_field ... ok
+test minres_converges_on_the_reduced_saddle_point_system_and_matches_a_dense_reduced_reference ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/w7_infsup.rs (/projects/sinbad/.show-build/debug/deps/w7_infsup-5313f06f2288d1d7)
+
+running 5 tests
+test inf_sup_refusals_are_typed ... ok
+test inf_sup_estimate_is_independent_of_the_equation_sign_gauge ... ok
+test rt0_p0_darcy_is_inf_sup_stable ... ok
+test p1_p1_stokes_is_refused_with_spurious_pressure_modes ... ok
+test taylor_hood_stokes_is_inf_sup_stable_with_a_mesh_robust_constant ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.77s
+
+     Running tests/w7_p_system_state_dependent.rs (/projects/sinbad/.show-build/debug/deps/w7_p_system_state_dependent-33b45ebe03e0dcd1)
+
+running 7 tests
+test a_kernel_without_a_tangent_for_its_state_input_is_refused_typed ... ok
+test zero_point_linear_view_and_load_vector_are_the_stateful_actions_at_zero ... ok
+test residual_centered_differences_match_the_jvp_at_a_nonzero_state ... ok
+test jvp_and_vjp_are_exact_transposes_at_a_nonzero_state ... ok
+test reduced_operator_is_a_consistent_transposable_dae_operator ... ok
+test kernel_field_sources_carry_exact_property_tangents_into_the_system_path ... ok
+test bdf_steps_advance_the_reduced_transient_system ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.60s
+
+     Running tests/w7_rt0_essential.rs (/projects/sinbad/.show-build/debug/deps/w7_rt0_essential-aaa7066c35406f5e)
+
+running 2 tests
+test uniform_outward_flux_datum_lifts_to_the_divergence_theorem_total ... ok
+test impermeable_walls_as_rt0_essential_constraints_restore_the_constant_pressure_kernel ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.58s
+
+     Running tests/w7_sc_w1_block_actions.rs (/projects/sinbad/.show-build/debug/deps/w7_sc_w1_block_actions-f2ab66050d1a897f)
+
+running 4 tests
+test composed_system_ids_are_dense_and_key_a_two_instance_layout ... ok
+test one_instance_system_ids_are_the_identity_maps_and_key_the_layout ... ok
+test system_block_operator_is_a_transposable_methodus_operator_and_refuses_bad_shapes ... ok
+test block_actions_partition_the_full_jacobian_and_transpose_exactly ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+
+     Running tests/w7_sc_w1_interface.rs (/projects/sinbad/.show-build/debug/deps/w7_sc_w1_interface-8217e5ce1e4fe8b6)
+
+running 5 tests
+test interface_binding_refusals_are_typed ... ok
+test gradient_trace_consistency_term_on_a_discontinuous_p1_field_matches_the_closed_form ... ok
+test two_field_p1_interface_coupling_assembles_segment_mass_matrices_on_the_shared_nodes ... ok
+test normal_dependent_flux_is_orientation_invariant_exactly_when_the_swap_receipt_passes ... ok
+test p0_jump_penalty_assembles_the_facet_weighted_graph_laplacian_and_is_orientation_invariant ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/w7_sc_w1_scientia_ids.rs (/projects/sinbad/.show-build/debug/deps/w7_sc_w1_scientia_ids-0464e038f7989886)
+
+running 3 tests
+test implicit_one_instance_system_ids_from_scientia_equal_finitums_identity_map ... ok
+test declared_two_instance_system_ids_from_scientia_equal_finitums_dense_composition ... ok
+test typed_inf_sup_obligations_bind_the_pairing_finitum_derives_structurally ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/w7_system_path_parity.rs (/projects/sinbad/.show-build/debug/deps/w7_system_path_parity-8ee83f6bcf7d3c56)
+
+running 12 tests
+test the_design_vector_is_part_of_the_system_operator_identity ... ok
+test system_coefficient_bindings_are_refused_typed ... ok
+test one_instance_nonlinear_heat_on_the_barycenter_rule_reproduces_the_default_plan_bitwise ... ok
+test a_closure_bound_input_refuses_the_transient_agreement_report_typed_and_named ... ok
+test one_instance_poisson_reproduces_the_realization_agreement_report_and_receipts ... ok
+test one_instance_nonlinear_heat_reproduces_the_single_model_products_at_a_nonzero_state ... ok
+test one_instance_poisson_on_the_barycenter_rule_reproduces_the_default_plan_bitwise ... ok
+test mcpu_s_scalar_assembly_matches_every_global_column ... ok
+test one_instance_poisson_reproduces_the_single_model_products_on_cell_and_vertex_layouts ... ok
+test one_instance_transient_diffusion_with_all_table_inputs_reproduces_the_agreement_report ... ok
+test system_path_residual_and_jvp_cost_is_recorded_against_the_single_model_plan ... ok
+test nonlinear_heat_final_time_nodal_ladder_on_the_system_path_recovers_second_order has been running for over 60 seconds
+test nonlinear_heat_final_time_nodal_ladder_on_the_system_path_recovers_second_order ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 180.78s
+
+     Running tests/w7_system_path_symmetry.rs (/projects/sinbad/.show-build/debug/deps/w7_system_path_symmetry-6a90db6cd147f8d0)
+
+running 2 tests
+test poisson_is_structurally_symmetric_and_its_proof_confirms_the_claim ... ok
+test linear_elasticity_is_admitted_by_conjugate_gradient_only_after_its_symmetry_proof ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.87s
+
+     Running tests/w8_fallible_inputs.rs (/projects/sinbad/.show-build/debug/deps/w8_fallible_inputs-a0f122aa912b5296)
+
+running 9 tests
+test a_failing_table_builder_refuses_at_construction_with_a_table_origin_on_the_all_table_transient_path ... ok
+test among_inputs_refusing_at_the_same_point_the_first_in_declaration_order_wins ... ok
+test a_p1_input_refusing_at_one_quadrature_point_is_located_and_carried_by_every_action ... ok
+test transient_dirichlet_data_g_of_t_is_sampled_at_the_requested_time_on_both_paths ... ok
+test fallible_p1_products_match_finite_differences_transpose_and_assembly ... ok
+test finitum_s_own_bound_property_table_refuses_typed_at_runtime_instead_of_nan_or_a_panic ... ok
+test fallible_field_sources_feed_time_sampled_tables_and_runtime_time_constitutive_inputs ... ok
+test a_system_constitutive_refusal_is_located_and_carried_through_the_reduced_dae_operator ... ok
+test fallible_system_products_match_finite_differences_transpose_and_assembly ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+     Running tests/w8_field_sampler.rs (/projects/sinbad/.show-build/debug/deps/w8_field_sampler-7a131cc843a3f131)
+
+running 6 tests
+test scalar_p2_sampler_agrees_with_the_realization_plan_at_its_quadrature_points ... ok
+test scalar_p1_sampler_agrees_with_the_realization_plan_at_its_quadrature_points ... ok
+test vector_p1_sampler_agrees_with_the_elasticity_plan_in_three_dimensions ... ok
+test a_system_field_outside_the_sampled_families_is_refused_by_name ... ok
+test taylor_hood_samplers_agree_with_the_stokes_system_operator ... ok
+test rt0_and_p0_samplers_agree_with_the_mixed_darcy_system_operator ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/w8_functional.rs (/projects/sinbad/.show-build/debug/deps/w8_functional-cd59d1880d8943e2)
+
+running 16 tests
+test coefficient_weight_indices_refuse_instead_of_panicking ... ok
+test rate_pullback_is_separate_from_state ... ok
+test functional_from_another_model_in_same_module_is_refused ... ok
+test keyed_sampler_preserves_one_instance_values ... ok
+test constant_argument_provider_can_be_an_independent_design ... ok
+test quadratic_value_and_gradient_functionals_are_exact_and_adjoint ... ok
+test reverse_overflow_is_a_located_refusal ... ok
+test composed_bound_input_is_not_an_independent_functional_design ... ok
+test cell_and_vertex_design_pullbacks_use_functional_quadrature ... ok
+test nested_provider_argument_graph_has_complete_chain_rule ... ok
+test independent_provider_binding_cannot_erase_argument_dependencies ... ok
+test frozen_nested_provider_needs_no_argument_product_but_active_design_does ... ok
+test elastic_stress_trace_accumulates_indexed_tensor_pullbacks ... ok
+test rehashed_cyclic_argument_metadata_is_refused_at_bind ... ok
+test unavailable_derivative_and_callback_failure_keep_origin_and_time ... ok
+test repeated_instance_sampling_and_functional_scatter_are_distinct ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/w8_multi_instance_system.rs (/projects/sinbad/.show-build/debug/deps/w8_multi_instance_system-561759e3a3884511)
+
+running 10 tests
+test keyed_essential_constraints_touch_only_the_named_instance_and_reduce ... ok
+test two_instances_of_one_model_realize_as_distinct_blocks ... ok
+test fallible_closures_on_the_composed_path_surface_typed_with_their_origin ... ok
+test self_referential_output_bind_is_refused_before_evaluation ... ok
+test composed_bind_time_refusals_are_typed ... ok
+test one_output_can_feed_two_consumers_with_complete_derivatives ... ok
+test composed_receipts_name_both_instances_and_the_binds ... ok
+test mcpu_s_composed_assembly_matches_every_global_column ... ok
+test composed_electrothermal_matches_monolithic_08_per_block_and_cross_block ... ok
+test composed_bind_transposes_and_linearizations_are_exact ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.25s
+
+     Running tests/w8_prescribed_motion.rs (/projects/sinbad/.show-build/debug/deps/w8_prescribed_motion-3bc715783e1434ed)
+
+running 5 tests
+test callback_failures_are_located_and_static_identity_is_preserved ... ok
+test paired_sources_project_vector_p2_edge_targets_and_check_overlap ... ok
+test fixed_topology_and_nonfinite_rates_are_checked ... ok
+test state_rate_jvp_fd_and_shifted_transpose ... ok
+test moving_boundary_mass_contribution_and_bdf_trajectory ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+

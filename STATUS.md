@@ -1,5 +1,18 @@
 # Finitum status
 
+SC-W2 first matching-interface implementation (2026-09-17):
+ConnectionRealizationPlan checks complete bijective exterior facet/vertex
+coverage, opposite normals/measures, scientific-source, model and mesh identity,
+scalar P1 traces, row orientation and essential-constraint non-overlap.
+Only a matching proof admits Open boundary terms. Affine trace identification
+and transpose restriction supply equality and outward balance; gaps, partial
+coverage, same-facing normals and nonmatching meshes refuse.
+Owner gate: 246 tests across 35 targets, fmt, strict all-feature clippy, rustdoc
+and doctests pass with unchanged source hashes. Sinbad final acceptance is pending.
+Scientia dependency: `c0d28f87e24e5be2d908dc3d726c549866e8f633`.
+Evidence: `docs/validation/2026-09-17-sc-w2/`.
+
+
 Updated: 2026-09-17
 SHOW-1 inspection primitives (2026-09-17): validated portable simplex meshes,
 exact P1 cell-vertex samples via FieldSampler, and clipped exterior/cap geometry

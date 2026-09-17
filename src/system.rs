@@ -150,6 +150,48 @@ impl SystemRealizationPlan {
         layout: BlockLayout,
         quadrature: SystemQuadrature,
     ) -> Result<Self, FinitumError> {
+        Self::with_connections(system, mesh, layout, quadrature, &[])
+    }
+
+    /// Admit open boundary data only through geometry-checked matching connections.
+    pub fn with_connections(
+        system: OperatorSystem,
+        mesh: Mesh,
+        layout: BlockLayout,
+        quadrature: SystemQuadrature,
+        connections: &[crate::ConnectionRealizationPlan],
+    ) -> Result<Self, FinitumError> {
+        for block in &system.blocks {
+            for term in &block.form.receipt.boundary_terms {
+                if let scientia::BoundaryTermDisposition::Open { port, field, .. } =
+                    &term.disposition
+                {
+                    if !connections.iter().any(|c| {
+                        c.admits(
+                            &mesh,
+                            &system.source_semantic_digest,
+                            &system.model,
+                            term.region,
+                            *field,
+                            port,
+                        )
+                    }) {
+                        return Err(FinitumError::UnsupportedRealization(format!(
+                            "CONNECTION_UNCLOSED: {port}"
+                        )));
+                    }
+                    if !block.requirements.elements.iter().any(|e| {
+                        e.symbol == *field
+                            && e.family == ElementFamilyRequirement::H1
+                            && e.polynomial_order == 1
+                    }) {
+                        return Err(FinitumError::UnsupportedRealization(
+                            "CONNECTION_TRACE_UNSUPPORTED: scalar H1 P1 required".into(),
+                        ));
+                    }
+                }
+            }
+        }
         for symbol in &system.field_order {
             if layout.block(*symbol).is_none() {
                 return Err(FinitumError::ArtifactMismatch(format!(
@@ -241,7 +283,19 @@ impl SystemRealizationPlan {
         } else {
             (None, None)
         };
-        let artifact_digest = digest_plan(&system, &mesh, &layout, &facets, quadrature);
+        let base_digest = digest_plan(&system, &mesh, &layout, &facets, quadrature);
+        let artifact_digest = if connections.is_empty() {
+            base_digest
+        } else {
+            let identities = connections
+                .iter()
+                .map(crate::ConnectionRealizationPlan::identity)
+                .collect::<Vec<_>>();
+            Digest::blake3(
+                &serde_json::to_vec(&("finitum-connected-realization/1", base_digest, identities))
+                    .expect("connection identity serializes"),
+            )
+        };
         let rows = system
             .blocks
             .iter()
@@ -324,6 +378,19 @@ impl SystemRealizationPlan {
                         record.instance, record.model_name
                     ))
                 })?;
+            if model_system.blocks.iter().any(|b| {
+                b.form.receipt.boundary_terms.iter().any(|t| {
+                    matches!(
+                        t.disposition,
+                        scientia::BoundaryTermDisposition::Open { .. }
+                    )
+                })
+            }) {
+                return Err(FinitumError::UnsupportedRealization(
+                    "CONNECTION_UNCLOSED: open ports require separate matching realization groups"
+                        .into(),
+                ));
+            }
             let expected = &system_ids.instances()[index].artifact_digest;
             if &model_system.artifact_digest != expected {
                 return Err(FinitumError::ArtifactMismatch(format!(
@@ -3074,6 +3141,25 @@ impl SystemOperator {
 
     pub fn layout(&self) -> &BlockLayout {
         self.data.plan.layout()
+    }
+
+    pub(crate) fn connection_row_scale(&self, field: SymbolId) -> Result<f64, FinitumError> {
+        let rows = self
+            .data
+            .plan
+            .system
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.row == field)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let [row] = rows.as_slice() else {
+            return Err(FinitumError::UnsupportedRealization(
+                "CONNECTION_ROW_AMBIGUOUS".into(),
+            ));
+        };
+        Ok(self.data.equation_sign.get(row).copied().unwrap_or(1.0))
     }
 
     pub fn dimension(&self) -> usize {

@@ -4,6 +4,7 @@ mod adaptivity;
 mod block;
 mod cad_geometry;
 mod condensation;
+mod connection;
 mod constraint;
 mod element;
 mod embedded;
@@ -32,6 +33,7 @@ pub use cad_geometry::{
     CadGeometrySource, CadNodeAssociation, CadParameterCoordinate, CadPrimalPlan,
 };
 pub use condensation::{CondensedLocalSystem, static_condense};
+pub use connection::ConnectionRealizationPlan;
 pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
