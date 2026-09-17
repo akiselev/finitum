@@ -1,0 +1,41 @@
+   Compiling finitum v0.1.0 (/tmp/sinbad-mcpu-s/finitum)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1m 50s
+     Running tests/sv2b4_system_stokes.rs (/projects/sinbad/.mcpu-build/debug/deps/sv2b4_system_stokes-26e5247947706165)
+
+running 4 tests
+test mcpu_s_empty_mesh_preserves_zero_operator_assembly ... M-CPU-S empty mesh: dimension=3, assembly=631ns, exhaustive=893ns
+ok
+test mcpu_s_exterior_facet_assembly_retains_the_reference_route ... M-CPU-S Darcy exterior facets: dimension=24, assembly=14.24921ms, exhaustive=17.81134ms
+ok
+test mcpu_s_mixed_assembly_matches_every_global_column_and_reduces_kernel_calls ... M-CPU-S mixed input evaluations: 2832 -> 720
+M-CPU-S Taylor-Hood mixed Stokes: dimension=59, assembly=33.527806ms, exhaustive=125.054817ms
+ok
+test mcpu_s_three_dimensional_elasticity_assembly_matches_global_columns ... M-CPU-S 3D elasticity: dimension=24, assembly=66.704428ms, exhaustive=119.076142ms
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.80s
+
+     Running tests/w7_system_path_parity.rs (/projects/sinbad/.mcpu-build/debug/deps/w7_system_path_parity-d4ee10beafb762d9)
+
+running 1 test
+test mcpu_s_scalar_assembly_matches_every_global_column ... M-CPU-S variable-coefficient Poisson: dimension=9, assembly=775.819µs, exhaustive=2.177327ms
+M-CPU-S nonlinear heat zero-point JVP: dimension=9, assembly=951.908µs, exhaustive=3.77659ms
+M-CPU-S variable-coefficient Poisson: dimension=9, assembly=4.257063ms, exhaustive=8.153985ms
+M-CPU-S nonlinear heat zero-point JVP: dimension=9, assembly=4.608426ms, exhaustive=14.139774ms
+M-CPU-S variable-coefficient Poisson: dimension=25, assembly=2.421542ms, exhaustive=19.430221ms
+M-CPU-S nonlinear heat zero-point JVP: dimension=25, assembly=3.533476ms, exhaustive=21.086482ms
+M-CPU-S variable-coefficient Poisson: dimension=25, assembly=7.798781ms, exhaustive=122.84993ms
+M-CPU-S nonlinear heat zero-point JVP: dimension=25, assembly=29.048335ms, exhaustive=175.853684ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.62s
+
+     Running tests/w8_multi_instance_system.rs (/projects/sinbad/.mcpu-build/debug/deps/w8_multi_instance_system-e7ad6e55683b9b06)
+
+running 1 test
+test mcpu_s_composed_assembly_matches_every_global_column ... M-CPU-S composed electrothermal: dimension=18, assembly=6.645514ms, exhaustive=19.113981ms
+M-CPU-S composed electrothermal: dimension=18, assembly=31.680621ms, exhaustive=93.683538ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.24s
+

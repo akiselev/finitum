@@ -1302,3 +1302,177 @@ fn equation_sign_flips_the_load_vectors_row_consistently_with_the_operator() {
         assert_eq!(signed_action[index], unsigned_action[index]);
     }
 }
+
+#[path = "support/mcpu_assembly.rs"]
+mod mcpu_assembly;
+
+#[test]
+fn mcpu_s_mixed_assembly_matches_every_global_column_and_reduces_kernel_calls() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let compiled = compile_stokes();
+    let mesh = unit_square(2);
+    let layout = taylor_hood_layout(&mesh.mesh, compiled.velocity, compiled.pressure);
+    let plan =
+        SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let constitutive = stokes_constitutive(&compiled.system, move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+        [0.0, 0.0]
+    });
+    let operator = plan.bind_kernels(constitutive, BTreeMap::new()).unwrap();
+    operator.assemble().unwrap();
+    let local_calls = calls.swap(0, Ordering::Relaxed);
+    let n = operator.dimension();
+    let mut direction = vec![0.0; n];
+    let mut output = vec![0.0; n];
+    for column in 0..n {
+        direction[column] = 1.0;
+        operator.apply_action(&direction, &mut output).unwrap();
+        direction[column] = 0.0;
+    }
+    let exhaustive_calls = calls.load(Ordering::Relaxed);
+    assert!(
+        local_calls > 0,
+        "the cost probe must observe generated-kernel inputs"
+    );
+    assert!(
+        local_calls < exhaustive_calls,
+        "cell-local {local_calls}, exhaustive {exhaustive_calls}"
+    );
+    eprintln!("M-CPU-S mixed input evaluations: {exhaustive_calls} -> {local_calls}");
+    mcpu_assembly::compare(&operator, "Taylor-Hood mixed Stokes");
+}
+
+#[test]
+fn mcpu_s_exterior_facet_assembly_retains_the_reference_route() {
+    let compiled = compile_darcy();
+    let mesh = darcy_box(1);
+    let facets = FacetTopology::from_mesh(&mesh.mesh).unwrap();
+    let (layout, _) = darcy_layout(&mesh.mesh, &facets, compiled.flux, compiled.pressure);
+    let plan =
+        SystemRealizationPlan::new(compiled.system.clone(), mesh.mesh.clone(), layout).unwrap();
+    let region = compiled
+        .system
+        .blocks
+        .iter()
+        .flat_map(|b| &b.factorization.integrals)
+        .find_map(|i| match i.measure {
+            SemanticMeasure::ExteriorFacet { region } => Some(region),
+            _ => None,
+        })
+        .unwrap();
+    let facet_regions =
+        facet_membership_from(&mesh, &darcy_walls_region_map(region), [region]).unwrap();
+    let operator = plan
+        .bind_kernels_with_facets(
+            darcy_constitutive(&compiled.system),
+            BTreeMap::from([("mass_balance".to_owned(), -1.0)]),
+            facet_regions,
+        )
+        .unwrap();
+    assert!(
+        operator.element_assembly(1).is_err(),
+        "facet element assembly remains explicitly unsupported"
+    );
+    mcpu_assembly::compare(&operator, "Darcy exterior facets");
+}
+
+#[test]
+fn mcpu_s_three_dimensional_elasticity_assembly_matches_global_columns() {
+    let source = include_str!("fixtures/corpus/17-linear-elasticity.res");
+    let compilation = compile_semantics(source, &UnitRegistry::si_bootstrap()).unwrap();
+    let system =
+        compile_operator_system(&compilation.semantic, "LinearElasticity", &["momentum"]).unwrap();
+    let mesh = realize(&MeshProfile::SimplexBox {
+        dimension: 3,
+        extent: vec![[0.0, 1.0]; 3],
+        subdivisions: vec![1; 3],
+    })
+    .unwrap();
+    let field = system.blocks[0].row;
+    let layout = BlockLayout::new([(field, mesh.mesh.vertices().len(), 3)]).unwrap();
+    let plan = SystemRealizationPlan::new(system.clone(), mesh.mesh.clone(), layout).unwrap();
+    fn elastic_stress(e: &[f64]) -> Vec<f64> {
+        assert_eq!(e.len(), 9);
+        let trace = e[0] + e[4] + e[8];
+        e.iter()
+            .enumerate()
+            .map(|(i, v)| 2.0 * v + if i % 4 == 0 { 1.25 * trace } else { 0.0 })
+            .collect()
+    }
+    let mut inputs = Vec::new();
+    for block in &system.blocks {
+        for integral in &block.factorization.integrals {
+            for input in &integral.primal.inputs {
+                if input.source == InputSourceRequirement::Basis {
+                    continue;
+                }
+                let components = input.shape.iter().product::<usize>().max(1);
+                let binding = if components == 9 {
+                    SystemConstitutiveInput::try_new(
+                        block.equation.clone(),
+                        integral.integral_index,
+                        input.id,
+                        components,
+                        "mcpu-s/elastic-stress",
+                        |e: &PointEvaluation| {
+                            Ok(elastic_stress(
+                                e.values(DerivativeEvaluation::SymmetricGradient).unwrap(),
+                            ))
+                        },
+                        |_: &PointEvaluation, d: &PointEvaluation| {
+                            Ok(elastic_stress(
+                                d.values(DerivativeEvaluation::SymmetricGradient).unwrap(),
+                            ))
+                        },
+                    )
+                } else {
+                    assert_eq!(
+                        components, 3,
+                        "only body force may remain outside the stress kernel"
+                    );
+                    SystemConstitutiveInput::try_new(
+                        block.equation.clone(),
+                        integral.integral_index,
+                        input.id,
+                        components,
+                        "mcpu-s/elastic-force",
+                        move |_: &PointEvaluation| Ok(vec![0.0; components]),
+                        move |_: &PointEvaluation, _: &PointEvaluation| Ok(vec![0.0; components]),
+                    )
+                };
+                inputs.push(binding.unwrap());
+            }
+        }
+    }
+    let operator = plan.bind_kernels(inputs, BTreeMap::new()).unwrap();
+    assert!(
+        operator
+            .assemble()
+            .unwrap()
+            .values()
+            .iter()
+            .any(|v| v.abs() > 0.1)
+    );
+    mcpu_assembly::compare(&operator, "3D elasticity");
+}
+
+#[test]
+fn mcpu_s_empty_mesh_preserves_zero_operator_assembly() {
+    let compiled = compile_stokes();
+    let mesh = Mesh::new(2, vec![vec![0.0, 0.0]], vec![]).unwrap();
+    let layout = taylor_hood_layout(&mesh, compiled.velocity, compiled.pressure);
+    let plan = SystemRealizationPlan::new(compiled.system.clone(), mesh, layout).unwrap();
+    let operator = plan
+        .bind_kernels(
+            stokes_constitutive(&compiled.system, |_| [0.0, 0.0]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+    assert!(operator.assemble().unwrap().values().is_empty());
+    mcpu_assembly::compare(&operator, "empty mesh");
+}

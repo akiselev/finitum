@@ -1,6 +1,15 @@
 # Finitum status
 
-Updated: 2026-09-08
+Updated: 2026-09-17
+M-CPU-S isolated candidate (2026-09-17): cell-local CSR assembly and scratch reuse
+pass the full owner gate (243 tests across 33 targets), six focused assembly/symmetry
+comparisons, fmt, warnings-denied all-target/all-feature clippy and rustdoc, and
+doctests. [Validation record](docs/validation/2026-09-17-mcpu-s/README.md).
+The mixed-case assembly input evaluations drop from 2,832 to 720. No whole-case
+speedup is claimed. Exterior-facet/empty-mesh probing, reduced/linearized assembly,
+proof tolerance and dimension cap are unchanged. The isolated Sinbad consumer gate
+is pending; this candidate does not close W8 or advance the primary source tuple.
+
 Current W8 follow-up (2026-09-08): `BoundPointExpression::require_derivatives()` uses a
 construction-cached structural activity proof over the compiler argument DAG, semantic fields,
 independent captures, and Malleus primal output read proofs. Frozen/zero primitives stop the

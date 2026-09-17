@@ -1921,3 +1921,20 @@ fn system_path_residual_and_jvp_cost_is_recorded_against_the_single_model_plan()
         }
     }
 }
+
+#[path = "support/mcpu_assembly.rs"]
+mod mcpu_assembly;
+
+#[test]
+fn mcpu_s_scalar_assembly_matches_every_global_column() {
+    for subdivisions in [2, 4] {
+        let mesh = unit_square(subdivisions);
+        for rule in [SystemQuadrature::Barycenter, SystemQuadrature::Richest] {
+            let design = nodal_design(&mesh);
+            let pair = poisson_pair(&mesh, CoefficientLayout::Vertex, &design, rule);
+            mcpu_assembly::compare(pair.reduced.operator(), "variable-coefficient Poisson");
+            let pair = nonlinear_heat_pair(&mesh, &cell_design(&mesh), rule);
+            mcpu_assembly::compare(pair.reduced.operator(), "nonlinear heat zero-point JVP");
+        }
+    }
+}

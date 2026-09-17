@@ -1921,3 +1921,15 @@ pub system SelfHeat {
         matches!(result, Err(FinitumError::UnsupportedRealization(message)) if message.contains("algebraic loop"))
     );
 }
+
+#[path = "support/mcpu_assembly.rs"]
+mod mcpu_assembly;
+
+#[test]
+fn mcpu_s_composed_assembly_matches_every_global_column() {
+    let mesh = unit_square(2);
+    for rule in [SystemQuadrature::Barycenter, SystemQuadrature::Richest] {
+        let composed = composed_electrothermal(&mesh, rule);
+        mcpu_assembly::compare(&composed.operator, "composed electrothermal");
+    }
+}

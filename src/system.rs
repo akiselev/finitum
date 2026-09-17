@@ -3791,14 +3791,17 @@ impl SystemOperator {
         let dimension = self.dimension();
         let zero = vec![0.0; dimension];
         let restrictions = self.cell_restrictions();
+        // M-CPU-S: allocate global work vectors once. Each cell action only scatters
+        // into its restriction, so resetting those entries avoids global-size work
+        // for every local column while preserving the existing cell JVP evaluator.
+        let mut direction = vec![0.0; dimension];
+        let mut output = vec![0.0; dimension];
         let mut local_matrices = Vec::with_capacity(restrictions.len());
         for (cell, restriction) in restrictions.iter().enumerate() {
             let local_dimension = restriction.dofs.len();
             let mut matrix = vec![0.0; local_dimension * local_dimension];
             for (column, dof) in restriction.dofs.iter().enumerate() {
-                let mut direction = vec![0.0; dimension];
                 direction[dof.0] = 1.0;
-                let mut output = vec![0.0; dimension];
                 self.apply_cell_blocks(
                     cell,
                     0.0,
@@ -3813,8 +3816,11 @@ impl SystemOperator {
                 )?;
                 for (row, row_dof) in restriction.dofs.iter().enumerate() {
                     matrix[row * local_dimension + column] = output[row_dof.0];
+                    output[row_dof.0] = 0.0;
                 }
+                direction[dof.0] = 0.0;
             }
+            validate_finite("system element matrix", &matrix)?;
             local_matrices.push(matrix);
         }
         ElementAssemblyOperator::new(
@@ -4270,9 +4276,42 @@ impl SystemOperator {
         })
     }
 
-    /// Canonical CSR assembly by unit-column probing of [`Self::apply_action`], mirroring
-    /// `RealizationPlan::assemble`/`MixedOperator::assemble`.
+    /// Canonical CSR assembly of the zero-point action from the existing cell-local
+    /// JVP matrices. Exterior-facet operators retain exhaustive action probing until
+    /// element assembly covers their facet terms. No structural symmetry claim is
+    /// substituted for evaluating the generated kernels.
     pub fn assemble(&self) -> Result<methodus::CsrMatrix, FinitumError> {
+        if !self.data.facet_regions.is_empty() || self.data.plan.mesh().cells().is_empty() {
+            return self.assemble_by_probing();
+        }
+        let element = self.element_assembly(1)?;
+        let restrictions = self.cell_restrictions();
+        // Accumulate in cell order, not CsrMatrix's value-sorted duplicate order.
+        // Only one triplet per global entry reaches the canonical CSR constructor.
+        let mut entries = BTreeMap::<(usize, usize), f64>::new();
+        for (restriction, matrix) in restrictions.iter().zip(element.local_matrices()) {
+            let width = restriction.dofs.len();
+            for (row, row_dof) in restriction.dofs.iter().enumerate() {
+                for (column, column_dof) in restriction.dofs.iter().enumerate() {
+                    let value = matrix[row * width + column];
+                    if value != 0.0 {
+                        *entries.entry((row_dof.0, column_dof.0)).or_default() += value;
+                    }
+                }
+            }
+        }
+        methodus::CsrMatrix::from_triplets(
+            self.dimension(),
+            self.dimension(),
+            entries
+                .into_iter()
+                .map(|((row, column), value)| (row, column, value))
+                .collect(),
+        )
+        .map_err(|error| FinitumError::Assembly(error.to_string()))
+    }
+
+    fn assemble_by_probing(&self) -> Result<methodus::CsrMatrix, FinitumError> {
         let dimension = self.dimension();
         let mut entries = Vec::new();
         let mut direction = vec![0.0; dimension];
