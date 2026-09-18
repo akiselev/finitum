@@ -10,8 +10,8 @@ owns local executable kernels, Krasis owns state/history, and Methodus owns
 numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
-SHOW-3 / SC-W3 additions are implemented and in acceptance. The complete owner
-gate and final Sinbad consumer gate remain separate requirements.
+SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes (249 tests across 36 targets); final Sinbad consumer coverage passes (210 tests across 35 targets with a documented
+external-fixture target retry).
 
 ## Current additions
 
@@ -32,7 +32,7 @@ gate and final Sinbad consumer gate remain separate requirements.
   coverage per coarse facet. It constructs weighted constraints and exposes
   continuity and dual-residual balance checks. Steady heat and species consumers
   exercise the product policy; arbitrary nonnested partitions refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate pending.
+- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 249 tests across 36 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 ## Accepted recent gates
 
@@ -95,3 +95,5 @@ gate and final Sinbad consumer gate remain separate requirements.
 Detailed FC/GX/W8 history and superseded audit findings remain in Git history.
 This compact ledger replaces the accumulated historical work log; recorded gate
 artifacts remain in `docs/validation/`.
+
+Final cross-repository evidence: [September 18 acceptance](../sinbad/docs/validation/2026-09-18-assembly/README.md).
