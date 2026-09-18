@@ -8,6 +8,10 @@ use scientia::ports::ConnectionSet;
 use scientia::{RegionId, SymbolId};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+mod nonmatching;
+
+/// Target trace vertex followed by weighted source trace vertices.
+pub type TraceInterpolationRow = (usize, Vec<(usize, f64)>);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ConnectionRealizationPlan {
@@ -19,11 +23,13 @@ pub struct ConnectionRealizationPlan {
     fields: [SymbolId; 2],
     facet_pairs: Vec<[usize; 2]>,
     vertex_pairs: Vec<[usize; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonmatching: Option<(crate::SurfaceTransfer, Vec<usize>)>,
     tolerance: f64,
     identity: String,
 }
 fn failure(message: impl Into<String>) -> FinitumError {
-    FinitumError::InvalidRealization(format!("CONNECTION_MATCHING: {}", message.into()))
+    FinitumError::InvalidRealization(format!("CONNECTION_TRACE: {}", message.into()))
 }
 impl ConnectionRealizationPlan {
     /// Every selected exterior facet must have exactly one geometrically coincident partner
@@ -133,6 +139,26 @@ impl ConnectionRealizationPlan {
         if used != selected[1] {
             return Err(failure("uncovered partner facets"));
         }
+        Self::finish(
+            system,
+            relation,
+            meshes,
+            pairs,
+            vertex_map.into_iter().map(|(a, b)| [a, b]).collect(),
+            None,
+            tolerance,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        system: &ScientificSystem,
+        relation: &ConnectionSet,
+        meshes: [&Mesh; 2],
+        facet_pairs: Vec<[usize; 2]>,
+        vertex_pairs: Vec<[usize; 2]>,
+        nonmatching: Option<(crate::SurfaceTransfer, Vec<usize>)>,
+        tolerance: f64,
+    ) -> Result<Self, FinitumError> {
         let mut fields = [SymbolId(0); 2];
         let mut regions = [RegionId(0); 2];
         for side in 0..2 {
@@ -175,8 +201,9 @@ impl ConnectionRealizationPlan {
             ],
             regions,
             fields,
-            facet_pairs: pairs,
-            vertex_pairs: vertex_map.into_iter().map(|(a, b)| [a, b]).collect(),
+            facet_pairs,
+            vertex_pairs,
+            nonmatching,
             tolerance,
             identity: String::new(),
         };
@@ -258,10 +285,10 @@ impl ConnectionRealizationPlan {
             if side == 1 {
                 offsets[side] += operators[0].operator().dimension();
             }
-            for pair in &self.vertex_pairs {
+            for vertex in self.trace_vertices(side) {
                 if operators[side]
                     .constraints()
-                    .is_constrained(DofId(block.offset + pair[side]))
+                    .is_constrained(DofId(block.offset + vertex))
                 {
                     return Err(failure(
                         "interface trace overlaps an essential or affine constraint",
@@ -271,13 +298,121 @@ impl ConnectionRealizationPlan {
         }
         ConstraintSet::new(
             operators.iter().map(|o| o.operator().dimension()).sum(),
-            self.vertex_pairs.iter().map(|pair| AffineConstraint {
-                target: DofId(offsets[1] + pair[1]),
-                dependencies: vec![WeightedDof {
-                    dof: DofId(offsets[0] + pair[0]),
-                    weight: 1.0,
-                }],
-                offset: 0.0,
+            self.trace_rows()
+                .into_iter()
+                .map(|(target, row)| AffineConstraint {
+                    target: DofId(offsets[1] + target),
+                    dependencies: row
+                        .into_iter()
+                        .map(|(source, weight)| WeightedDof {
+                            dof: DofId(offsets[0] + source),
+                            weight,
+                        })
+                        .collect(),
+                    offset: 0.0,
+                }),
+        )
+    }
+
+    /// Compose pairwise matching interfaces in scientific instance order. Shared
+    /// edge/corner DOFs form one equivalence class, independent of connection order;
+    /// transpose restriction accumulates every participating component's residual.
+    pub fn system_constraints(
+        connections: &[Self],
+        operators: &[&crate::ReducedSystemOperator],
+    ) -> Result<ConstraintSet, FinitumError> {
+        if connections.is_empty() || operators.is_empty() {
+            return Err(failure("empty connected system"));
+        }
+        let mut offsets = vec![0usize];
+        for operator in operators {
+            offsets.push(offsets.last().unwrap() + operator.operator().dimension());
+        }
+        let dimension = *offsets.last().unwrap();
+        if connections.iter().any(|c| c.nonmatching.is_some()) {
+            if connections.len() != 1 || operators.len() != 2 {
+                return Err(failure(
+                    "nested nonmatching currently requires one two-component relation",
+                ));
+            }
+            let c = &connections[0];
+            let ids = c.relation.ports.each_ref().map(|p| p.instance.index());
+            let [Some(a), Some(b)] = ids.map(|i| operators.get(i).copied()) else {
+                return Err(failure("connection instance absent from operator list"));
+            };
+            let pair = c.constraints([a, b])?;
+            let split = a.operator().dimension();
+            let global = |i: usize| {
+                if i < split {
+                    offsets[ids[0]] + i
+                } else {
+                    offsets[ids[1]] + i - split
+                }
+            };
+            return ConstraintSet::new(
+                dimension,
+                pair.constraints().map(|c| AffineConstraint {
+                    target: DofId(global(c.target.0)),
+                    dependencies: c
+                        .dependencies
+                        .iter()
+                        .map(|d| WeightedDof {
+                            dof: DofId(global(d.dof.0)),
+                            weight: d.weight,
+                        })
+                        .collect(),
+                    offset: c.offset,
+                }),
+            );
+        }
+
+        let mut parents: Vec<usize> = (0..dimension).collect();
+        fn root(parents: &[usize], mut index: usize) -> usize {
+            while parents[index] != index {
+                index = parents[index];
+            }
+            index
+        }
+        let mut seen = BTreeSet::new();
+        for connection in connections {
+            if !seen.insert(connection.identity()) {
+                return Err(failure("duplicate matching relation"));
+            }
+            let indices = connection
+                .relation
+                .ports
+                .each_ref()
+                .map(|p| p.instance.index());
+            let [Some(a), Some(b)] = indices.map(|i| operators.get(i).copied()) else {
+                return Err(failure("connection instance absent from operator list"));
+            };
+            let local = connection.constraints([a, b])?;
+            let split = a.operator().dimension();
+            let global = |local: usize| {
+                if local < split {
+                    offsets[indices[0]] + local
+                } else {
+                    offsets[indices[1]] + local - split
+                }
+            };
+            for constraint in local.constraints() {
+                let a = root(&parents, global(constraint.target.0));
+                let b = root(&parents, global(constraint.dependencies[0].dof.0));
+                parents[a.max(b)] = a.min(b);
+            }
+        }
+        ConstraintSet::new(
+            dimension,
+            (0..dimension).filter_map(|index| {
+                let representative = root(&parents, index);
+                (representative != index).then(|| AffineConstraint {
+                    target: DofId(index),
+                    dependencies: vec![WeightedDof {
+                        dof: DofId(representative),
+                        weight: 1.0,
+                    }],
+                    offset: 0.0,
+                })
             }),
         )
     }

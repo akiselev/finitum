@@ -200,3 +200,152 @@ fn validate_values(name: &str, values: &[f64], expected: usize) -> Result<(), Fi
     }
     Ok(())
 }
+
+/// Piecewise P1 interpolation from a triangular surface in physical 3-D space.
+/// This is a point-transfer artifact, not proof of complete interface coverage.
+/// Targets outside the source surface, degenerate cells and ambiguous overlapping
+/// traces refuse. The transpose transfers dual loads; primal interpolation alone
+/// does not preserve a volume or surface integral.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SurfaceTransfer {
+    source_vertices: Vec<[f64; 3]>,
+    source_triangles: Vec<[usize; 3]>,
+    target_points: Vec<[f64; 3]>,
+    rows: Vec<Vec<(usize, f64)>>,
+    tolerance: f64,
+}
+impl SurfaceTransfer {
+    pub fn p1(
+        source_vertices: Vec<[f64; 3]>,
+        source_triangles: Vec<[usize; 3]>,
+        target_points: Vec<[f64; 3]>,
+        tolerance: f64,
+    ) -> Result<Self, FinitumError> {
+        let fail = |message: &str| {
+            FinitumError::InvalidRealization(format!("surface transfer: {message}"))
+        };
+        if source_vertices.is_empty()
+            || source_triangles.is_empty()
+            || target_points.is_empty()
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || source_vertices
+                .iter()
+                .chain(&target_points)
+                .flatten()
+                .any(|x| !x.is_finite())
+        {
+            return Err(fail(
+                "nonempty finite geometry and positive tolerance required",
+            ));
+        }
+        let sub = |a: [f64; 3], b: [f64; 3]| std::array::from_fn::<_, 3, _>(|i| a[i] - b[i]);
+        let dot = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
+        let mut geometry = Vec::new();
+        for triangle in &source_triangles {
+            if triangle.iter().any(|i| *i >= source_vertices.len()) {
+                return Err(fail("triangle vertex out of range"));
+            }
+            let a = source_vertices[triangle[0]];
+            let u = sub(source_vertices[triangle[1]], a);
+            let v = sub(source_vertices[triangle[2]], a);
+            let uu = dot(u, u);
+            let uv = dot(u, v);
+            let vv = dot(v, v);
+            let det = uu * vv - uv * uv;
+            if !det.is_finite() || det <= 1e-14 * uu * vv || uu == 0.0 || vv == 0.0 {
+                return Err(fail("degenerate or ill-conditioned source triangle"));
+            }
+            geometry.push((a, u, v, uu, uv, vv, det));
+        }
+        let mut rows = Vec::new();
+        for point in &target_points {
+            let mut selected: Option<Vec<(usize, f64)>> = None;
+            for (triangle, &(a, u, v, uu, uv, vv, det)) in source_triangles.iter().zip(&geometry) {
+                let d = sub(*point, a);
+                let du = dot(d, u);
+                let dv = dot(d, v);
+                let s = (vv * du - uv * dv) / det;
+                let t = (uu * dv - uv * du) / det;
+                if !s.is_finite() || !t.is_finite() {
+                    return Err(fail("nonfinite barycentric coordinates"));
+                }
+                let projected = std::array::from_fn(|i| a[i] + s * u[i] + t * v[i]);
+                let distance = sub(*point, projected);
+                // Convert the declared physical tolerance into barycentric tolerances.
+                let epsilon = tolerance * (uu.max(vv) / det).sqrt();
+                if epsilon >= 1e-6 {
+                    return Err(fail("tolerance is too large relative to a source triangle"));
+                }
+                if dot(distance, distance).sqrt() > tolerance
+                    || s < -epsilon
+                    || t < -epsilon
+                    || s + t > 1.0 + epsilon
+                {
+                    continue;
+                }
+                let mut row: Vec<_> = triangle
+                    .iter()
+                    .copied()
+                    .zip([1.0 - s - t, s, t])
+                    .filter(|(_, w)| w.abs() > epsilon)
+                    .collect();
+                let sum: f64 = row.iter().map(|(_, w)| w).sum();
+                for (_, w) in &mut row {
+                    *w /= sum;
+                }
+                row.sort_by_key(|(i, _)| *i);
+                if let Some(previous) = &selected {
+                    if previous.len() != row.len()
+                        || previous
+                            .iter()
+                            .zip(&row)
+                            .any(|((a, x), (b, y))| a != b || (x - y).abs() > 1e-10)
+                    {
+                        return Err(fail("target has ambiguous overlapping source traces"));
+                    }
+                } else {
+                    selected = Some(row);
+                }
+            }
+            rows.push(selected.ok_or_else(|| fail("target is outside the source surface"))?);
+        }
+        Ok(Self {
+            source_vertices,
+            source_triangles,
+            target_points,
+            rows,
+            tolerance,
+        })
+    }
+    pub fn rows(&self) -> &[Vec<(usize, f64)>] {
+        &self.rows
+    }
+    pub fn apply(&self, values: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        validate_values("surface source", values, self.source_vertices.len())?;
+        let result: Vec<f64> = self
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|(i, w)| values[*i] * w).sum())
+            .collect();
+        validate_values("surface result", &result, self.target_points.len())?;
+        Ok(result)
+    }
+    /// Dual action, satisfying `<P u, f> = <u, P^T f>`. With P preserving
+    /// constants, the total dual load is conserved even on nonmatching traces.
+    pub fn apply_transpose(&self, loads: &[f64]) -> Result<Vec<f64>, FinitumError> {
+        validate_values("surface target loads", loads, self.target_points.len())?;
+        let mut values = vec![0.0; self.source_vertices.len()];
+        for (row, load) in self.rows.iter().zip(loads) {
+            for (index, weight) in row {
+                values[*index] += weight * load;
+            }
+        }
+        validate_values(
+            "surface transpose result",
+            &values,
+            self.source_vertices.len(),
+        )?;
+        Ok(values)
+    }
+}

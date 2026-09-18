@@ -33,7 +33,7 @@ pub use cad_geometry::{
     CadGeometrySource, CadNodeAssociation, CadParameterCoordinate, CadPrimalPlan,
 };
 pub use condensation::{CondensedLocalSystem, static_condense};
-pub use connection::ConnectionRealizationPlan;
+pub use connection::{ConnectionRealizationPlan, TraceInterpolationRow};
 pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
@@ -108,7 +108,7 @@ pub use topology::{
     CompatibleDofMaps, ExactSequence, FacetId, FacetIncidence, FacetTopology, MeshFacet,
     OrientedFacetPair, OrientedRestriction, SignedIncidence,
 };
-pub use transfer::{MortarInterface, NonmatchingTransfer};
+pub use transfer::{MortarInterface, NonmatchingTransfer, SurfaceTransfer};
 pub use verification::{
     ConstraintWorkBody, ConstraintWorkReport, ExactSequenceCheckBody, ExactSequenceCheckReport,
     GlobalTransposeWorkBody, GlobalTransposeWorkReport, MeshRefinementCheckBody,

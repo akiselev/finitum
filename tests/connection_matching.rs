@@ -153,3 +153,81 @@ fn matching_checks_coverage_normals_mesh_identity_and_open_boundary_admission() 
         .is_err()
     );
 }
+
+#[test]
+fn nested_surface_proves_complete_coverage_and_refuses_non_nested_or_reversed_meshes() {
+    let closure = resolve_module_closure(
+        include_str!("fixtures/two-material-conduction.res"),
+        &NoImports,
+    )
+    .unwrap();
+    let compiled = compile_system(
+        &closure,
+        Registries::new(
+            &UnitRegistry::si_bootstrap(),
+            &QuantityKindRegistry::si_bootstrap(),
+        ),
+        "TwoMaterials",
+    )
+    .unwrap();
+    let relation = &compiled.system.connections[0];
+    let [coarse, _] = meshes(1);
+    let [_, fine] = meshes(2);
+    let a = &coarse.tags.facet_regions[&RegionTagId::new("x_max")];
+    let b = &fine.tags.facet_regions[&RegionTagId::new("x_min")];
+    let plan = ConnectionRealizationPlan::nested_p1(
+        &compiled.system,
+        relation,
+        [&coarse.mesh, &fine.mesh],
+        [a, b],
+        1e-12,
+    )
+    .unwrap();
+    assert!(plan.is_nonmatching());
+    assert_eq!(plan.trace_rows().len(), 9);
+    assert!(plan.trace_rows().iter().any(|(_, r)| r.len() > 1));
+    for (target, row) in plan.trace_rows() {
+        assert!((row.iter().map(|(_, w)| w).sum::<f64>() - 1.0).abs() < 1e-12);
+        let affine = |p: &[f64]| 300.0 + 2.0 * p[1] - 3.0 * p[2];
+        let value: f64 = row
+            .iter()
+            .map(|(v, w)| affine(&coarse.mesh.vertices()[*v]) * w)
+            .sum();
+        assert!((value - affine(&fine.mesh.vertices()[target])).abs() < 1e-12);
+    }
+    assert!(
+        ConnectionRealizationPlan::nested_p1(
+            &compiled.system,
+            relation,
+            [&coarse.mesh, &fine.mesh],
+            [a, &b[..b.len() - 1]],
+            1e-12
+        )
+        .is_err()
+    );
+    assert!(
+        ConnectionRealizationPlan::nested_p1(
+            &compiled.system,
+            relation,
+            [&fine.mesh, &coarse.mesh],
+            [b, a],
+            1e-12
+        )
+        .is_err()
+    );
+    let [coarse, _] = meshes(2);
+    let [_, not_nested] = meshes(3);
+    assert!(
+        ConnectionRealizationPlan::nested_p1(
+            &compiled.system,
+            relation,
+            [&coarse.mesh, &not_nested.mesh],
+            [
+                &coarse.tags.facet_regions[&RegionTagId::new("x_max")],
+                &not_nested.tags.facet_regions[&RegionTagId::new("x_min")]
+            ],
+            1e-12
+        )
+        .is_err()
+    );
+}

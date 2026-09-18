@@ -4515,6 +4515,60 @@ impl SystemOperator {
         Ok(*self.data.symmetry_proof.get_or_init(|| proof))
     }
 
+    /// Exact state/rate Jacobian diagonal assembled from cell-local JVPs. Work
+    /// scales with cells and local width, without probing whole-mesh columns or
+    /// allocating a global dense Jacobian. Facet kernels remain unavailable.
+    pub fn linearized_diagonal(
+        &self,
+        time: f64,
+        state: &[f64],
+        rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<Option<Vec<f64>>, FinitumError> {
+        validate_rate_shift(rate_shift)?;
+        if !time.is_finite() || state.len() != self.dimension() || rate.len() != self.dimension() {
+            return Err(FinitumError::InvalidRealization(
+                "invalid diagonal linearization point".into(),
+            ));
+        }
+        validate_finite("diagonal state", state)?;
+        validate_finite("diagonal rate", rate)?;
+        if !self.data.facet_regions.is_empty() {
+            return Ok(None);
+        }
+        let restrictions = self.cell_restrictions();
+        let mut diagonal = vec![0.0; self.dimension()];
+        let mut direction = vec![0.0; self.dimension()];
+        let mut rate_direction = vec![0.0; self.dimension()];
+        let mut output = vec![0.0; self.dimension()];
+        for (cell, restriction) in restrictions.iter().enumerate() {
+            for dof in &restriction.dofs {
+                direction[dof.0] = 1.0;
+                rate_direction[dof.0] = rate_shift;
+                self.apply_cell_blocks(
+                    cell,
+                    time,
+                    state,
+                    rate,
+                    SystemAction::Jvp {
+                        state_direction: &direction,
+                        rate_direction: &rate_direction,
+                    },
+                    &mut output,
+                    None,
+                )?;
+                diagonal[dof.0] += output[dof.0];
+                for row in &restriction.dofs {
+                    output[row.0] = 0.0;
+                }
+                direction[dof.0] = 0.0;
+                rate_direction[dof.0] = 0.0;
+            }
+        }
+        validate_finite("cell-local Jacobian diagonal", &diagonal)?;
+        Ok(Some(diagonal))
+    }
+
     /// The per-cell gather of every realized field's local DOFs of `vector`, by variable.
     fn gather_cell(&self, cell: usize, vector: &[f64]) -> BTreeMap<SysVarId, Vec<f64>> {
         let layout = self.layout();
@@ -5690,6 +5744,12 @@ impl LinearOperator for ReducedSystemOperator {
         }
     }
 
+    fn diagonal(&self, context: &EvaluationContext) -> Result<Option<Vec<f64>>, NumericError> {
+        self.require_static_view().map_err(numeric_error)?;
+        let zero = vec![0.0; self.operator.dimension()];
+        DaeOperator::jacobian_diagonal(self, context, 0.0, &zero, &zero, 0.0)
+    }
+
     fn apply(
         &self,
         _context: &EvaluationContext,
@@ -6505,6 +6565,33 @@ impl DaeOperator for ReducedSystemOperator {
 
     fn jacobian_properties(&self) -> OperatorProperties {
         self.linearized_properties()
+    }
+
+    fn jacobian_diagonal(
+        &self,
+        _context: &EvaluationContext,
+        time: f64,
+        state: &[f64],
+        state_rate: &[f64],
+        rate_shift: f64,
+    ) -> Result<Option<Vec<f64>>, NumericError> {
+        if self.constraints.has_affine_dependencies() {
+            return Ok(None);
+        }
+        let (physical, rate) = self
+            .physical_state_and_rate(time, state, state_rate)
+            .map_err(numeric_error)?;
+        let Some(mut diagonal) = self
+            .operator
+            .linearized_diagonal(time, &physical, &rate, rate_shift)
+            .map_err(numeric_error)?
+        else {
+            return Ok(None);
+        };
+        for constraint in self.constraints.constraints() {
+            diagonal[constraint.target.0] = 1.0;
+        }
+        Ok(Some(diagonal))
     }
 
     fn residual(

@@ -716,3 +716,52 @@ fn a_kernel_without_a_tangent_for_its_state_input_is_refused_typed() {
         "expected a typed tangent refusal, got {error:?}"
     );
 }
+
+#[test]
+fn cell_local_dynamic_diagonal_matches_physical_and_reduced_jvp_columns() {
+    let compiled = compile();
+    let tagged = unit_square(2);
+    let (operator, reduced) = build(&compiled, &tagged, closure_constitutive(&compiled));
+    let n = operator.dimension();
+    let state = probe_vector(n, 0.7, 1.2);
+    let rate = probe_vector(n, 1.3, 0.6);
+    let context = EvaluationContext::reproducible();
+    for shift in [0.0, 2.5] {
+        let physical = operator
+            .linearized_diagonal(0.3, &state, &rate, shift)
+            .unwrap()
+            .unwrap();
+        let constrained =
+            methodus::DaeOperator::jacobian_diagonal(&reduced, &context, 0.3, &state, &rate, shift)
+                .unwrap()
+                .unwrap();
+        for column in 0..n {
+            let mut direction = vec![0.0; n];
+            direction[column] = 1.0;
+            let rate_direction = direction.iter().map(|v| v * shift).collect::<Vec<_>>();
+            let mut output = vec![0.0; n];
+            operator
+                .jacobian_vector_product(
+                    0.3,
+                    &state,
+                    &rate,
+                    &direction,
+                    &rate_direction,
+                    &mut output,
+                )
+                .unwrap();
+            assert!((physical[column] - output[column]).abs() < 1e-11);
+            reduced
+                .jacobian_vector_product(
+                    0.3,
+                    &state,
+                    &rate,
+                    &direction,
+                    &rate_direction,
+                    &mut output,
+                )
+                .unwrap();
+            assert!((constrained[column] - output[column]).abs() < 1e-11);
+        }
+    }
+}
