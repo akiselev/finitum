@@ -58,12 +58,45 @@ by this package).
 - Open (not in this package; see "Limits and next work"): the general
   multi-relation `system_constraints` union-find path (matching, N > 1
   relations) has no analogous diagonal yet; only the single-relation,
-  two-operator shape (`matching` or `nested_p1`) is proved. Package 2
-  (transient DAE row classification for `nested_p1`, mirroring the matching
-  plan's differential/algebraic trace-row treatment) and package 3 (planar
-  non-nested triangulated-interface coverage proof) from this wave's brief are
-  not started; both are self-contained follow-on packages, not partially-landed
-  code.
+  two-operator shape (`matching` or `nested_p1`) is proved. Cross-repo need:
+  Krasis's `ConnectedSystemOperator::jacobian_diagonal`
+  (`krasis/src/connected.rs`) currently returns `Ok(None)` for any connection
+  whose constraints carry a dependency weight other than `1.0` (its own
+  comment: "Weighted interpolation needs within-leaf cross entries in
+  diag(PᵀJP)... A sum of leaf diagonals is not exact for a nonmatching
+  trace") -- that is precisely what `system_linearized_diagonal` now supplies;
+  the Krasis lane needs to route through it to actually turn weighted-map
+  Jacobi on for `nested_p1`. Not fixed here: one writer per repository.
+
+## W9 SC-W3 package 2 investigation (2026-09-29): read-only finding, not landed
+
+Read (not edited, per "one writer per repository") the pinned Krasis clone's
+`ConnectedSystemOperator` (`krasis/src/connected.rs`) to find the actual gap
+package 2 describes. Finding: `row_kinds()`, `residual()` and
+`jacobian_vector_product()` are already fully generic over `ConstraintSet` --
+none of the three special-case dependency count or weight, so a `nested_p1`
+connection's differential/algebraic row classification, rate expansion
+(`expand_homogeneous`) and transpose restriction (`restrict_transpose`)
+already work identically to a `matching` connection's today, with **no
+Finitum-side realization-plan change needed** for that part of package 2's
+intent. The one place that *does* special-case weight is Krasis's own
+`jacobian_diagonal` shortcut (see the cross-repo need above), which is a
+preconditioner optimization, not a DAE-composition correctness requirement,
+and is already addressed on the Finitum side by package 1.
+What genuinely remains uncovered on Finitum's side: `nonmatching.rs`'s
+`trace_defects` (continuity + dual-residual balance) has **no test at all**
+today, for either the steady or the transient/rate case -- this predates this
+wave's work. Proving the balance identity correctly needs a residual pair
+that actually satisfies interface flux conservation (a real two-sided
+evaluation, or a carefully manufactured pair), which is a self-contained task
+I did not reach within this lane's budget; landing it rushed and unverified
+would be worse than leaving it recorded here. Package 2 is therefore **not
+started** as a code change (none was needed for the classification/expansion
+half); the `trace_defects` proof-test gap (steady and transient) is the
+concrete next step, sized independently of this wave's remaining packages.
+
+Package 3 (planar non-nested triangulated-interface coverage proof) is **not
+started**, gated on package 2 per the brief and out of reach within budget.
 
 ## Current additions
 
