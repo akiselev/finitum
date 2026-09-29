@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-09-18
+Updated: 2026-09-29
 
 ## Role and frontier
 
@@ -10,8 +10,60 @@ owns local executable kernels, Krasis owns state/history, and Methodus owns
 numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
-SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes (249 tests across 36 targets); final Sinbad consumer coverage passes (210 tests across 35 targets with a documented
-external-fixture target retry).
+SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
+(250 tests across 37 targets); final Sinbad consumer coverage passes (210 tests
+across 35 targets with a documented external-fixture target retry, unaffected
+by this package).
+
+## W9 SC-W3 package 1 (2026-09-29): weighted-map Jacobi diagonal
+
+- `ConnectionRealizationPlan::system_linearized_diagonal` lands the reduced
+  Jacobian diagonal `diag(Rᵀ J R)` of the two-operator connected system a
+  `matching` or `nested_p1` plan couples: essential and connection-target
+  (slave) rows are preserved as the reduced system's own identity row (`1.0`,
+  exactly as the existing essential-only path already does); a master row
+  untouched by the interface keeps its own operator's
+  `SystemOperator::linearized_diagonal` value; an interface-adjacent master row
+  gains the transpose-scattered cross term `Σ w_β J_B[β,γ] w_γ` over the target
+  trace DOFs it prolongates into. Previously "weighted-map Jacobi refuses"
+  (any affine-dependency constraint set returned no diagonal at all); this
+  closes that gap for the bounded one-relation/two-operator shape
+  `system_constraints` already restricts nonmatching connections to.
+- New `SystemOperator::linearized_block` (`pub(crate)`) computes the bounded
+  dense off-diagonal Jacobian sub-block restricted to a given row/column DOF
+  set from the same cell-local JVP machinery `linearized_diagonal` uses: work
+  scales with the requested (interface-sized) column count and the cells that
+  touch them, never with the whole mesh. It is the only new primitive; no
+  change to `linearized_diagonal`, `apply_action`, `apply_reduced_action`, or
+  any existing constraint/transfer type.
+  Refusal is unchanged and reused, not widened: either operator's own
+  facet-kernel operators or its own affine-dependency essential constraints
+  (periodic-style, not this connection's) return `Ok(None)`, matching
+  `SystemOperator::linearized_diagonal`'s and `ReducedSystemOperator`'s
+  existing refusal cases exactly.
+- Proof: `tests/nested_p1_diagonal.rs` binds two real `SystemOperator`s (a
+  coarse and a fine `Conduction` instance of the `two-material-conduction.res`
+  fixture `ConnectionRealizationPlan::nested_p1` already proves coverage over)
+  with a constant-conductivity flux closure and no essential constraints, then
+  checks `system_linearized_diagonal` against bounded exhaustive probing: every
+  unit vector through the same two-operator connected reduced action,
+  reconstructed from the public `ConstraintSet::expand_homogeneous` /
+  `restrict_transpose` / `direction_residual` primitives exactly as
+  `crate::constraint::apply_constrained_action` composes them internally.
+  Measured worst relative discrepancy is exactly `0` (the fixture's `k` is
+  state-independent, so the Jacobian is exact to roundoff). The test also
+  asserts at least one interface-adjacent master row differs from the
+  unconnected operator's own diagonal, so the proof cannot pass vacuously
+  against a formula that silently ignores the connection.
+- Open (not in this package; see "Limits and next work"): the general
+  multi-relation `system_constraints` union-find path (matching, N > 1
+  relations) has no analogous diagonal yet; only the single-relation,
+  two-operator shape (`matching` or `nested_p1`) is proved. Package 2
+  (transient DAE row classification for `nested_p1`, mirroring the matching
+  plan's differential/algebraic trace-row treatment) and package 3 (planar
+  non-nested triangulated-interface coverage proof) from this wave's brief are
+  not started; both are self-contained follow-on packages, not partially-landed
+  code.
 
 ## Current additions
 
@@ -21,8 +73,10 @@ external-fixture target retry).
   Transpose restriction accumulates all participating residuals.
 - `SystemOperator::linearized_diagonal` obtains the dynamic Jacobian diagonal
   through cell-local JVP columns at the actual state/rate and declared rate shift.
-  Reduced operators preserve essential rows. Facet kernels and affine dependency
-  constraints return no diagonal; there is no whole-mesh probing fallback.
+  Reduced operators preserve essential rows. Facet kernels and (single-operator,
+  own) affine dependency constraints return no diagonal; there is no whole-mesh
+  probing fallback. `ConnectionRealizationPlan::system_linearized_diagonal` (above)
+  now covers the two-operator connected case a `matching`/`nested_p1` plan couples.
 - `SurfaceTransfer::p1` interpolates a triangular surface in physical 3-D to
   nonmatching points and supplies the exact dual transpose. It preserves affine
   traces and total dual loads. Degenerate/ambiguous/outside geometry refuses.
@@ -32,7 +86,7 @@ external-fixture target retry).
   coverage per coarse facet. It constructs weighted constraints and exposes
   continuity and dual-residual balance checks. Steady heat and species consumers
   exercise the product policy; arbitrary nonnested partitions refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 249 tests across 36 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
+- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 250 tests across 37 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 ## Accepted recent gates
 
@@ -82,8 +136,14 @@ external-fixture target retry).
   realization, moving/remeshed interfaces and production embedded-domain semantics
   remain open. Reference segment tables are not multidimensional hp support.
 - Connected product admission includes matching scalar P1 and one steady planar
-  nested P1 pair. General nonnested, curved, moving or transient nonmatching
-  coupling and multiplier/Nitsche stability remain open.
+  nested P1 pair; weighted-map Jacobi now has a proved diagonal for that same
+  bounded shape (above). General nonnested, curved, moving or transient
+  nonmatching coupling and multiplier/Nitsche stability remain open. Planar
+  non-nested triangulated-interface coverage (area-weighted mortar constraints
+  over arbitrary planar triangulations of the same polygon) is designed in this
+  wave's brief but not implemented. Transient (DAE) use of `nested_p1` needs
+  its own rate-row differential/algebraic classification and rate expansion,
+  mirroring the matching plan's trace-row treatment; not implemented.
 - Full-coordinate affine constraint rows are generally nonsymmetric even when
   the free-coordinate `P^T A P` block is symmetric; symmetry declarations and solver
   refusals must retain that distinction.

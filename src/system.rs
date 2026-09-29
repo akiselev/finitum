@@ -4569,6 +4569,85 @@ impl SystemOperator {
         Ok(Some(diagonal))
     }
 
+    /// The dense Jacobian sub-block restricted to `rows` x `columns` (row-major,
+    /// `rows.len() * columns.len()`), from the same cell-local JVP machinery
+    /// [`Self::linearized_diagonal`] uses: each requested column's unit direction is probed once
+    /// per cell that touches it, and the output is read back at every requested row that shares
+    /// that cell (basis functions have local support, so a row/column pair sharing no cell
+    /// contributes zero). Work scales with the requested column count and the cells touching
+    /// them, never with the whole mesh's column count. Used to fold a bounded interface's
+    /// off-diagonal couplings into a connected reduced diagonal
+    /// ([`crate::ConnectionRealizationPlan::system_linearized_diagonal`]). Refuses exactly like
+    /// [`Self::linearized_diagonal`] (facet kernels).
+    pub(crate) fn linearized_block(
+        &self,
+        time: f64,
+        state: &[f64],
+        rate: &[f64],
+        rate_shift: f64,
+        rows: &[usize],
+        columns: &[usize],
+    ) -> Result<Option<Vec<f64>>, FinitumError> {
+        validate_rate_shift(rate_shift)?;
+        if !time.is_finite() || state.len() != self.dimension() || rate.len() != self.dimension() {
+            return Err(FinitumError::InvalidRealization(
+                "invalid block linearization point".into(),
+            ));
+        }
+        validate_finite("block state", state)?;
+        validate_finite("block rate", rate)?;
+        let dimension = self.dimension();
+        if rows.iter().chain(columns).any(|&dof| dof >= dimension) {
+            return Err(FinitumError::InvalidRealization(
+                "linearized block dof out of range".into(),
+            ));
+        }
+        if !self.data.facet_regions.is_empty() {
+            return Ok(None);
+        }
+        let row_index: BTreeMap<usize, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, &dof)| (dof, index))
+            .collect();
+        let restrictions = self.cell_restrictions();
+        let mut block = vec![0.0; rows.len() * columns.len()];
+        let mut direction = vec![0.0; dimension];
+        let mut rate_direction = vec![0.0; dimension];
+        let mut output = vec![0.0; dimension];
+        for (cell, restriction) in restrictions.iter().enumerate() {
+            for (column_index, &column) in columns.iter().enumerate() {
+                if !restriction.dofs.iter().any(|dof| dof.0 == column) {
+                    continue;
+                }
+                direction[column] = 1.0;
+                rate_direction[column] = rate_shift;
+                self.apply_cell_blocks(
+                    cell,
+                    time,
+                    state,
+                    rate,
+                    SystemAction::Jvp {
+                        state_direction: &direction,
+                        rate_direction: &rate_direction,
+                    },
+                    &mut output,
+                    None,
+                )?;
+                for row in &restriction.dofs {
+                    if let Some(&row_position) = row_index.get(&row.0) {
+                        block[row_position * columns.len() + column_index] += output[row.0];
+                    }
+                    output[row.0] = 0.0;
+                }
+                direction[column] = 0.0;
+                rate_direction[column] = 0.0;
+            }
+        }
+        validate_finite("cell-local Jacobian block", &block)?;
+        Ok(Some(block))
+    }
+
     /// The per-cell gather of every realized field's local DOFs of `vector`, by variable.
     fn gather_cell(&self, cell: usize, vector: &[f64]) -> BTreeMap<SysVarId, Vec<f64>> {
         let layout = self.layout();

@@ -314,6 +314,114 @@ impl ConnectionRealizationPlan {
         )
     }
 
+    /// The Jacobian diagonal of the two-operator connected system this plan couples, i.e.
+    /// `diag(Rᵀ J R)` at every free/master coordinate, where `R` is this plan's constraint
+    /// prolongation (weighted for `nested_p1`, equality for `matching`) and `J` is the block-
+    /// diagonal physical Jacobian of the two operators (a connection carries no term of its own;
+    /// coupling exists only through the shared trace DOFs). Essential and connection-target
+    /// (slave) rows are preserved as the reduced system's own identity/constraint row (`1.0`),
+    /// exactly as `ReducedSystemOperator::jacobian_diagonal` already does for essential-only
+    /// constraint sets. A master row untouched by the interface keeps its own operator's
+    /// [`crate::SystemOperator::linearized_diagonal`] value unchanged; an interface-adjacent
+    /// master row gains the transpose-scattered cross term `Σ w_β J_B[β,γ] w_γ` over the target
+    /// (slave) trace DOFs `β, γ` it prolongates into, computed from the bounded dense interface
+    /// sub-block `SystemOperator::linearized_block` returns (cell-local JVPs restricted to the
+    /// trace DOF set, never a whole-mesh probe).
+    ///
+    /// Requires exactly one relation between two operators (mirroring
+    /// [`Self::system_constraints`]'s own nonmatching restriction). Refuses only what is
+    /// genuinely unsupported: either operator's own facet-kernel or affine-dependency essential
+    /// constraints (the same cases [`crate::SystemOperator::linearized_diagonal`] and
+    /// `ReducedSystemOperator`'s own `DaeOperator::jacobian_diagonal` already refuse) return
+    /// `Ok(None)`.
+    pub fn system_linearized_diagonal(
+        &self,
+        operators: [&crate::ReducedSystemOperator; 2],
+        time: f64,
+        states: [&[f64]; 2],
+        rates: [&[f64]; 2],
+        rate_shift: f64,
+    ) -> Result<Option<Vec<f64>>, FinitumError> {
+        let pair = self.constraints(operators)?;
+        if operators
+            .iter()
+            .any(|operator| operator.constraints().has_affine_dependencies())
+        {
+            return Ok(None);
+        }
+        let dimension_a = operators[0].operator().dimension();
+        let mut physical = [Vec::new(), Vec::new()];
+        let mut physical_rate = [Vec::new(), Vec::new()];
+        for side in 0..2 {
+            let (state, rate) =
+                operators[side].physical_state_and_rate(time, states[side], rates[side])?;
+            physical[side] = state;
+            physical_rate[side] = rate;
+        }
+        let mut per_operator = [None, None];
+        for side in 0..2 {
+            per_operator[side] = operators[side].operator().linearized_diagonal(
+                time,
+                &physical[side],
+                &physical_rate[side],
+                rate_shift,
+            )?;
+        }
+        let (Some(diagonal_a), Some(diagonal_b)) = (per_operator[0].take(), per_operator[1].take())
+        else {
+            return Ok(None);
+        };
+        let mut target_locals: Vec<usize> = pair
+            .constraints()
+            .map(|constraint| constraint.target.0 - dimension_a)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        target_locals.sort_unstable();
+        let Some(interface) = operators[1].operator().linearized_block(
+            time,
+            &physical[1],
+            &physical_rate[1],
+            rate_shift,
+            &target_locals,
+            &target_locals,
+        )?
+        else {
+            return Ok(None);
+        };
+        let width = target_locals.len();
+        let local_position = |dof: usize| target_locals.binary_search(&dof).unwrap();
+        let mut incidence: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new();
+        for constraint in pair.constraints() {
+            let target_local = constraint.target.0 - dimension_a;
+            for dependency in &constraint.dependencies {
+                incidence
+                    .entry(dependency.dof.0)
+                    .or_default()
+                    .push((target_local, dependency.weight));
+            }
+        }
+        let mut diagonal = Vec::with_capacity(dimension_a + operators[1].operator().dimension());
+        diagonal.extend_from_slice(&diagonal_a);
+        diagonal.extend_from_slice(&diagonal_b);
+        for (&master, entries) in &incidence {
+            let mut contribution = 0.0;
+            for &(beta, weight_beta) in entries {
+                for &(gamma, weight_gamma) in entries {
+                    contribution += weight_beta
+                        * interface[local_position(beta) * width + local_position(gamma)]
+                        * weight_gamma;
+                }
+            }
+            diagonal[master] += contribution;
+        }
+        for constraint in pair.constraints() {
+            diagonal[constraint.target.0] = 1.0;
+        }
+        crate::realization::validate_finite("connected Jacobian diagonal", &diagonal)?;
+        Ok(Some(diagonal))
+    }
+
     /// Compose pairwise matching interfaces in scientific instance order. Shared
     /// edge/corner DOFs form one equivalence class, independent of connection order;
     /// transpose restriction accumulates every participating component's residual.
