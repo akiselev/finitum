@@ -11,7 +11,7 @@ numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
 SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
-(250 tests across 37 targets); final Sinbad consumer coverage passes (210 tests
+(252 tests across 38 targets); final Sinbad consumer coverage passes (210 tests
 across 35 targets with a documented external-fixture target retry, unaffected
 by this package).
 
@@ -68,35 +68,55 @@ by this package).
   the Krasis lane needs to route through it to actually turn weighted-map
   Jacobi on for `nested_p1`. Not fixed here: one writer per repository.
 
-## W9 SC-W3 package 2 investigation (2026-09-29): read-only finding, not landed
+## W9 SC-W3 package 2 (2026-09-29): transient nonmatching proof checks
 
 Read (not edited, per "one writer per repository") the pinned Krasis clone's
 `ConnectedSystemOperator` (`krasis/src/connected.rs`) to find the actual gap
 package 2 describes. Finding: `row_kinds()`, `residual()` and
-`jacobian_vector_product()` are already fully generic over `ConstraintSet` --
-none of the three special-case dependency count or weight, so a `nested_p1`
-connection's differential/algebraic row classification, rate expansion
-(`expand_homogeneous`) and transpose restriction (`restrict_transpose`)
-already work identically to a `matching` connection's today, with **no
-Finitum-side realization-plan change needed** for that part of package 2's
-intent. The one place that *does* special-case weight is Krasis's own
-`jacobian_diagonal` shortcut (see the cross-repo need above), which is a
-preconditioner optimization, not a DAE-composition correctness requirement,
-and is already addressed on the Finitum side by package 1.
-What genuinely remains uncovered on Finitum's side: `nonmatching.rs`'s
-`trace_defects` (continuity + dual-residual balance) has **no test at all**
-today, for either the steady or the transient/rate case -- this predates this
-wave's work. Proving the balance identity correctly needs a residual pair
-that actually satisfies interface flux conservation (a real two-sided
-evaluation, or a carefully manufactured pair), which is a self-contained task
-I did not reach within this lane's budget; landing it rushed and unverified
-would be worse than leaving it recorded here. Package 2 is therefore **not
-started** as a code change (none was needed for the classification/expansion
-half); the `trace_defects` proof-test gap (steady and transient) is the
-concrete next step, sized independently of this wave's remaining packages.
+`jacobian_vector_product()` there are already fully generic over
+`ConstraintSet` -- none of the three special-case dependency count or weight,
+so a `nested_p1` connection's differential/algebraic row classification, rate
+expansion (`expand_homogeneous`) and transpose restriction
+(`restrict_transpose`) already work identically to a `matching` connection's
+today. **No `ConnectionRealizationPlan`/`nested_p1` shape change was needed**
+to make that true; the deliverable is the proof that it holds, which is what
+this package lands. The one place Krasis *does* special-case weight is its
+own `jacobian_diagonal` shortcut (the cross-repo need above), a preconditioner
+optimization already addressed on the Finitum side by package 1, not a
+DAE-composition correctness requirement.
+
+`tests/nested_p1_transient.rs` closes `nonmatching.rs`'s `trace_defects`
+(continuity + dual-residual balance) test gap, which predated this wave for
+both the steady and transient/rate case:
+
+- `fine_side_trace_continuity_holds_for_constant_and_linear_in_time_traces`:
+  `trace_defects`'s own continuity number is `<= 1e-12` for a constant trace,
+  for a linear-in-time trace `value(x, t) = value0(x) + rate(x) * t` sampled
+  at two different times (the map carries no time dependence of its own, so
+  continuity holding at each independent snapshot is the concrete meaning of
+  "at any state"), and for the bare rate field `rate(x)` itself -- rate
+  expansion is the same primal interpolation as value expansion, since a
+  trace constraint's offset is always zero.
+- `dual_residual_balance_identity_matches_restrict_transpose_for_state_and_storage_residuals`:
+  `trace_defects`'s returned balance number matches an independently computed
+  `ConstraintSet::restrict_transpose` reference to `1e-12` relative, for an
+  arbitrary state-like residual pair *and* for a genuinely storage-bearing
+  residual pair built from each side's own `SystemOperator::mass_matrix`
+  action on a rate field (the discrete term a `rho * cp * dt(T)` storage
+  equation contributes) -- "on both sides" literally, one mass matrix per
+  mesh. A further direct check confirms the same result is the general
+  adjoint identity `<R x, y> = <x, Rᵀ y>` via `expand_homogeneous` /
+  `restrict_transpose` alone, not an artifact of `trace_defects`'s own
+  bookkeeping.
+
+Both tests bind two real `SystemOperator`s (coarse/fine `Conduction`) over the
+same `two-material-conduction.res` fixture and `nested_p1` plan package 1's
+proof uses. Package 2 needed no time stepping or history (Krasis's own); no
+production code change, only the proof.
 
 Package 3 (planar non-nested triangulated-interface coverage proof) is **not
-started**, gated on package 2 per the brief and out of reach within budget.
+started**, gated on package 2's landing per the brief but not attempted this
+lane -- out of scope for this pass.
 
 ## Current additions
 
@@ -119,7 +139,7 @@ started**, gated on package 2 per the brief and out of reach within budget.
   coverage per coarse facet. It constructs weighted constraints and exposes
   continuity and dual-residual balance checks. Steady heat and species consumers
   exercise the product policy; arbitrary nonnested partitions refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 250 tests across 37 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
+- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 252 tests across 38 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 ## Accepted recent gates
 
@@ -170,13 +190,15 @@ started**, gated on package 2 per the brief and out of reach within budget.
   remain open. Reference segment tables are not multidimensional hp support.
 - Connected product admission includes matching scalar P1 and one steady planar
   nested P1 pair; weighted-map Jacobi now has a proved diagonal for that same
-  bounded shape (above). General nonnested, curved, moving or transient
-  nonmatching coupling and multiplier/Nitsche stability remain open. Planar
+  bounded shape (above), and the transient/rate proof checks Krasis needs for
+  a `nested_p1` connection (fine-side continuity, dual-residual balance, both
+  at any state and rate) are proved in `tests/nested_p1_transient.rs`.
+  General nonnested, curved or moving nonmatching coupling and multiplier/
+  Nitsche stability remain open; actual time stepping/history for a transient
+  nonmatching connection is Krasis's own composition, not built here. Planar
   non-nested triangulated-interface coverage (area-weighted mortar constraints
-  over arbitrary planar triangulations of the same polygon) is designed in this
-  wave's brief but not implemented. Transient (DAE) use of `nested_p1` needs
-  its own rate-row differential/algebraic classification and rate expansion,
-  mirroring the matching plan's trace-row treatment; not implemented.
+  over arbitrary planar triangulations of the same polygon) is designed in
+  this wave's brief but not implemented (package 3).
 - Full-coordinate affine constraint rows are generally nonsymmetric even when
   the free-coordinate `P^T A P` block is symmetric; symmetry declarations and solver
   refusals must retain that distinction.
