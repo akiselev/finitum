@@ -5,17 +5,20 @@
 //! they are), driven with the rate direction `rate_shift · d` `linearized_diagonal` probes, and
 //! composed through the connection exactly as Krasis's
 //! `ConnectedSystemOperator::jacobian_vector_product` composes its leaves (the linearization
-//! point expanded through the pair first). Two shapes:
+//! point expanded through the pair first). Three shapes:
 //!
 //! - the steady `nested_p1` heat fixture, with one essential constraint per side;
 //! - a storage-bearing (`rho * cp * dt(T)`), state-dependent-conductivity `nested_p1` fixture,
 //!   where the diagonal must change with `rate_shift` and must be linearized at the
-//!   connection-expanded point, not at the caller's raw fine-trace entries.
+//!   connection-expanded point, not at the caller's raw fine-trace entries;
+//! - the `matching` plan, where the diagonal must also equal the sum-of-leaf-diagonals
+//!   convention Krasis's `ConnectedSystemOperator::jacobian_diagonal` uses for weight-1 pairs.
 use finitum::{
     AffineConstraint, BlockLayout, ConnectionRealizationPlan, ConstraintSet, DofId, Mesh,
     MeshProfile, PointEvaluation, ReducedSystemOperator, RegionTagId, SystemConstitutiveInput,
     SystemOperator, SystemQuadrature, SystemRealizationPlan, TaggedMesh, realize,
 };
+use methodus::{DaeOperator, EvaluationContext};
 use quantitas::{QuantityKindRegistry, UnitRegistry};
 use scientia::{
     DerivativeEvaluation, InputSourceRequirement, IntegralOperatorFactorization, NoImports,
@@ -670,6 +673,124 @@ fn nested_p1_diagonal_sees_rate_shift_and_expands_the_point_through_the_connecti
         &pair,
         &diagonals[0],
         [&plain_a, &plain_expanded],
+        [essential_a, essential_b],
+    );
+}
+
+/// The `matching` plan path: the same exhaustive probe, plus equality with the
+/// sum-of-leaf-diagonals convention Krasis's `ConnectedSystemOperator::jacobian_diagonal` uses
+/// for weight-1 bijective pairs (`Rᵀ` of the concatenated leaf `DaeOperator::jacobian_diagonal`s,
+/// targets set to the identity row).
+#[test]
+fn matching_diagonal_matches_probing_and_the_sum_of_leaf_diagonals_convention() {
+    let (compiled, operators) = compile(STEADY);
+    let system = &compiled.system;
+    let relation = &system.connections[0];
+    let [left, right] = meshes(2);
+    let a = &left.tags.facet_regions[&RegionTagId::new("x_max")];
+    let b = &right.tags.facet_regions[&RegionTagId::new("x_min")];
+    let matching = ConnectionRealizationPlan::matching(
+        system,
+        relation,
+        [&left.mesh, &right.mesh],
+        [a, b],
+        1e-12,
+    )
+    .unwrap();
+    assert!(!matching.is_nonmatching());
+
+    let left_model = operators.model_systems[0].1.clone();
+    let right_model = operators.model_systems[1].1.clone();
+    let left_operator = bind(
+        left_model.clone(),
+        &left.mesh,
+        &matching,
+        constant_flux(&left_model, 2.5),
+    );
+    let right_operator = bind(
+        right_model.clone(),
+        &right.mesh,
+        &matching,
+        constant_flux(&right_model, 3.0),
+    );
+    let dim_a = left_operator.dimension();
+    let dim_b = right_operator.dimension();
+    let essential_a = vertex_on(&left.mesh, 0.0);
+    let essential_b = vertex_on(&right.mesh, 1.0);
+    let reduced_a = left_operator
+        .reduced(essential(dim_a, essential_a, 300.0))
+        .unwrap();
+    let reduced_b = right_operator
+        .reduced(essential(dim_b, essential_b, 350.0))
+        .unwrap();
+    let pair = matching.constraints([&reduced_a, &reduced_b]).unwrap();
+    assert!(
+        pair.constraints()
+            .all(|c| c.dependencies.len() == 1 && c.dependencies[0].weight == 1.0)
+    );
+
+    let state_a = vec![0.0; dim_a];
+    let state_b = vec![0.0; dim_b];
+    let rate_a = vec![0.0; dim_a];
+    let rate_b = vec![0.0; dim_b];
+    let rate_shift = 1.0;
+    let diagonal = matching
+        .system_linearized_diagonal(
+            [&reduced_a, &reduced_b],
+            0.0,
+            [&state_a, &state_b],
+            [&rate_a, &rate_b],
+            rate_shift,
+        )
+        .unwrap()
+        .expect("linear conduction over cell-only kernels admits a cell-local diagonal");
+    let expected = exhaustive_diagonal(
+        &pair,
+        [&reduced_a, &reduced_b],
+        0.0,
+        [&state_a, &state_b],
+        [&rate_a, &rate_b],
+        rate_shift,
+    );
+    let worst = assert_diagonal_matches("matching", &diagonal, &expected);
+    eprintln!("matching diagonal: worst relative discrepancy {worst:.3e}");
+
+    // Krasis's convention for weight-1 bijective pairs: concatenate the leaves' own reduced
+    // `DaeOperator::jacobian_diagonal`s, restrict by the pair's transpose, identity targets.
+    let context = EvaluationContext::reproducible();
+    let mut leaves =
+        DaeOperator::jacobian_diagonal(&reduced_a, &context, 0.0, &state_a, &rate_a, rate_shift)
+            .unwrap()
+            .expect("left leaf diagonal");
+    leaves.extend(
+        DaeOperator::jacobian_diagonal(&reduced_b, &context, 0.0, &state_b, &rate_b, rate_shift)
+            .unwrap()
+            .expect("right leaf diagonal"),
+    );
+    let mut krasis = pair.restrict_transpose(&leaves).unwrap();
+    for constraint in pair.constraints() {
+        krasis[constraint.target.0] = 1.0;
+    }
+    for (row, (&got, &want)) in diagonal.iter().zip(&krasis).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+            "row {row}: connected diagonal {got} != sum-of-leaf-diagonals convention {want}"
+        );
+    }
+
+    let plain_a = left_operator
+        .linearized_diagonal(0.0, &state_a, &rate_a, rate_shift)
+        .unwrap()
+        .unwrap();
+    let plain_b = right_operator
+        .linearized_diagonal(0.0, &state_b, &rate_b, rate_shift)
+        .unwrap()
+        .unwrap();
+    assert_row_structure(
+        "matching",
+        &pair,
+        &diagonal,
+        [&plain_a, &plain_b],
         [essential_a, essential_b],
     );
 }

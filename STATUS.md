@@ -11,7 +11,7 @@ numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
 SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
-(253 tests across 38 targets after the 2026-10-08 review fixes below); final
+(254 tests across 38 targets after the 2026-10-08 review fixes below); final
 Sinbad consumer coverage passed (210 tests across 35 targets with a documented
 external-fixture target retry) at the 2026-09-29 head, before those fixes.
 
@@ -39,7 +39,11 @@ external-fixture target retry) at the 2026-09-29 head, before those fixes.
   Jacobi refuses" (any affine-dependency constraint set returned no diagonal
   at all); this closes that gap for the bounded one-relation/two-operator
   shape `system_constraints` already restricts nonmatching connections to.
-- New `SystemOperator::linearized_block` (`pub(crate)`) computes the
+- New `SystemOperator::linearized_block` (`pub` since 2026-10-08, with its
+  contract documented: a bounded dense `rows x columns` sub-block
+  `J + rate_shift·M` of the physical operator from the cell-local JVP
+  machinery, work scaling with the requested columns and the cells touching
+  them, so Krasis can fold N-leaf cross terms itself later) computes the
   bounded dense off-diagonal Jacobian sub-block restricted to a given
   row/column DOF set from the same cell-local JVP machinery
   `linearized_diagonal` uses: work scales with the requested
@@ -52,7 +56,7 @@ external-fixture target retry) at the 2026-09-29 head, before those fixes.
   (periodic-style, not this connection's) return `Ok(None)`, matching
   `SystemOperator::linearized_diagonal`'s and `ReducedSystemOperator`'s
   existing refusal cases exactly.
-- Proof (`tests/nested_p1_diagonal.rs`, two tests; oracle revised
+- Proof (`tests/nested_p1_diagonal.rs`, three tests; oracle revised
   2026-10-08): bounded exhaustive probing -- every unit vector of the
   connection-reduced space, prolongated through the pair and pushed through
   the two REDUCED operators' own `jacobian_vector_product` with the rate
@@ -82,6 +86,12 @@ external-fixture target retry) at the 2026-09-29 head, before those fixes.
     shift at every free/master row, and on interior coarse rows grows by
     exactly `shift · rho · cp · M_ii` against `SystemOperator::mass_matrix`
     (independent of the JVP machinery under test).
+  - `matching_diagonal_matches_probing_and_the_sum_of_leaf_diagonals_convention`:
+    the `matching` plan on the 2x2x2 pair (9 weight-1 vertex pairs) with one
+    essential constraint per side: the same probe, plus entrywise equality
+    (`1e-12`) with the sum-of-leaf-diagonals convention Krasis's
+    `ConnectedSystemOperator::jacobian_diagonal` uses (`Rᵀ` of the
+    concatenated leaf `DaeOperator::jacobian_diagonal`s, identity targets).
 - Open (not in this package; see "Limits and next work"): the general
   multi-relation `system_constraints` union-find path (matching, N > 1
   relations) has no analogous diagonal yet; only the single-relation,
@@ -171,7 +181,7 @@ lane -- out of scope for this pass.
   coverage per coarse facet. It constructs weighted constraints and exposes
   continuity and dual-residual balance checks. Steady heat and species consumers
   exercise the product policy; arbitrary nonnested partitions refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 253 tests across 38 targets, formatting, check, strict clippy, rustdoc and doctests (2026-10-08). Final consumer acceptance passed at the 2026-09-29 head: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
+- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 254 tests across 38 targets, formatting, check, strict clippy, rustdoc and doctests (2026-10-08). Final consumer acceptance passed at the 2026-09-29 head: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 ## Accepted recent gates
 

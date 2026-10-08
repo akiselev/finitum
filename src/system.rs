@@ -4569,17 +4569,24 @@ impl SystemOperator {
         Ok(Some(diagonal))
     }
 
-    /// The dense Jacobian sub-block restricted to `rows` x `columns` (row-major,
-    /// `rows.len() * columns.len()`), from the same cell-local JVP machinery
-    /// [`Self::linearized_diagonal`] uses: each requested column's unit direction is probed once
-    /// per cell that touches it, and the output is read back at every requested row that shares
-    /// that cell (basis functions have local support, so a row/column pair sharing no cell
-    /// contributes zero). Work scales with the requested column count and the cells touching
-    /// them, never with the whole mesh's column count. Used to fold a bounded interface's
-    /// off-diagonal couplings into a connected reduced diagonal
-    /// ([`crate::ConnectionRealizationPlan::system_linearized_diagonal`]). Refuses exactly like
-    /// [`Self::linearized_diagonal`] (facet kernels).
-    pub(crate) fn linearized_block(
+    /// The bounded dense Jacobian sub-block of this (unreduced, physical) operator restricted
+    /// to `rows` x `columns` (row-major, `rows.len() * columns.len()`): entry `(i, j)` is
+    /// `J[rows[i], columns[j]] + rate_shift * M[rows[i], columns[j]]`, the same shifted column
+    /// [`Self::linearized_diagonal`] probes (`state_direction = e_j`, `rate_direction =
+    /// rate_shift * e_j`), from the same cell-local JVP machinery: each requested column's unit
+    /// direction is probed once per cell that touches it, and the output is read back at every
+    /// requested row that shares that cell (basis functions have local support, so a row/column
+    /// pair sharing no cell contributes exactly zero). Work scales with the requested column
+    /// count and the cells touching them, never with the whole mesh's column count, so the
+    /// caller bounds the cost by bounding the column set (an interface's trace DOFs, not a
+    /// mesh). `rows` and `columns` are physical DOF indices in [`Self::layout`] order, each
+    /// listed at most once. Used to fold a bounded interface's off-diagonal couplings into a
+    /// connected reduced diagonal
+    /// ([`crate::ConnectionRealizationPlan::system_linearized_diagonal`]); a consumer folding
+    /// N-leaf cross terms itself requests one such block per leaf and interface. Refuses
+    /// exactly like [`Self::linearized_diagonal`] (facet kernels return `Ok(None)`); an
+    /// out-of-range DOF or a non-finite point is an error.
+    pub fn linearized_block(
         &self,
         time: f64,
         state: &[f64],
