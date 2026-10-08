@@ -1,8 +1,10 @@
 //! W9 Finitum SC-W3 package 2: the proof checks Krasis needs to compose a transient `nested_p1`
 //! connection -- fine-side primal trace continuity at any state, and the dual-residual
 //! transpose-work balance identity at any state and rate -- exercised against real bound
-//! operators over the `two-material-conduction.res` heat fixture. `trace_defects` had no test
-//! coverage at all before this file, steady or transient.
+//! operators over the `two-material-conduction.res` heat fixture. `trace_defects` had no
+//! Finitum-owned test before this file, steady or transient (Sinbad's connected run consumes
+//! it). The balance test proves the transpose bookkeeping -- the adjoint identity holds for any
+//! vector, storage-shaped or not -- not a physical storage-equation balance across the interface.
 //!
 //! Differential/algebraic row classification, rate expansion (`ConstraintSet::expand_homogeneous`)
 //! and transpose restriction (`ConstraintSet::restrict_transpose`) are already generic over any

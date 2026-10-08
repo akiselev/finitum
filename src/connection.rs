@@ -317,16 +317,36 @@ impl ConnectionRealizationPlan {
     /// The Jacobian diagonal of the two-operator connected system this plan couples, i.e.
     /// `diag(Rᵀ J R)` at every free/master coordinate, where `R` is this plan's constraint
     /// prolongation (weighted for `nested_p1`, equality for `matching`) and `J` is the block-
-    /// diagonal physical Jacobian of the two operators (a connection carries no term of its own;
-    /// coupling exists only through the shared trace DOFs). Essential and connection-target
-    /// (slave) rows are preserved as the reduced system's own identity/constraint row (`1.0`),
-    /// exactly as `ReducedSystemOperator::jacobian_diagonal` already does for essential-only
-    /// constraint sets. A master row untouched by the interface keeps its own operator's
+    /// diagonal physical Jacobian `J + rate_shift·M` of the two operators (a connection carries
+    /// no term of its own; coupling exists only through the shared trace DOFs).
+    ///
+    /// # Linearization point
+    ///
+    /// `states`/`rates` are the per-operator slices of the connection-REDUCED state and rate:
+    /// exactly what Krasis's `ConnectedSystemOperator` holds and what its own
+    /// `jacobian_diagonal`/`residual`/`jacobian_vector_product` hand their leaves. The point is
+    /// expanded here through this connection first (`ConstraintSet::expand` of the pair, so
+    /// operator B's target (fine-trace) entries are the weighted trace of operator A's masters,
+    /// whatever the caller's slice holds there) and only then through each operator's own
+    /// essential constraints ([`crate::ReducedSystemOperator::physical_state_and_rate`],
+    /// prescribed motion included): the same two-stage expansion every other connected reduced
+    /// path performs. A slice whose extent is not its operator's dimension is an error.
+    ///
+    /// # Rows
+    ///
+    /// Each operator's own essential rows and every connection-target (slave) row are preserved
+    /// as the reduced system's own identity/constraint row (`1.0`), exactly as
+    /// `ReducedSystemOperator::jacobian_diagonal` does for essential-only constraint sets (the
+    /// essential-overlap refusal in [`Self::constraints`] guarantees such a row is never a
+    /// master or a target). A master row untouched by the interface keeps its own operator's
     /// [`crate::SystemOperator::linearized_diagonal`] value unchanged; an interface-adjacent
     /// master row gains the transpose-scattered cross term `Σ w_β J_B[β,γ] w_γ` over the target
     /// (slave) trace DOFs `β, γ` it prolongates into, computed from the bounded dense interface
-    /// sub-block `SystemOperator::linearized_block` returns (cell-local JVPs restricted to the
-    /// trace DOF set, never a whole-mesh probe).
+    /// sub-block [`crate::SystemOperator::linearized_block`] returns at the same `rate_shift`
+    /// (cell-local JVPs restricted to the trace DOF set, never a whole-mesh probe). For
+    /// `matching` (weight-1 bijective pairs) the cross term is `J_B[β,β]` alone, i.e. the
+    /// sum-of-leaf-diagonals convention Krasis's `ConnectedSystemOperator::jacobian_diagonal`
+    /// uses.
     ///
     /// Requires exactly one relation between two operators (mirroring
     /// [`Self::system_constraints`]'s own nonmatching restriction). Refuses only what is
@@ -350,11 +370,43 @@ impl ConnectionRealizationPlan {
             return Ok(None);
         }
         let dimension_a = operators[0].operator().dimension();
+        let dimension_b = operators[1].operator().dimension();
+        for side in 0..2 {
+            let dimension = operators[side].operator().dimension();
+            if states[side].len() != dimension || rates[side].len() != dimension {
+                return Err(failure(format!(
+                    "connected diagonal linearization point: operator {side} has {dimension} \
+                     degrees of freedom, got state/rate slices of {}/{}",
+                    states[side].len(),
+                    rates[side].len()
+                )));
+            }
+        }
+        // The caller's slices are the connection-reduced point: expand through this connection
+        // first (a trace constraint's offset is always zero, so `expand` is the homogeneous
+        // expansion for the state and the rate alike), then through each operator's own
+        // essential constraints, exactly as Krasis's `ConnectedSystemOperator` feeds its leaves.
+        let mut reduced_state = Vec::with_capacity(dimension_a + dimension_b);
+        reduced_state.extend_from_slice(states[0]);
+        reduced_state.extend_from_slice(states[1]);
+        let mut reduced_rate = Vec::with_capacity(dimension_a + dimension_b);
+        reduced_rate.extend_from_slice(rates[0]);
+        reduced_rate.extend_from_slice(rates[1]);
+        let connected_state = pair.expand(&reduced_state)?;
+        let connected_rate = pair.expand_homogeneous(&reduced_rate)?;
         let mut physical = [Vec::new(), Vec::new()];
         let mut physical_rate = [Vec::new(), Vec::new()];
         for side in 0..2 {
-            let (state, rate) =
-                operators[side].physical_state_and_rate(time, states[side], rates[side])?;
+            let range = if side == 0 {
+                0..dimension_a
+            } else {
+                dimension_a..dimension_a + dimension_b
+            };
+            let (state, rate) = operators[side].physical_state_and_rate(
+                time,
+                &connected_state[range.clone()],
+                &connected_rate[range],
+            )?;
             physical[side] = state;
             physical_rate[side] = rate;
         }
@@ -401,7 +453,7 @@ impl ConnectionRealizationPlan {
                     .push((target_local, dependency.weight));
             }
         }
-        let mut diagonal = Vec::with_capacity(dimension_a + operators[1].operator().dimension());
+        let mut diagonal = Vec::with_capacity(dimension_a + dimension_b);
         diagonal.extend_from_slice(&diagonal_a);
         diagonal.extend_from_slice(&diagonal_b);
         for (&master, entries) in &incidence {
@@ -414,6 +466,14 @@ impl ConnectionRealizationPlan {
                 }
             }
             diagonal[master] += contribution;
+        }
+        // Each operator's own essential rows (never a master or a target, by `constraints()`'s
+        // overlap refusal) and every connection-target row are the reduced system's own
+        // identity rows, not the physical `J_ee` the unreduced diagonals carry there.
+        for (side, offset) in [(0, 0), (1, dimension_a)] {
+            for constraint in operators[side].constraints().constraints() {
+                diagonal[offset + constraint.target.0] = 1.0;
+            }
         }
         for constraint in pair.constraints() {
             diagonal[constraint.target.0] = 1.0;

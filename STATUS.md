@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-09-29
+Updated: 2026-10-08
 
 ## Role and frontier
 
@@ -11,50 +11,77 @@ numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
 SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
-(252 tests across 38 targets); final Sinbad consumer coverage passes (210 tests
-across 35 targets with a documented external-fixture target retry, unaffected
-by this package).
+(253 tests across 38 targets after the 2026-10-08 review fixes below); final
+Sinbad consumer coverage passed (210 tests across 35 targets with a documented
+external-fixture target retry) at the 2026-09-29 head, before those fixes.
 
 ## W9 SC-W3 package 1 (2026-09-29): weighted-map Jacobi diagonal
 
 - `ConnectionRealizationPlan::system_linearized_diagonal` lands the reduced
   Jacobian diagonal `diag(Rᵀ J R)` of the two-operator connected system a
-  `matching` or `nested_p1` plan couples: essential and connection-target
-  (slave) rows are preserved as the reduced system's own identity row (`1.0`,
-  exactly as the existing essential-only path already does); a master row
-  untouched by the interface keeps its own operator's
-  `SystemOperator::linearized_diagonal` value; an interface-adjacent master row
-  gains the transpose-scattered cross term `Σ w_β J_B[β,γ] w_γ` over the target
-  trace DOFs it prolongates into. Previously "weighted-map Jacobi refuses"
-  (any affine-dependency constraint set returned no diagonal at all); this
-  closes that gap for the bounded one-relation/two-operator shape
-  `system_constraints` already restricts nonmatching connections to.
-- New `SystemOperator::linearized_block` (`pub(crate)`) computes the bounded
-  dense off-diagonal Jacobian sub-block restricted to a given row/column DOF
-  set from the same cell-local JVP machinery `linearized_diagonal` uses: work
-  scales with the requested (interface-sized) column count and the cells that
-  touch them, never with the whole mesh. It is the only new primitive; no
-  change to `linearized_diagonal`, `apply_action`, `apply_reduced_action`, or
-  any existing constraint/transfer type.
+  `matching` or `nested_p1` plan couples: each operator's own essential rows
+  and every connection-target (slave) row are preserved as the reduced
+  system's own identity row (`1.0`, as `ReducedSystemOperator`'s own
+  `jacobian_diagonal` does) -- true only since the 2026-10-08 review fix
+  below: the 2026-09-29 landing identity-rowed the connection targets only
+  and left the physical `J_ee` on each operator's own essential rows while
+  claiming otherwise. A master row untouched by the interface keeps its own
+  operator's `SystemOperator::linearized_diagonal` value; an interface-adjacent
+  master row gains the transpose-scattered cross term `Σ w_β J_B[β,γ] w_γ`
+  over the target trace DOFs it prolongates into (for `matching`, `J_B[β,β]`,
+  the sum-of-leaf-diagonals convention Krasis uses). Contract: the caller
+  passes the per-operator slices of the connection-REDUCED state/rate, and
+  the point is expanded through the connection first, then through each
+  operator's own essential constraints, as every other connected reduced path
+  does (also a 2026-10-08 fix: the landing expanded only through each
+  operator's own constraints, so operator B was linearized at whatever the
+  caller's slice held on the fine-trace rows). Previously "weighted-map
+  Jacobi refuses" (any affine-dependency constraint set returned no diagonal
+  at all); this closes that gap for the bounded one-relation/two-operator
+  shape `system_constraints` already restricts nonmatching connections to.
+- New `SystemOperator::linearized_block` (`pub(crate)`) computes the
+  bounded dense off-diagonal Jacobian sub-block restricted to a given
+  row/column DOF set from the same cell-local JVP machinery
+  `linearized_diagonal` uses: work scales with the requested
+  (interface-sized) column count and the cells that touch them, never with
+  the whole mesh. It is the only new primitive; no change to
+  `linearized_diagonal`, `apply_action`, `apply_reduced_action`, or any
+  existing constraint/transfer type.
   Refusal is unchanged and reused, not widened: either operator's own
   facet-kernel operators or its own affine-dependency essential constraints
   (periodic-style, not this connection's) return `Ok(None)`, matching
   `SystemOperator::linearized_diagonal`'s and `ReducedSystemOperator`'s
   existing refusal cases exactly.
-- Proof: `tests/nested_p1_diagonal.rs` binds two real `SystemOperator`s (a
-  coarse and a fine `Conduction` instance of the `two-material-conduction.res`
-  fixture `ConnectionRealizationPlan::nested_p1` already proves coverage over)
-  with a constant-conductivity flux closure and no essential constraints, then
-  checks `system_linearized_diagonal` against bounded exhaustive probing: every
-  unit vector through the same two-operator connected reduced action,
-  reconstructed from the public `ConstraintSet::expand_homogeneous` /
-  `restrict_transpose` / `direction_residual` primitives exactly as
-  `crate::constraint::apply_constrained_action` composes them internally.
-  Measured worst relative discrepancy is exactly `0` (the fixture's `k` is
-  state-independent, so the Jacobian is exact to roundoff). The test also
-  asserts at least one interface-adjacent master row differs from the
-  unconnected operator's own diagonal, so the proof cannot pass vacuously
-  against a formula that silently ignores the connection.
+- Proof (`tests/nested_p1_diagonal.rs`, two tests; oracle revised
+  2026-10-08): bounded exhaustive probing -- every unit vector of the
+  connection-reduced space, prolongated through the pair and pushed through
+  the two REDUCED operators' own `jacobian_vector_product` with the rate
+  direction `rate_shift · d` that `linearized_diagonal` probes, restricted by
+  `Rᵀ`, target rows from `direction_residual` -- composed exactly as Krasis's
+  `ConnectedSystemOperator::jacobian_vector_product` composes its leaves,
+  including the pair-expanded linearization point. (The 2026-09-29 oracle
+  was the raw `apply_action`: a zero rate direction on the unreduced
+  operators, which could see neither essential rows nor `rate_shift`.) Gate
+  `1e-9` relative per row; measured worst discrepancies are printed by each
+  test (`0` on the two state-independent fixtures; `2.5e-16` and `2.1e-16` on
+  the storage fixture at shifts 0 and 3).
+  - `nested_p1_diagonal_matches_bounded_exhaustive_probing`: the steady
+    `two-material-conduction.res` coarse/fine `Conduction` pair with a
+    constant-conductivity flux closure and one essential constraint per side
+    on a non-interface vertex. Also asserts an interface-adjacent master row
+    differs from the unconnected diagonal, every target row is `1.0`, and
+    each essential row is `1.0` where the physical diagonal is not.
+  - `nested_p1_diagonal_sees_rate_shift_and_expands_the_point_through_the_connection`:
+    the storage-bearing, state-dependent fixture
+    `tests/fixtures/two-material-transient-conduction.res`
+    (`rho * cp * dt(T) + div(q) = 0`, `q = -k(T) grad(T)`,
+    `k(T) = k0 (1 + k1 T)`, all bound as closures). The caller's fine-trace
+    entries are deliberately wrong (0 K where the expansion gives ~300 K) and
+    operator B's own diagonal is first shown to depend on them; the connected
+    diagonal then matches the probe at `rate_shift` 0 and 3, grows with the
+    shift at every free/master row, and on interior coarse rows grows by
+    exactly `shift · rho · cp · M_ii` against `SystemOperator::mass_matrix`
+    (independent of the JVP machinery under test).
 - Open (not in this package; see "Limits and next work"): the general
   multi-relation `system_constraints` union-find path (matching, N > 1
   relations) has no analogous diagonal yet; only the single-relation,
@@ -85,9 +112,10 @@ own `jacobian_diagonal` shortcut (the cross-repo need above), a preconditioner
 optimization already addressed on the Finitum side by package 1, not a
 DAE-composition correctness requirement.
 
-`tests/nested_p1_transient.rs` closes `nonmatching.rs`'s `trace_defects`
-(continuity + dual-residual balance) test gap, which predated this wave for
-both the steady and transient/rate case:
+`tests/nested_p1_transient.rs` gives `nonmatching.rs`'s `trace_defects`
+(continuity + dual-residual balance) its first Finitum-owned test, steady or
+transient/rate (Sinbad's connected run consumed it before, so "no test
+coverage at all" overstated the gap):
 
 - `fine_side_trace_continuity_holds_for_constant_and_linear_in_time_traces`:
   `trace_defects`'s own continuity number is `<= 1e-12` for a constant trace,
@@ -107,7 +135,10 @@ both the steady and transient/rate case:
   mesh. A further direct check confirms the same result is the general
   adjoint identity `<R x, y> = <x, Rᵀ y>` via `expand_homogeneous` /
   `restrict_transpose` alone, not an artifact of `trace_defects`'s own
-  bookkeeping.
+  bookkeeping. Limitation: this proves the transpose bookkeeping (the adjoint
+  identity holds for any vector, storage-shaped or not), not a physical
+  storage-equation balance across the interface; no time-stepped two-side
+  energy balance is asserted anywhere in Finitum.
 
 Both tests bind two real `SystemOperator`s (coarse/fine `Conduction`) over the
 same `two-material-conduction.res` fixture and `nested_p1` plan package 1's
@@ -129,7 +160,8 @@ lane -- out of scope for this pass.
   Reduced operators preserve essential rows. Facet kernels and (single-operator,
   own) affine dependency constraints return no diagonal; there is no whole-mesh
   probing fallback. `ConnectionRealizationPlan::system_linearized_diagonal` (above)
-  now covers the two-operator connected case a `matching`/`nested_p1` plan couples.
+  now covers the two-operator connected case a `matching`/`nested_p1` plan couples,
+  each operator's essential rows included (since the 2026-10-08 review fix).
 - `SurfaceTransfer::p1` interpolates a triangular surface in physical 3-D to
   nonmatching points and supplies the exact dual transpose. It preserves affine
   traces and total dual loads. Degenerate/ambiguous/outside geometry refuses.
@@ -139,7 +171,7 @@ lane -- out of scope for this pass.
   coverage per coarse facet. It constructs weighted constraints and exposes
   continuity and dual-residual balance checks. Steady heat and species consumers
   exercise the product policy; arbitrary nonnested partitions refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 252 tests across 38 targets, formatting, check, strict clippy, rustdoc and doctests. Final consumer acceptance passed: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
+- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 253 tests across 38 targets, formatting, check, strict clippy, rustdoc and doctests (2026-10-08). Final consumer acceptance passed at the 2026-09-29 head: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 ## Accepted recent gates
 
@@ -189,8 +221,9 @@ lane -- out of scope for this pass.
   realization, moving/remeshed interfaces and production embedded-domain semantics
   remain open. Reference segment tables are not multidimensional hp support.
 - Connected product admission includes matching scalar P1 and one steady planar
-  nested P1 pair; weighted-map Jacobi now has a proved diagonal for that same
-  bounded shape (above), and the transient/rate proof checks Krasis needs for
+  nested P1 pair; weighted-map Jacobi has a proved diagonal for that same
+  bounded shape, essential rows included only since the 2026-10-08 review fix
+  (above), and the transient/rate proof checks Krasis needs for
   a `nested_p1` connection (fine-side continuity, dual-residual balance, both
   at any state and rate) are proved in `tests/nested_p1_transient.rs`.
   General nonnested, curved or moving nonmatching coupling and multiplier/
