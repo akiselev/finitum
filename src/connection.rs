@@ -9,6 +9,7 @@ use scientia::{RegionId, SymbolId};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 mod nonmatching;
+pub use nonmatching::PlanarCoverageReport;
 
 /// Target trace vertex followed by weighted source trace vertices.
 pub type TraceInterpolationRow = (usize, Vec<(usize, f64)>);
@@ -25,6 +26,8 @@ pub struct ConnectionRealizationPlan {
     vertex_pairs: Vec<[usize; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nonmatching: Option<(crate::SurfaceTransfer, Vec<usize>)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planar_coverage: Option<PlanarCoverageReport>,
     tolerance: f64,
     identity: String,
 }
@@ -146,6 +149,7 @@ impl ConnectionRealizationPlan {
             pairs,
             vertex_map.into_iter().map(|(a, b)| [a, b]).collect(),
             None,
+            None,
             tolerance,
         )
     }
@@ -157,6 +161,7 @@ impl ConnectionRealizationPlan {
         facet_pairs: Vec<[usize; 2]>,
         vertex_pairs: Vec<[usize; 2]>,
         nonmatching: Option<(crate::SurfaceTransfer, Vec<usize>)>,
+        planar_coverage: Option<PlanarCoverageReport>,
         tolerance: f64,
     ) -> Result<Self, FinitumError> {
         let mut fields = [SymbolId(0); 2];
@@ -204,6 +209,7 @@ impl ConnectionRealizationPlan {
             facet_pairs,
             vertex_pairs,
             nonmatching,
+            planar_coverage,
             tolerance,
             identity: String::new(),
         };

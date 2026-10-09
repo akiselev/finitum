@@ -201,11 +201,12 @@ fn validate_values(name: &str, values: &[f64], expected: usize) -> Result<(), Fi
     Ok(())
 }
 
-/// Piecewise P1 interpolation from a triangular surface in physical 3-D space.
-/// This is a point-transfer artifact, not proof of complete interface coverage.
-/// Targets outside the source surface, degenerate cells and ambiguous overlapping
-/// traces refuse. The transpose transfers dual loads; primal interpolation alone
-/// does not preserve a volume or surface integral.
+/// Weighted scalar P1 trace map from a triangular surface in physical 3-D space to target
+/// points: pointwise interpolation ([`Self::p1`]; targets outside the source surface,
+/// degenerate cells and ambiguous overlapping traces refuse) or explicit rows such as the
+/// mortar projection `ConnectionRealizationPlan::planar_p1` integrates. By itself it is a
+/// point-transfer artifact, not proof of complete interface coverage. The transpose transfers
+/// dual loads; primal interpolation alone does not preserve a volume or surface integral.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SurfaceTransfer {
     source_vertices: Vec<[f64; 3]>,
@@ -309,6 +310,65 @@ impl SurfaceTransfer {
                 }
             }
             rows.push(selected.ok_or_else(|| fail("target is outside the source surface"))?);
+        }
+        Ok(Self {
+            source_vertices,
+            source_triangles,
+            target_points,
+            rows,
+            tolerance,
+        })
+    }
+    /// The map with explicit rows (one per target point: ascending distinct source vertices
+    /// with finite weights), as `ConnectionRealizationPlan::planar_p1` builds from its exact
+    /// intersection integrals. Validates extents and indices only; the weights' meaning (a
+    /// projection, constant reproduction) is the caller's proof.
+    pub(crate) fn from_rows(
+        source_vertices: Vec<[f64; 3]>,
+        source_triangles: Vec<[usize; 3]>,
+        target_points: Vec<[f64; 3]>,
+        rows: Vec<Vec<(usize, f64)>>,
+        tolerance: f64,
+    ) -> Result<Self, FinitumError> {
+        let fail = |message: &str| {
+            FinitumError::InvalidRealization(format!("surface transfer: {message}"))
+        };
+        if source_vertices.is_empty()
+            || source_triangles.is_empty()
+            || target_points.is_empty()
+            || !tolerance.is_finite()
+            || tolerance <= 0.0
+            || source_vertices
+                .iter()
+                .chain(&target_points)
+                .flatten()
+                .any(|x| !x.is_finite())
+        {
+            return Err(fail(
+                "nonempty finite geometry and positive tolerance required",
+            ));
+        }
+        if source_triangles
+            .iter()
+            .flatten()
+            .any(|i| *i >= source_vertices.len())
+        {
+            return Err(fail("triangle vertex out of range"));
+        }
+        if rows.len() != target_points.len() {
+            return Err(fail("one weighted row per target point required"));
+        }
+        for row in &rows {
+            if row.is_empty()
+                || row
+                    .iter()
+                    .any(|(i, w)| *i >= source_vertices.len() || !w.is_finite())
+                || row.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            {
+                return Err(fail(
+                    "each row needs ascending distinct source vertices with finite weights",
+                ));
+            }
         }
         Ok(Self {
             source_vertices,

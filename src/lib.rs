@@ -33,7 +33,7 @@ pub use cad_geometry::{
     CadGeometrySource, CadNodeAssociation, CadParameterCoordinate, CadPrimalPlan,
 };
 pub use condensation::{CondensedLocalSystem, static_condense};
-pub use connection::{ConnectionRealizationPlan, TraceInterpolationRow};
+pub use connection::{ConnectionRealizationPlan, PlanarCoverageReport, TraceInterpolationRow};
 pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};

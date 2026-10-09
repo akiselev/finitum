@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-10-08
+Updated: 2026-10-09
 
 ## Role and frontier
 
@@ -11,9 +11,116 @@ numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
 SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
-(254 tests across 38 targets after the 2026-10-08 review fixes below); final
-Sinbad consumer coverage passed (210 tests across 35 targets with a documented
-external-fixture target retry) at the 2026-09-29 head, before those fixes.
+(262 tests across 39 targets after the W10 package 3 landing below; 254
+across 38 at the W9 head `a75baeb`); final Sinbad consumer coverage passed (210
+tests across 35 targets with a documented external-fixture target retry) at the
+2026-09-29 head, before the 2026-10-08 fixes and this landing.
+
+## W10 package 3 (2026-10-09): planar non-nested coverage and mortar-type P1 constraints
+
+- `ConnectionRealizationPlan::planar_p1(system, relation, meshes, facets, tolerance)`
+  (beside `nested_p1`, same signature; Sinbad product policy value expected:
+  `InterfaceTransferPolicy::PlanarP1`, serialized `planar_p1`) admits two
+  arbitrary planar triangulations of the SAME polygon: endpoint zero is the
+  master trace whose vertex values the constraints depend on, endpoint one the
+  target trace whose every vertex is eliminated. Admission is shared with
+  `nested_p1` (one `PlanarTraces::admit`, nothing duplicated): admitted
+  relation, nonempty 3-D traces, distinct exterior triangular facets, every
+  vertex within `tolerance` of the first master facet's plane, master normals
+  equal and target normals opposite to it. Both constructors now project into
+  one orthonormal in-plane frame (in-plane areas are physical); the former
+  dominant-axis projection scaled by `|n_drop|` was the same overlap criterion,
+  and `nested_p1`'s weights, refusals and 3 + 2 + 2 owner tests are unchanged.
+- Coverage proof (in the constructor, refusing): area floor `tolerance ×
+  diameter` (longest admitted edge, `1.4e-12` on the unit square at `1e-12`); a
+  triangle at or below it is degenerate; an opposite-side intersection at or
+  below it is classified empty; a same-side overlap above `max(1e-10 · min
+  area, floor)` refuses; exact orientation-independent Sutherland–Hodgman clips
+  of every target triangle against every master triangle must cover every
+  triangle of BOTH sides to relative `1e-10`, hence `Σ_{a,b} |T_a ∩ T_b| =
+  |Γ_master| = |Γ_target|` to `1e-10`. Carried as `plan.planar_coverage() ->
+  Option<&PlanarCoverageReport>` (`area: [f64; 2]`, `intersection_total`,
+  `worst_relative_defect`, `worst_constant_defect`, `relative_tolerance`,
+  `area_floor`, `pairs`, `slivers_classified`; re-exported from the crate root),
+  a new optional `skip_serializing_if` field of the plan: `None` for
+  `matching`/`nested_p1`, whose serialized bytes and identities are unchanged.
+- Constraints: the mortar projection of the master P1 trace onto the target P1
+  trace tested against the **biorthogonal dual basis** `ψ_i = 4λ_i − 1` per
+  target triangle (`∫_T ψ_i φ_j = δ_ij |T|/3`): `w_ik = ∫ ψ_i φ_k /
+  (|patch_i|/3)`, every integral exact over the intersection polygons (fan
+  triangles, degree-2 edge-midpoint rule). Chosen over the standard-basis
+  `M_ff⁻¹ M_fc`: rows stay local (a target depends only on the masters whose
+  triangles meet its patch), no dense inverse, and still a projection -- every
+  trace already in the target space (affine traces; every trace of a nested
+  pair) is reproduced, so nested consistency with `nested_p1` holds; rows sum
+  to one (constant reproduction, total dual load conserved); weights can be
+  negative (no maximum principle, as for any L2-type projection). Emitted
+  through the new `pub(crate) SurfaceTransfer::from_rows` into the same
+  `nonmatching: (SurfaceTransfer, targets)` slot, so `trace_rows`,
+  `trace_vertices`, `constraints` (same `ConstraintSet` shape: target, weighted
+  dependencies, zero offset), `trace_defects`, `system_linearized_diagonal`,
+  `system_constraints` and Krasis's generic `row_kinds`/`residual`/
+  `jacobian_vector_product`/`expand_homogeneous`/`restrict_transpose` path
+  apply unchanged.
+- Refusals (`FinitumError::InvalidRealization`, `CONNECTION_TRACE:` prefix),
+  each asserted by message in `tests/planar_p1.rs`: `planar P1 needs an
+  admitted relation and nonempty 3-D traces`; `duplicate interface facet`;
+  `facet out of range`; `triangular traces required`; `interface planes do not
+  coincide`; `planar opposite normals required`; `degenerate interface triangle
+  below the area floor`; `overlapping interface triangles`; `interface
+  triangulations do not cover the same polygon: side S triangle T is covered on
+  C of its A` (one polygon not the other, either direction, or a dropped
+  facet); `mortar rows do not reproduce constants: …` (integration self-check
+  at `1e-9`, unreachable while coverage holds); non-exterior traces propagate
+  `exterior_facet`'s `UnsupportedRealization` (`facet N is interior; …`).
+  `constraints()`'s scalar-P1, orientation and essential-overlap refusals are
+  unchanged and apply. A thin-but-admitted fan (vertex `1e-3` off an edge) and
+  a grazing fan whose `~2.5e-13` slivers against the master diagonal are
+  classified empty (2 classified, worst relative coverage defect `1.0e-12`,
+  plan admitted) show the floor classifies rather than forbids.
+- Fixtures (`tests/support/planar_meshes.rs`, transforms keep cells and facet
+  ids; orientation asserted): the right 1x1x1 box turned a quarter turn about
+  `x` against the left 1x1x1 box (the unit square split along opposite
+  diagonals, 2 vs 2 triangles, 4 pairs); the right 3x3x3 box deformed in-plane
+  by `(0.05, −0.07) sin πy sin πz` against the left 2x2x2 box (8 vs 18
+  triangles, 43 pairs; every interior target vertex `> 1e-2` from every master
+  vertex and edge, asserted); the nested 1 vs 2 pair; one-apex tetrahedral fans
+  for the overlap, degenerate, thin and grazing cases. The operator, closure
+  and exhaustive-probe helpers `tests/nested_p1_diagonal.rs` held inline moved,
+  unchanged, to `tests/support/connected_conduction.rs`, shared by both proofs.
+- Proofs (`tests/planar_p1.rs`, 8 tests; worst discrepancies as printed):
+  1. coverage: `Σ|T_a ∩ T_b| = 1 =` both areas on all three pairs; worst
+     relative coverage defect `0` / `3.4e-16` / `0` (opposite diagonals /
+     irregular / nested), worst row-sum defect `0` / `1.6e-15` / `2.2e-16`;
+     `nested_p1` refuses both non-nested pairs and carries no report;
+  2. affine reproduction at every target vertex: `0` (opposite diagonals; 2
+     rows with several non-trivial weights, 2 negative weights) and `4.5e-13`
+     (irregular, values ~300 K; 12 such rows, 34 negative weights), gate `1e-12`;
+  3. nested consistency: `1.1e-16` entrywise over 14 entries against
+     `nested_p1`, no entry present on one side only;
+  4. `<R x, y> = <x, Rᵀ y>`: `1.3e-16` relative; total dual load of target loads
+     after `restrict_transpose`: `3.8e-16` relative;
+  5. `trace_defects`: continuity `4.5e-13` for constant and linear traces,
+     balance `0` relative against `restrict_transpose` for a state residual and
+     a mass-matrix (storage) residual;
+  6. `system_linearized_diagonal` against the bounded exhaustive reduced-JVP
+     probe (`1e-9` gate) on the irregular pair: steady `3.7e-16`; storage
+     fixture `two-material-transient-conduction.res` `2.9e-16` at `rate_shift`
+     0 and `3.6e-16` at 3, with 5 masters prolongating into several targets
+     with non-trivial weights -- the general cross term `Σ w_β J_B[β,γ] w_γ`
+     exercised for the first time beyond one dependency -- identity essential
+     and target rows, and `shift · rho · cp · M_ii` growth on interior rows;
+  7. the refusals above, each by code.
+- Open: curved or moving interfaces, multiplier/Nitsche stability, the
+  multi-relation (`system_constraints` union-find, N > 1) diagonal, n-way
+  junctions, transient nonmatching composition (Krasis's). The
+  `system_constraints` refusal wording "nested nonmatching currently requires
+  one two-component relation" now also covers `planar_p1` plans (unchanged
+  text). Cross-repo need (Sinbad lane, next wave): `InterfaceTransferPolicy::
+  PlanarP1` (`planar_p1`) in `sinbad/src/case.rs`, dispatched in
+  `connected_run.rs` beside `NestedP1` to `ConnectionRealizationPlan::planar_p1`
+  under the same steady-only guard; Sinbad's "arbitrary nonnested interfaces
+  refuse" boundary becomes "curved/moving refuse". Krasis needs nothing new.
 
 ## W9 SC-W3 package 1 (2026-09-29): weighted-map Jacobi diagonal
 
@@ -155,9 +262,8 @@ same `two-material-conduction.res` fixture and `nested_p1` plan package 1's
 proof uses. Package 2 needed no time stepping or history (Krasis's own); no
 production code change, only the proof.
 
-Package 3 (planar non-nested triangulated-interface coverage proof) is **not
-started**, gated on package 2's landing per the brief but not attempted this
-lane -- out of scope for this pass.
+Package 3 (planar non-nested triangulated-interface coverage proof) was not
+started in W9; it landed 2026-10-09 as `planar_p1` (W10 section above).
 
 ## Current additions
 
@@ -180,8 +286,10 @@ lane -- out of scope for this pass.
   exterior triangular traces, absence of overlap and complete nested fine-facet
   coverage per coarse facet. It constructs weighted constraints and exposes
   continuity and dual-residual balance checks. Steady heat and species consumers
-  exercise the product policy; arbitrary nonnested partitions refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 254 tests across 38 targets, formatting, check, strict clippy, rustdoc and doctests (2026-10-08). Final consumer acceptance passed at the 2026-09-29 head: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
+  exercise the product policy. `planar_p1` (W10, above) admits arbitrary planar
+  triangulations of the same polygon with exact pairwise-intersection coverage
+  and dual-basis mortar rows; curved and moving interfaces refuse.
+- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 262 tests across 39 targets, formatting, check, strict clippy, rustdoc and doctests (2026-10-09; 254 across 38 on 2026-10-08). Final consumer acceptance passed at the 2026-09-29 head: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
 
 ## Accepted recent gates
 
@@ -236,12 +344,11 @@ lane -- out of scope for this pass.
   (above), and the transient/rate proof checks Krasis needs for
   a `nested_p1` connection (fine-side continuity, dual-residual balance, both
   at any state and rate) are proved in `tests/nested_p1_transient.rs`.
-  General nonnested, curved or moving nonmatching coupling and multiplier/
-  Nitsche stability remain open; actual time stepping/history for a transient
-  nonmatching connection is Krasis's own composition, not built here. Planar
-  non-nested triangulated-interface coverage (area-weighted mortar constraints
-  over arbitrary planar triangulations of the same polygon) is designed in
-  this wave's brief but not implemented (package 3).
+  Planar non-nested triangulations of the same polygon are admitted by
+  `planar_p1` with a proved coverage and dual-basis mortar rows (W10, above);
+  curved or moving nonmatching coupling and multiplier/Nitsche stability remain
+  open; actual time stepping/history for a transient nonmatching connection is
+  Krasis's own composition, not built here.
 - Full-coordinate affine constraint rows are generally nonsymmetric even when
   the free-coordinate `P^T A P` block is symmetric; symmetry declarations and solver
   refusals must retain that distinction.
