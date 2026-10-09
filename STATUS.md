@@ -113,7 +113,15 @@ tests across 35 targets with a documented external-fixture target retry) at the
   7. the refusals above, each by code.
 - Open: curved or moving interfaces, multiplier/Nitsche stability, the
   multi-relation (`system_constraints` union-find, N > 1) diagonal, n-way
-  junctions, transient nonmatching composition (Krasis's). The
+  junctions, transient nonmatching composition (Krasis's). Recorded
+  limitation (pre-publication review, 2026-10-09): the sliver floor is
+  absolute (`tolerance × diameter`) while the per-triangle coverage check is
+  relative (`1e-10`), so a genuine sub-floor sliver against a triangle whose
+  area is below about `floor × 1e10` (`1.4e-2` on the unit square at `1e-12`)
+  is dropped from `covered` and the pair refuses "do not cover the same
+  polygon" although the geometry is admissible; the direction is
+  conservative (a refusal, never a false admission) and no fixture reaches
+  it (smallest triangle `1/18`). The
   `system_constraints` refusal wording "nested nonmatching currently requires
   one two-component relation" now also covers `planar_p1` plans (unchanged
   text). Cross-repo need (Sinbad lane, next wave): `InterfaceTransferPolicy::

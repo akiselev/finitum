@@ -298,6 +298,7 @@ fn planar_p1_weights_coincide_with_nested_p1_on_a_nested_pair() {
         one_sided += usize::from(reference.contains_key(&key) != weights.contains_key(&key));
     }
     assert!(worst <= 1e-12, "entrywise weight discrepancy {worst:e}");
+    assert_eq!(one_sided, 0, "weights present on one side only");
     eprintln!(
         "nested consistency: worst entrywise weight discrepancy {worst:.3e} over {} entries, \
          {one_sided} present on one side only (absent = 0)",
