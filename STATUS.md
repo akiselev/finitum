@@ -11,7 +11,7 @@ numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
 SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
-(272 tests across 41 targets after the W12 L4 landing below; 262 across 39 after W10
+(281 tests across 42 targets after the W12 L6 landing below; 272 across 41 after L4; 262 across 39 after W10
 package 3; 254
 across 38 at the W9 head `a75baeb`); final Sinbad consumer coverage passed (210
 tests across 35 targets with a documented external-fixture target retry) at the
@@ -78,8 +78,53 @@ Working clone, not yet integrated or consumer-accepted. Siblings: Scientia L1 `7
 - Measurement: residual of 1-D LLF advection, 100 000 cells, 20 repeats, opt-level 2, host
   thinkpadx1 (12 threads, shared with other builds): 106 ns/face. Not optimized; no claim.
 - Open: simplex periodic pairing; spatially varying data/provider fields; systems
-  (multi-component); MUSCL/limiters/LSQ/diffusion (L6); VJP; admissibility hooks; a
-  zero-allocation proof (the crate forbids `unsafe`, so no counting allocator).
+  (multi-component); admissibility hooks; a zero-allocation proof (the crate forbids
+  `unsafe`, so no counting allocator). MUSCL/limiters/LSQ/diffusion/VJP: L6 below.
+
+## W12 L6 SV2-C2b (2026-10-19): MUSCL, limiters, TPFA diffusion, derivative chain
+
+Working clone on L4 `b935dd2`; siblings Malleus `7a43e7f` (`malleus::ad`), Scientia L1
+`7819884`. Not yet integrated or consumer-accepted.
+
+- `FvReconstruction` (`src/fv_reconstruction.rs`): unweighted linear LSQ gradients over face
+  neighbours in topology face order (periodic translated), CSR weights `M⁻¹d`; rank-deficient
+  cells (simplex corners) extend to neighbours' neighbours, else zero slope and counted
+  (`degenerate_cells`). `FvLimiter::{Unlimited, Sweby(FvKernel), BarthJespersen,
+  Venkatakrishnan{k}}`. Sweby (tensor only, else `FV_LIMITER_UNSUPPORTED`): the Scientia
+  `Limiter` kernel over `SlopeRatio`, one `run_batch` over all cell-axis pairs, `σ=φ(r)s⁻`,
+  `r=0` when `s⁻=0`, zero slope at non-periodic boundaries; non-finite `φ` ->
+  `FV_LIMITER_INVALID`. BJ/Venkatakrishnan (`ε²=(k|Ω|^{1/d})³`, clamped to 1) on any mesh.
+  Diagnostics `slopes`, `face_states`; `derivative_refusal()` (Sweby via `malleus::ad`
+  `NonsmoothPolicy::Refuse`, `FV_NONSMOOTH_DERIVATIVE_REFUSED` with kink sites).
+- `FvRealization` takes `Muscl` intents: conserved variables only (`Primitive` ->
+  `FV_PRIMITIVE_RECONSTRUCTION_UNSUPPORTED`), `LeastSquares` anywhere, `Axis1D` tensor only,
+  `GreenGauss` -> `FV_GRADIENT_UNSUPPORTED`. Face, ghost (reads the reconstructed interior
+  state) and speed kernels read reconstructed face states; CFL uses them too.
+- `with_diffusion(FvDiffusion{coefficient})`: TPFA `−κ(u⁺−u⁻)/(δ·n)` with cell values on
+  interior/periodic/ghost faces (half-cell `δ` at a ghost; prescribed flux is total).
+  Refuses `max_nonorthogonality() > 1e-10` rad (`FV_TPFA_NONORTHOGONAL`, all 2-D/3-D simplex
+  boxes) and bad coefficients (`FV_DIFFUSION_INVALID`). CFL sums `|f|(λ_f+κ/(δ·n))`.
+  Identity `blake3(schema, base digest, "two_point", κ)`; without diffusion unchanged.
+- Derivatives: JVP through unlimited reconstruction (linear); `state_vjp(t,u,w,out)` =
+  `(∂R/∂u)ᵀw` from unit-tangent face/ghost/source JVP partials and the exact transpose of
+  reconstruction (allocates per call). Any limited reconstruction refuses JVP and VJP
+  (`InputEvaluation`, origin `fv/limiter`); primal unaffected.
+- Receipt adds skip-if-none `muscl{variables, gradient, limiter, limiter_kernel_digest,
+  degenerate_gradient_cells, derivative}`, `diffusion{scheme, coefficient,
+  max_nonorthogonality}`, `max_nonorthogonality`; `reconstruction` = `muscl`. L4 first-order
+  digests and receipt bytes pinned (`first_order_identities_are_pinned`).
+- Evidence `tests/sv2c2b_fv.rs` (9) + fixture `fv-muscl.res`: LSQ exact for linear fields
+  (graded tensor, simplex) at cells and faces; BJ strictly bounded, Venkatakrishnan within
+  O(ε²) on a simplex step; transpose identity ≤ 64ε·scale (Burgers central periodic, inflow
+  LLF + diffusion, 2-D simplex LLF) and Taylor order 1.9–2.1 (Burgers); D6 refusals for the
+  four Sweby kernels, Scientia agreeing; TVD + min/max on a 100-cell square wave, 120
+  SSP-RK3 steps at the stable step, each Sweby limiter (unlimited control fails); L1 orders
+  128->256 on sin(2πx), t=0.5, SSP-RK3: first 0.97, unlimited 2.00, van Leer 2.05, MC 1.99;
+  TPFA linear profile exact, Pe=10 boundary layer (central + TPFA) max error 1.75e-3 ->
+  4.57e-4 (order 1.94); simplex refusals. L4's MUSCL refusal assertion now asserts success.
+- Not measured (no performance claim). Open: Scientia lowering of `div(-k grad u)` and of
+  BJ/Venkatakrishnan intents (Finitum realizes both once programs carry them); limited-slope
+  frozen-active-set derivatives; non-orthogonal diffusion correction; spatially varying κ.
 
 ## W11 F1 (2026-10-19): prepared and batched Malleus execution
 

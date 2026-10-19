@@ -576,6 +576,24 @@ impl FvTopology {
             .chain(self.boundary.values())
     }
 
+    /// The largest angle (radians) between a face's centroid offset `delta` and its unit
+    /// normal over every face; `0` on tensor meshes. Two-point diffusion needs it near zero.
+    pub fn max_nonorthogonality(&self) -> f64 {
+        let dimension = self.dimension;
+        let mut worst = 0.0_f64;
+        for block in self.blocks() {
+            for face in 0..block.len() {
+                let delta = &block.delta[face * dimension..(face + 1) * dimension];
+                let length = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+                let projected = (0..dimension)
+                    .map(|axis| delta[axis] * block.normal[axis][face])
+                    .sum::<f64>();
+                worst = worst.max((projected / length).clamp(-1.0, 1.0).acos());
+            }
+        }
+        worst
+    }
+
     /// Check positivity, unit normals, face-count and closure (`Σ_f s_if |f| n_f = 0` for every
     /// closed cell, to `8·faces·ε` relative to `Σ_f |f|`) and interior pairing.
     pub fn check_invariants(&self) -> Result<FvTopologyInvariants, FinitumError> {

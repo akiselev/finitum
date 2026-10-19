@@ -11,6 +11,7 @@ mod embedded;
 mod error;
 mod execution;
 mod fv;
+mod fv_reconstruction;
 mod fv_topology;
 mod infsup;
 mod interface;
@@ -42,9 +43,13 @@ pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::{FinitumError, InputEvaluationError, InputLocation, InputOrigin};
 pub use fv::{
-    FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FvCfl, FvConservationReceipt,
-    FvDerivativeDisposition, FvFaceFluxes, FvKernelReceipt, FvRealization, FvRealizationReceipt,
+    FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FV_TPFA_NONORTHOGONALITY_TOLERANCE,
+    FvCfl, FvConservationReceipt, FvDerivativeDisposition, FvDiffusion, FvDiffusionReceipt,
+    FvFaceFluxes, FvKernelReceipt, FvRealization, FvRealizationReceipt, FvReconstructionReceipt,
     discrete_flux_balance, scatter_face_fluxes,
+};
+pub use fv_reconstruction::{
+    FV_NONSMOOTH_DERIVATIVE_REFUSED, FvBlockStates, FvLimiter, FvReconstruction,
 };
 pub use fv_topology::{
     AxisSpacing, FV_TOPOLOGY_SCHEMA, FvCellShape, FvFaceBlock, FvTopology, FvTopologyInvariants,

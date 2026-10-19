@@ -750,7 +750,7 @@ fn realization_identity_and_binding_refusals() {
         )),
         "FV_BOUNDARY_TAG_UNKNOWN"
     );
-    // MUSCL reconstruction is SV2-C2b.
+    // MUSCL reconstruction (SV2-C2b) is now realized; see `tests/sv2c2b_fv.rs`.
     let module = module();
     let system = compile_conservation_law_system(&module, "Burgers1D", "balance", "u").unwrap();
     let muscl = FvMethodIntent {
@@ -762,14 +762,13 @@ fn realization_identity_and_binding_refusals() {
         ..intent(NumericalFluxIntent::LocalLaxFriedrichs)
     };
     let program = lower_conservation_law(&module, &system, &muscl, &[]).unwrap();
-    assert_eq!(
-        code(FvRealization::new(
-            &system,
-            Arc::new(program),
-            ring.clone(),
-            &RegionMap::new(),
-            &BTreeMap::from([("k".to_string(), 0.3)]),
-        )),
-        "FV_RECONSTRUCTION_UNSUPPORTED"
-    );
+    let realized = FvRealization::new(
+        &system,
+        Arc::new(program),
+        ring.clone(),
+        &RegionMap::new(),
+        &BTreeMap::from([("k".to_string(), 0.3)]),
+    )
+    .unwrap();
+    assert_eq!(realized.receipt().reconstruction, "muscl");
 }
