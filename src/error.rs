@@ -70,6 +70,9 @@ pub enum FinitumError {
     KernelValidation(String),
     #[error("Malleus kernel execution failed: {0}")]
     KernelExecution(String),
+    /// The selected [`crate::ExecutionBackend`] cannot run in this build or process.
+    #[error("EXECUTION_BACKEND_UNAVAILABLE: {0}")]
+    ExecutionBackendUnavailable(String),
     #[error("assembled realization failed: {0}")]
     Assembly(String),
     #[error("stale CAD geometry revision: expected {expected}, got {actual}")]
@@ -166,6 +169,7 @@ impl FinitumError {
             }
             FinitumError::SamplingUnsupported { .. } => Some("SAMPLING_UNSUPPORTED"),
             FinitumError::InfSupUnstable(_) => Some("INF_SUP_UNSTABLE"),
+            FinitumError::ExecutionBackendUnavailable(_) => Some("EXECUTION_BACKEND_UNAVAILABLE"),
             _ => None,
         }
     }

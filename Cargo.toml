@@ -10,11 +10,16 @@ description = "Concrete discretization and global operator realization for the S
 blake3 = "1"
 cadabra-provider = { path = "../cadabra3/crates/cadabra-provider" }
 malleus = { path = "../malleus" }
+malleus-cranelift = { path = "../malleus/crates/malleus-cranelift", optional = true }
 scientia = { path = "../scientia" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 methodus = { path = "../methodus" }
 thiserror = "2"
+
+[features]
+# Native kernel execution through malleus-cranelift (ExecutionBackend::Cranelift).
+cranelift = ["dep:malleus-cranelift"]
 
 [dev-dependencies]
 cadabra = { path = "../cadabra3/crates/cadabra" }

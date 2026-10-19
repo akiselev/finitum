@@ -48,6 +48,11 @@ pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::{FinitumError, InputEvaluationError, InputLocation, InputOrigin};
+pub use execution::{
+    EXECUTION_BACKEND_ENV, EXECUTION_RECEIPT_SCHEMA, ExecutionBackend, ExecutionKernelReceipt,
+    ExecutionReceipt, KernelEngine, native_kernel_cache_len, selected_execution_backend,
+    with_execution_backend,
+};
 pub use fv::{
     FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FV_TPFA_NONORTHOGONALITY_TOLERANCE,
     FvCfl, FvConservationReceipt, FvDerivativeDisposition, FvDiffusion, FvDiffusionReceipt,

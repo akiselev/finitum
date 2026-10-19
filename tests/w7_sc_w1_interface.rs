@@ -887,3 +887,114 @@ fn interface_binding_refusals_are_typed() {
         Err(FinitumError::ArtifactMismatch(_))
     ));
 }
+
+#[cfg(feature = "cranelift")]
+#[path = "support/backend.rs"]
+mod backend;
+
+/// W13 A1: facet-pair kernels (primal, JVP, VJP) run bitwise equal on Cranelift.
+#[cfg(feature = "cranelift")]
+#[test]
+fn cranelift_backend_is_bitwise_equal_on_facet_pair_kernels() {
+    let ((interpreted, interpreted_receipt), (native, native_receipt)) =
+        backend::on_both_backends(|| {
+            let mesh = unit_square(3);
+            let topology = FacetTopology::from_mesh(&mesh).unwrap();
+            let measure = InterfaceMeasure::interior(&topology).unwrap();
+            let operator = InterfaceOperator::new(
+                p0_space(&mesh),
+                measure,
+                vec![
+                    InterfaceKernel::new(jump_penalty_kernel(2.5), u_value_bindings()).unwrap(),
+                    InterfaceKernel::new(flux_kernel(false), flux_bindings([0.7, -0.4])).unwrap(),
+                    InterfaceKernel::new(flux_kernel(true), flux_bindings([-0.2, 1.1])).unwrap(),
+                ],
+            )
+            .unwrap();
+            let cells = operator.dimension();
+            let state = probe(cells, 0.4);
+            let context = EvaluationContext::default();
+            let product = |run: &dyn Fn(&mut [f64]) -> Result<(), String>| {
+                let mut output = vec![0.0; cells];
+                run(&mut output).map(|()| output)
+            };
+            let outcomes = vec![
+                product(&|out| operator.residual(&state, out).map_err(|e| e.to_string())),
+                product(&|out| {
+                    operator
+                        .apply_action(&state, out)
+                        .map_err(|e| e.to_string())
+                }),
+                product(&|out| {
+                    operator
+                        .apply(&context, &state, out)
+                        .map_err(|e| e.to_string())
+                }),
+                product(&|out| {
+                    operator
+                        .apply_transpose(&context, &state, out)
+                        .map_err(|e| e.to_string())
+                }),
+                backend::outcome::<String>(Ok(dense(&operator).concat())),
+            ];
+            (outcomes, operator.execution_receipt())
+        });
+    backend::assert_bitwise_outcomes("interface", &interpreted, &native);
+    backend::assert_native_receipts("interface", &interpreted_receipt, &native_receipt);
+    assert!(interpreted.iter().all(Result::is_ok), "{interpreted:?}");
+}
+
+/// W13 A1: a kernel the JIT refuses (over its 256-statement IR budget) runs on the
+/// interpreter per kernel, recorded with its reason, while the other kernels stay native; the
+/// results are still the interpreter's bits.
+#[cfg(feature = "cranelift")]
+#[test]
+fn cranelift_refusals_fall_back_per_kernel_and_are_recorded() {
+    let oversized = || {
+        let mut kernel = jump_penalty_kernel(0.01);
+        let statements = kernel.kernel.body.statements.clone();
+        kernel.kernel.name = "p0-jump-penalty-unrolled".into();
+        kernel.kernel.body.statements = statements.iter().cycle().take(300).cloned().collect();
+        kernel
+    };
+    let ((interpreted, receipt_i), (native, receipt_n)) = backend::on_both_backends(|| {
+        let mesh = unit_square(2);
+        let topology = FacetTopology::from_mesh(&mesh).unwrap();
+        let operator = InterfaceOperator::new(
+            p0_space(&mesh),
+            InterfaceMeasure::interior(&topology).unwrap(),
+            vec![
+                InterfaceKernel::new(jump_penalty_kernel(2.5), u_value_bindings()).unwrap(),
+                InterfaceKernel::new(oversized(), u_value_bindings()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let state = probe(operator.dimension(), 0.9);
+        let mut residual = vec![0.0; operator.dimension()];
+        let outcome = operator
+            .residual(&state, &mut residual)
+            .map(|()| residual)
+            .map_err(|e| e.to_string());
+        (
+            vec![outcome, Ok(dense(&operator).concat())],
+            operator.execution_receipt(),
+        )
+    });
+    backend::assert_bitwise_outcomes("fallback", &interpreted, &native);
+    assert!(interpreted.iter().all(Result::is_ok), "{interpreted:?}");
+    assert_eq!(receipt_i.fallbacks, 0);
+    assert_eq!(receipt_i.native, 0);
+    assert_eq!(receipt_n.backend, finitum::ExecutionBackend::Cranelift);
+    assert!(receipt_n.native >= 1, "{receipt_n:?}");
+    assert!(receipt_n.fallbacks >= 1, "{receipt_n:?}");
+    assert_eq!(receipt_n.interpreted, receipt_n.fallbacks);
+    for kernel in &receipt_n.kernels {
+        match &kernel.engine {
+            finitum::KernelEngine::Fallback { reason } => {
+                assert!(kernel.name.contains("unrolled"), "{kernel:?}");
+                assert!(reason.contains("IR budget"), "{reason}");
+            }
+            engine => assert_eq!(*engine, finitum::KernelEngine::Native, "{kernel:?}"),
+        }
+    }
+}

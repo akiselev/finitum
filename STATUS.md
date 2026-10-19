@@ -193,42 +193,67 @@ Working clone on L4 `b935dd2`; siblings Malleus `7a43e7f` (`malleus::ad`), Scien
   BJ/Venkatakrishnan intents (Finitum realizes both once programs carry them); limited-slope
   frozen-active-set derivatives; non-orthogonal diffusion correction; spatially varying κ.
 
+## W13 A1 (2026-10-19): JIT execution backend (W11 F2)
+
+Working clone, not yet integrated. Siblings: Malleus `7a43e7f` (`crates/malleus-cranelift`).
+- `ExecutionBackend::{Interpreter, Cranelift}` (serde `interpreter`/`cranelift`). Cargo
+  feature `cranelift` (off by default) adds the optional `malleus-cranelift` path dependency
+  (Cranelift `=0.128.3` crates enter `Cargo.lock`); without it `Cranelift` is refused with
+  `FinitumError::ExecutionBackendUnavailable` (code `EXECUTION_BACKEND_UNAVAILABLE`).
+- Selection is captured when a kernel is prepared: `with_execution_backend(backend, || ..)`
+  (thread scope, restored on unwind) else the process default `FINITUM_EXECUTION_BACKEND`
+  (`interpreter` when unset; other values refuse). Every kernel-owning object (realization
+  plans, system operators and bind compositions, interface operators, FV realizations,
+  methods, samplers, functionals) therefore follows the scope it was built in.
+- Under `Cranelift` each kernel is compiled once per process via one shared
+  `malleus_cranelift::JitCache` (key: kernel digest, schedule, level, backend version, CPU
+  features, batch ABI) and every call goes through the same positional `run_batch` (one native
+  loop over face/cell/point batches; JVP/VJP kernels included). Bindings are checked by the core
+  `check_bindings` on both paths and refusals re-run the interpreter, so errors are identical.
+  Compositions run natively stage by stage with `PreparedComposition`'s copy-in/copy-out
+  semantics when every stage compiled; a binding shape it does not accept is re-run by the
+  interpreter for its error. A kernel the JIT refuses runs on the interpreter: per kernel,
+  recorded as `KernelEngine::Fallback{reason}`.
+- Receipts (`finitum-execution-receipt/1`): `execution_receipt()` on `RealizationPlan`,
+  `SystemOperator`, `InterfaceOperator`, `FvRealization` -> `ExecutionReceipt{backend,
+  backend_identity, native, interpreted, fallbacks, kernels[{name, kernel_digest, engine}]}`
+  (distinct by digest). Not in any capability, receipt or digest: no serialized type, digest or
+  existing public signature changed (pins in `first_order_identities_are_pinned`, capability
+  tests, Sinbad identities unchanged; `w13_execution_backend` asserts digest and FV receipt
+  bytes equal across backends).
+- Differential proof (feature `cranelift`; bitwise, NaN-equivalent; errors equal as text;
+  every distinct kernel native, zero fallbacks, same digests): `gx_f7_vjp`
+  `cranelift_backend_is_bitwise_equal_on_fe_residual_jvp_vjp_and_assembly` (Poisson, hanging
+  constraint, elasticity, nonlinear dynamic input: residual, JVP, VJP, linearized, assembled
+  values/action, matrix-free); `w8_multi_instance_system` `..._on_the_system_path_and_bind_
+  compositions` (monolithic + composed electrothermal, both quadratures, three states);
+  `w7_sc_w1_interface` `..._on_facet_pair_kernels` and
+  `cranelift_refusals_fall_back_per_kernel_and_are_recorded` (300-statement kernel over the
+  JIT IR budget: interpreter, reason recorded, others native, same bits); `sv2c2a_fv` first
+  order LLF/HLL/central 1-D + 2-D HLL with ±0, ±inf, NaN, subnormal, ±huge states;
+  `sv2c2b_fv` MUSCL x {none, minmod, van Leer, MC, superbee} x {axis, LSQ, Green-Gauss},
+  tensor + simplex, TPFA diffusion (Barth-Jespersen/Venkatakrishnan are refused by Scientia
+  lowering, so no FV kernel exists for them). `w13_execution_backend`: selection, scoping,
+  compile-once (second realization compiles nothing). Whole battery also green with the
+  feature and `FINITUM_EXECUTION_BACKEND=cranelift` (43 targets, 288 tests; default
+  build 43 targets, 282 tests).
+- Finitum timing (`finished in`, s, feature build, same binaries, env toggled, 3 alternating
+  reps, median; opt 2, thinkpadx1 12 threads, load 9-17 from other projects): interpreter /
+  cranelift: w7_system_path_parity 7.50/6.02, gx_c4_facet_integrals 1.91/1.75, planar_p1
+  1.44/1.06, sv2b4_system_stokes 1.55/1.07, w7_infsup 2.43/1.15, sv2_elasticity 1.64/0.35.
+  Includes ~0.2-0.3 ms compile per distinct kernel; remaining time is Finitum gathers.
+- Open: SIMD across points, batching the remaining per-point loops, a disk cache.
+
 ## W11 F1 (2026-10-19): prepared and batched Malleus execution
 
-- Every Malleus call site runs prepared (`malleus::prepared`, M1 head `51aa9d3`):
-  `src/execution.rs` holds `PreparedExecutable` / `PreparedExecutableModule` /
-  `PreparedExecutableComposition` next to the executable in its owning struct
-  (`BoundBundle`, interface `BoundKernel`, functional `Node`, method
-  `AffineExecutable`, `BoundComposition`; field-source kernels are prepared once
-  where their closures are built). No address-keyed cache. Calls bind positionally
-  over inline (<=16 operand) binding tables and a per-thread `PreparedState` /
-  `CompositionState`; a positional refusal re-runs `PreparedKernel::run`, which
-  returns the interpreter's exact `ExecutionError`, so `KernelExecution` text is
-  unchanged. No `Interpreter::run`/`run_composition` call remains in `src/`.
-- `PointBatch` (realization.rs) packs per-point operand windows strided by
-  `region.offset + region.length`; `execute` is its one-point case.
-  `execute_{primal,jvp}_values_batch` run one `run_batch` per kernel and return the
-  outputs before the first refusal plus that refusal, so callers keep the
-  point-by-point error and accumulation order. Batched: the system cell loop
-  (`SystemOperator::apply_block_cell`, primal + JVP; bind compositions stay per
-  point). Batching the single-field `RealizationPlan::apply_cell` loop too (outputs
-  replayed in point-major order) passed all 262 tests but changed no target time
-  measurably (sv2_elasticity 3.9 -> 4.5, planar_p1 4.6 -> 4.3, load 28), so it was
-  not landed. Not yet batched (open): single-field realization point loops, facet and
-  interface loops, VJP paths, the one-shot scalar property kernels (still allocate
-  their operand vectors), and Finitum's per-point `BTreeMap` gathers, which now
-  dominate.
-- No serialized type, digest or public API changed; Sinbad needs no change.
-- Timing (wall s per test binary, opt-level 2, 4 build jobs, shared host;
-  before = `e415d8d` load 37-52, P1 = prepared load 33, after = +batching load 31):
-  w7_system_path_parity 45.5 / 19.0 / 16.1; gx_c4_facet_integrals 26.7 / 5.7 / 5.2;
-  planar_p1 15.9 / 4.6 / 4.6; sv2_elasticity 15.3 / 4.0 / 3.9;
-  sv2b4_system_stokes 10.8 / 4.4 / 4.4; w7_rt0_essential 9.5 / 3.0 / 2.3.
-  Load was higher for the baseline; the 2-5x ratios exceed what load explains.
-- perf (`perf record -F 199`, w7_system_path_parity): before, `malleus::*` 33% and
-  malloc/free 18% of samples; after, `malleus::*` 23% (point program 7%, columnar
-  blocks 4%) and malloc/free 16%; the rest is Finitum gather (`PointBatch::push`
-  5%, `point_inputs_system`, BTreeMap traffic).
+Condensed 2026-10-19 (full text at `90c4789`). Every Malleus call runs prepared
+(`src/execution.rs`: `PreparedExecutable`/`Module`/`Composition` held by the owning struct, no
+address-keyed cache; positional binding over inline tables and per-thread state; a refusal
+re-runs `PreparedKernel::run` for the interpreter's exact error). `PointBatch` packs strided
+per-point windows; the system cell loop runs one `run_batch` per kernel. Not batched (open):
+single-field point loops, facet/interface loops, VJP paths, scalar property kernels; Finitum's
+per-point `BTreeMap` gathers dominate profiles. Timing before/after (s, opt 2, loaded host):
+w7_system_path_parity 45.5/16.1, gx_c4 26.7/5.2, planar_p1 15.9/4.6, sv2_elasticity 15.3/3.9.
 
 ## W10 package 3 (2026-10-09): planar non-nested coverage and mortar-type P1 constraints
 
@@ -261,49 +286,19 @@ Condensed 2026-10-19 (full text in git history at `16dbdf3`).
 
 ## Current additions
 
-- `ConnectionRealizationPlan::system_constraints` checks each pair's scientific
-  source, model, mesh, field, orientation and essential-boundary exclusions, then
-  forms deterministic flat equivalence classes across multiple matching relations.
-  Transpose restriction accumulates all participating residuals.
-- `SystemOperator::linearized_diagonal` obtains the dynamic Jacobian diagonal
-  through cell-local JVP columns at the actual state/rate and declared rate shift.
-  Reduced operators preserve essential rows. Facet kernels and (single-operator,
-  own) affine dependency constraints return no diagonal; there is no whole-mesh
-  probing fallback. `ConnectionRealizationPlan::system_linearized_diagonal` (above)
-  now covers the two-operator connected case a `matching`/`nested_p1` plan couples,
-  each operator's essential rows included (since the 2026-10-08 review fix).
-- `SurfaceTransfer::p1` interpolates a triangular surface in physical 3-D to
-  nonmatching points and supplies the exact dual transpose. It preserves affine
-  traces and total dual loads. Degenerate/ambiguous/outside geometry refuses.
-  The point-transfer artifact alone is not a coverage proof.
-- `ConnectionRealizationPlan::nested_p1` additionally proves planar, opposite,
-  exterior triangular traces, absence of overlap and complete nested fine-facet
-  coverage per coarse facet. It constructs weighted constraints and exposes
-  continuity and dual-residual balance checks. Steady heat and species consumers
-  exercise the product policy. `planar_p1` (W10, above) admits arbitrary planar
-  triangulations of the same polygon with exact pairwise-intersection coverage
-  and dual-basis mortar rows; curved and moving interfaces refuse.
-- Focused dynamic-diagonal/JVP comparison passes. Complete owner gate passed: 262 tests across 39 targets, formatting, check, strict clippy, rustdoc and doctests (2026-10-09; 254 across 38 on 2026-10-08). Final consumer acceptance passed at the 2026-09-29 head: 210 tests across 35 targets, with a documented external-fixture target retry and unchanged source.
+Condensed 2026-10-19 (text at `90c4789`): `ConnectionRealizationPlan::system_constraints`
+(flat equivalence classes across matching relations), `SystemOperator::linearized_diagonal`
+(cell-local JVP columns; facet kernels and affine constraints give no diagonal, no probing
+fallback), `SurfaceTransfer::p1` (3-D surface interpolation with exact dual transpose),
+`nested_p1` coverage proofs and weighted constraints. Owner gate 262 tests/39 targets on
+2026-10-09; consumer acceptance 210 tests/35 targets at the 2026-09-29 head.
 
 ## Accepted recent gates
 
-- SC-W2 first matching-interface implementation: complete bijective exterior
-  facet/vertex coverage, opposite normals/measures, source/model/mesh identity,
-  scalar P1 traces, row orientation and essential-constraint non-overlap. Only
-  a matching proof admits Open boundary terms; gaps, partial coverage, same-facing
-  normals and nonmatching meshes refuse. September 17 owner gate: 246 tests across
-  35 targets, formatting, strict clippy, rustdoc and doctests passed.
-  [Evidence](docs/validation/2026-09-17-sc-w2/README.md).
-- SHOW-1: portable simplex meshes, exact P1 samples through FieldSampler, and
-  clipped exterior/cap geometry with owner sampling coordinates. Non-P1 exports
-  refuse. September 17: 245 tests across 34 targets and the lint/doc gates passed.
-  [Evidence](docs/validation/2026-09-17-show1/README.md).
-- M-CPU-S: cell-local CSR assembly and scratch reuse, preserving operator/identity/
-  symmetry semantics. September 17: 243 owner tests, six focused comparisons and
-  195 unchanged Sinbad consumer tests passed. Mixed-case input evaluations fell
-  from 2,832 to 720. Exterior-facet/empty-mesh probing, reduced/linearized assembly,
-  proof tolerance and dimension cap were unchanged by that bounded fix.
-  [Evidence](docs/validation/2026-09-17-mcpu-s/README.md).
+Condensed 2026-10-19 (text at `90c4789`): SC-W2 matching interface (246 tests, 2026-09-17,
+[evidence](docs/validation/2026-09-17-sc-w2/README.md)); SHOW-1 portable meshes and exact P1
+sampling ([evidence](docs/validation/2026-09-17-show1/README.md)); M-CPU-S cell-local CSR
+assembly ([evidence](docs/validation/2026-09-17-mcpu-s/README.md)).
 
 ## Library surface
 

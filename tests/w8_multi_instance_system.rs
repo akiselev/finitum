@@ -1933,3 +1933,85 @@ fn mcpu_s_composed_assembly_matches_every_global_column() {
         mcpu_assembly::compare(&composed.operator, "composed electrothermal");
     }
 }
+
+#[cfg(feature = "cranelift")]
+#[path = "support/backend.rs"]
+mod backend;
+
+/// Residual, JVP, shifted VJP, linearized action and assembled values of a system operator.
+#[cfg(feature = "cranelift")]
+fn system_outcomes(
+    operator: &SystemOperator,
+    state: &[f64],
+    rate: &[f64],
+) -> Vec<backend::Outcome> {
+    let n = operator.dimension();
+    let direction = probe_vector(n, 0.3, 1.0);
+    let rate_direction = probe_vector(n, 1.7, 0.4);
+    let adjoint = probe_vector(n, 4.2, 1.0);
+    let context = methodus::EvaluationContext::reproducible();
+    let product = |run: &dyn Fn(&mut [f64]) -> Result<(), String>| {
+        let mut output = vec![0.0; n];
+        run(&mut output).map(|()| output)
+    };
+    vec![
+        product(&|out| {
+            operator
+                .residual(TIME, state, rate, out)
+                .map_err(|e| e.to_string())
+        }),
+        product(&|out| {
+            operator
+                .jacobian_vector_product(TIME, state, rate, &direction, &rate_direction, out)
+                .map_err(|e| e.to_string())
+        }),
+        product(&|out| {
+            operator
+                .vector_jacobian_product_shifted(TIME, state, rate, &adjoint, RATE_SHIFT, out)
+                .map_err(|e| e.to_string())
+        }),
+        product(&|out| {
+            let linearized = operator
+                .linearize(TIME, state, rate, RATE_SHIFT)
+                .map_err(|e| e.to_string())?;
+            linearized
+                .apply(&context, &direction, out)
+                .map_err(|e| e.to_string())
+        }),
+        backend::outcome(operator.assemble().map(|matrix| matrix.values().to_vec())),
+    ]
+}
+
+/// W13 A1: the system path, including kernel-input bind compositions, runs bitwise equal on
+/// Cranelift (composed electrothermal and its monolithic twin, both quadratures).
+#[cfg(feature = "cranelift")]
+#[test]
+fn cranelift_backend_is_bitwise_equal_on_the_system_path_and_bind_compositions() {
+    for quadrature in [SystemQuadrature::Barycenter, SystemQuadrature::Richest] {
+        let ((interpreted, receipts_i), (native, receipts_n)) = backend::on_both_backends(|| {
+            let tagged = unit_square(3);
+            let mono = monolithic_08(&tagged, quadrature);
+            let composed = composed_electrothermal(&tagged, quadrature);
+            let mut outcomes = Vec::new();
+            for (_, state, rate) in states(&mono) {
+                outcomes.extend(system_outcomes(&mono.operator, &state, &rate));
+                // The composed layout differs from the monolithic one; the same vectors are
+                // simply other admissible states for it.
+                outcomes.extend(system_outcomes(&composed.operator, &state, &rate));
+            }
+            (
+                outcomes,
+                [
+                    mono.operator.execution_receipt(),
+                    composed.operator.execution_receipt(),
+                ],
+            )
+        });
+        let label = format!("{quadrature:?}");
+        backend::assert_bitwise_outcomes(&label, &interpreted, &native);
+        for (left, right) in receipts_i.iter().zip(&receipts_n) {
+            backend::assert_native_receipts(&label, left, right);
+        }
+        assert!(interpreted.iter().all(Result::is_ok), "{interpreted:?}");
+    }
+}

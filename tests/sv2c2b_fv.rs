@@ -776,3 +776,99 @@ fn simplex_refusals_and_binding_shapes() {
         "FV_DIFFUSION_INVALID"
     );
 }
+
+#[cfg(feature = "cranelift")]
+#[path = "support/backend.rs"]
+mod backend;
+
+/// W13 A1: MUSCL reconstruction with every limiter family Scientia lowers (Barth-Jespersen and
+/// Venkatakrishnan are refused at lowering, `FV_LIMITER_UNSUPPORTED`) and every gradient
+/// scheme, and two-point diffusion, run bitwise equal on Cranelift (tensor 1-D, simplex 2-D).
+#[cfg(feature = "cranelift")]
+#[test]
+fn cranelift_backend_is_bitwise_equal_on_muscl_limiters_and_tpfa() {
+    let limiters = [
+        LimiterFamily::None,
+        LimiterFamily::Minmod,
+        LimiterFamily::VanLeer,
+        LimiterFamily::MonotonizedCentral,
+        LimiterFamily::Superbee,
+    ];
+    for limiter in limiters {
+        for (gradient, simplex) in [
+            (GradientScheme::Axis1D, false),
+            (GradientScheme::LeastSquares, false),
+            (GradientScheme::LeastSquares, true),
+            (GradientScheme::GreenGauss, true),
+        ] {
+            let label = format!("{limiter:?}/{gradient:?}/simplex={simplex}");
+            let ((interpreted, receipt_i), (native, receipt_n)) = backend::on_both_backends(|| {
+                let built = if simplex {
+                    realization(
+                        MUSCL,
+                        "WalledAdvection2D",
+                        NumericalFluxIntent::LocalLaxFriedrichs,
+                        muscl(gradient, limiter.clone()),
+                        &simplex_square(4),
+                        &[("ax", 1.0), ("ay", 0.5)],
+                    )
+                } else {
+                    realization(
+                        SCALAR,
+                        "InflowAdvection1D",
+                        NumericalFluxIntent::LocalLaxFriedrichs,
+                        muscl(gradient, limiter.clone()),
+                        &line(16, false),
+                        &[("a", 1.0)],
+                    )
+                    .and_then(|operator| operator.with_diffusion(FvDiffusion { coefficient: 0.05 }))
+                };
+                let operator = match built {
+                    Ok(operator) => operator,
+                    Err(error) => return (vec![Err(error.to_string())], None),
+                };
+                let cells = operator.dimension();
+                let state = values(cells, 41);
+                let step = state
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| if index < cells / 2 { 1.0 } else { -0.0 })
+                    .collect::<Vec<_>>();
+                let direction = values(cells, 43);
+                let mut outcomes = Vec::new();
+                for state in [&state, &step] {
+                    let zero = vec![0.0; cells];
+                    let mut out = vec![0.0; cells];
+                    outcomes.push(backend::outcome(
+                        DaeOperator::residual(&operator, &cx(), 0.0, state, &zero, &mut out)
+                            .map(|()| out.clone()),
+                    ));
+                    outcomes.push(backend::outcome(
+                        DaeOperator::jacobian_vector_product(
+                            &operator,
+                            &cx(),
+                            0.0,
+                            state,
+                            &zero,
+                            &direction,
+                            &zero,
+                            &mut out,
+                        )
+                        .map(|()| out.clone()),
+                    ));
+                    outcomes.push(backend::outcome(
+                        ExplicitOperator::rhs(&operator, &cx(), 0.0, state, &mut out)
+                            .map(|()| out.clone()),
+                    ));
+                }
+                (outcomes, Some(operator.execution_receipt()))
+            });
+            backend::assert_bitwise_outcomes(&label, &interpreted, &native);
+            match (receipt_i, receipt_n) {
+                (Some(left), Some(right)) => backend::assert_native_receipts(&label, &left, &right),
+                (None, None) => {}
+                other => panic!("{label}: construction differs by backend: {other:?}"),
+            }
+        }
+    }
+}

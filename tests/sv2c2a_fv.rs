@@ -772,3 +772,138 @@ fn realization_identity_and_binding_refusals() {
     .unwrap();
     assert_eq!(realized.receipt().reconstruction, "muscl");
 }
+
+#[cfg(feature = "cranelift")]
+#[path = "support/backend.rs"]
+mod backend;
+
+/// Residual, JVP, explicit rhs and face fluxes of a first-order FV realization at `state`.
+#[cfg(feature = "cranelift")]
+fn fv_outcomes(operator: &FvRealization, state: &[f64]) -> Vec<backend::Outcome> {
+    let n = state.len();
+    let rate = values(n, 23);
+    let direction = values(n, 29);
+    let product = |run: &dyn Fn(&mut [f64]) -> Result<(), String>| {
+        let mut output = vec![0.0; n];
+        run(&mut output).map(|()| output)
+    };
+    vec![
+        product(&|out| {
+            DaeOperator::residual(operator, &cx(), 0.2, state, &rate, out)
+                .map_err(|e| e.to_string())
+        }),
+        product(&|out| {
+            DaeOperator::jacobian_vector_product(
+                operator,
+                &cx(),
+                0.2,
+                state,
+                &rate,
+                &direction,
+                &rate,
+                out,
+            )
+            .map_err(|e| e.to_string())
+        }),
+        product(&|out| {
+            ExplicitOperator::rhs(operator, &cx(), 0.2, state, out).map_err(|e| e.to_string())
+        }),
+        backend::outcome(operator.face_fluxes(0.2, state).map(|fluxes| {
+            let mut all = fluxes.interior.clone();
+            all.extend(&fluxes.periodic);
+            all.extend(fluxes.boundary.values().flatten());
+            all
+        })),
+    ]
+}
+
+/// W13 A1: first-order FV (LLF, HLL, central; periodic, ghost and 2-D) runs bitwise equal on
+/// Cranelift, including IEEE specials and signed zeros in the state.
+#[cfg(feature = "cranelift")]
+#[test]
+fn cranelift_backend_is_bitwise_equal_on_first_order_fv_including_ieee_specials() {
+    type Case<'a> = (&'a str, NumericalFluxIntent, bool, &'a [(&'a str, f64)]);
+    let cases: [Case; 5] = [
+        (
+            "PeriodicAdvection1D",
+            NumericalFluxIntent::LocalLaxFriedrichs,
+            true,
+            &[("a", 1.75)],
+        ),
+        (
+            "InflowAdvection1D",
+            NumericalFluxIntent::LocalLaxFriedrichs,
+            false,
+            &[("a", 0.5)],
+        ),
+        (
+            "Burgers1D",
+            NumericalFluxIntent::LocalLaxFriedrichs,
+            true,
+            &[("k", 0.3)],
+        ),
+        ("Burgers1D", NumericalFluxIntent::Hll, true, &[("k", 0.3)]),
+        (
+            "Burgers1D",
+            NumericalFluxIntent::Central,
+            true,
+            &[("k", 0.3)],
+        ),
+    ];
+    let specials = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::MIN_POSITIVE / 4.0,
+        -f64::MAX,
+        1.0e300,
+    ];
+    for (model, flux, periodic, data) in cases {
+        let label = format!("{model}/{flux:?}");
+        let ((interpreted, receipt_i), (native, receipt_n)) = backend::on_both_backends(|| {
+            let cells = specials.len();
+            let operator = realization(model, flux.clone(), &line(cells, periodic), data).unwrap();
+            let mut outcomes = fv_outcomes(&operator, &values(cells, 13));
+            outcomes.extend(fv_outcomes(&operator, &specials));
+            outcomes.extend(fv_outcomes(&operator, &[-0.0; 8]));
+            (outcomes, operator.execution_receipt())
+        });
+        backend::assert_bitwise_outcomes(&label, &interpreted, &native);
+        backend::assert_native_receipts(&label, &receipt_i, &receipt_n);
+        // The specials reached the kernels: the residual at that state executed and is
+        // non-finite somewhere.
+        assert!(
+            interpreted[4]
+                .as_ref()
+                .is_ok_and(|residual| residual.iter().any(|value| !value.is_finite())),
+            "{label}: {:?}",
+            interpreted[4]
+        );
+    }
+    let ((interpreted, receipt_i), (native, receipt_n)) = backend::on_both_backends(|| {
+        let plane = Arc::new(
+            FvTopology::from_tensor_box(&TensorBox {
+                axes: vec![
+                    TensorAxis::uniform(0.0, 1.0, 5).periodic(),
+                    TensorAxis::uniform(0.0, 0.6, 3).periodic(),
+                ],
+            })
+            .unwrap(),
+        );
+        let operator = realization(
+            "PeriodicAdvection2D",
+            NumericalFluxIntent::Hll,
+            &plane,
+            &[("ax", 1.0), ("ay", -0.5)],
+        )
+        .unwrap();
+        (
+            fv_outcomes(&operator, &values(15, 31)),
+            operator.execution_receipt(),
+        )
+    });
+    backend::assert_bitwise_outcomes("PeriodicAdvection2D", &interpreted, &native);
+    backend::assert_native_receipts("PeriodicAdvection2D", &receipt_i, &receipt_n);
+}

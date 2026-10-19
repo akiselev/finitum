@@ -697,3 +697,85 @@ fn capability_reports_vjp_only_when_executable() {
             .contains(&DerivativeProduct::Vjp)
     );
 }
+
+#[cfg(feature = "cranelift")]
+#[path = "support/backend.rs"]
+mod backend;
+
+/// Every FE product a plan executes kernels for: residual, JVP, VJP, linearized, assembled
+/// and matrix-free actions, at a nonzero state.
+#[cfg(feature = "cranelift")]
+fn plan_outcomes(plan: &RealizationPlan) -> Vec<backend::Outcome> {
+    let n = plan.dimension();
+    let state = probe_vector(n, 1.9, 0.35);
+    let rate = probe_vector(n, 5.2, -0.17);
+    let direction = probe_vector(n, 0.4, 0.73);
+    let rate_direction = probe_vector(n, 3.3, 0.21);
+    let adjoint = probe_vector(n, 2.6, -0.41);
+    let context = EvaluationContext::reproducible();
+    let product = |run: &dyn Fn(&mut [f64]) -> Result<(), String>| {
+        let mut output = vec![0.0; n];
+        run(&mut output).map(|()| output)
+    };
+    let text = |error: &dyn std::fmt::Display| error.to_string();
+    vec![
+        product(&|out| plan.residual(0.3, &state, &rate, out).map_err(|e| text(&e))),
+        product(&|out| {
+            plan.jacobian_vector_product(0.3, &state, &rate, &direction, &rate_direction, out)
+                .map_err(|e| text(&e))
+        }),
+        product(&|out| {
+            plan.vector_jacobian_product(0.3, &state, &rate, &adjoint, out)
+                .map_err(|e| text(&e))
+        }),
+        product(&|out| {
+            let linearized = plan
+                .linearize(0.3, &state, &rate, 2.0)
+                .map_err(|e| text(&e))?;
+            linearized
+                .apply(&context, &direction, out)
+                .map_err(|e| text(&e))
+        }),
+        product(&|out| {
+            let assembled = plan.assemble().map_err(|e| text(&e))?;
+            assembled
+                .apply(&context, &direction, out)
+                .map_err(|e| text(&e))
+        }),
+        product(&|out| {
+            plan.matrix_free()
+                .apply(&context, &direction, out)
+                .map_err(|e| text(&e))
+        }),
+        backend::outcome(
+            plan.assemble()
+                .map(|assembled| assembled.matrix().values().to_vec()),
+        ),
+    ]
+}
+
+/// W13 A1: the Cranelift backend computes every FE product bitwise as the interpreter does.
+#[cfg(feature = "cranelift")]
+#[test]
+fn cranelift_backend_is_bitwise_equal_on_fe_residual_jvp_vjp_and_assembly() {
+    type Build = fn() -> RealizationPlan;
+    let cases: [(&str, Build); 4] = [
+        ("poisson", || poisson_plan(false)),
+        ("poisson+hanging", || poisson_plan(true)),
+        ("elasticity", elasticity_plan),
+        ("nonlinear-dynamic", nonlinear_plan),
+    ];
+    for (label, build) in cases {
+        let ((interpreted, interpreted_receipt), (native, native_receipt)) =
+            backend::on_both_backends(|| {
+                let plan = build();
+                (plan_outcomes(&plan), plan.execution_receipt())
+            });
+        backend::assert_bitwise_outcomes(label, &interpreted, &native);
+        backend::assert_native_receipts(label, &interpreted_receipt, &native_receipt);
+        assert!(
+            interpreted.iter().filter(|outcome| outcome.is_ok()).count() >= 4,
+            "{label}: too few products executed: {interpreted:?}"
+        );
+    }
+}

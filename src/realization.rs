@@ -15,7 +15,9 @@ use scientia::{
 };
 use serde::Serialize;
 
-use crate::execution::{PreparedExecutable, PreparedExecutableModule, run_buffers, run_strided};
+use crate::execution::{
+    ExecutionReceipt, PreparedExecutable, PreparedExecutableModule, run_buffers, run_strided,
+};
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
 use crate::profile::{
     FieldSource, PartitionReport, RegionMap, RegionTags, evaluate_kernel_partial,
@@ -1589,6 +1591,18 @@ impl RealizationPlan {
     /// shapes, measures realized, constraint kinds, the representation and derivative products
     /// this plan exposes, and its declared symmetry (SV2-A2). This is purely descriptive: it
     /// reports what the plan already does, adding no policy of its own.
+    /// Which backend executes this plan's bound kernels (primal, JVP, VJP and parameter
+    /// kernels of every bundle), with per-kernel engines and JIT fallbacks. Not part of
+    /// [`Self::capability`] or any digest: every backend computes the same bits.
+    pub fn execution_receipt(&self) -> ExecutionReceipt {
+        ExecutionReceipt::collect(
+            self.data
+                .bundles
+                .values()
+                .flat_map(|bound| bound.executable.kernels()),
+        )
+    }
+
     pub fn capability(&self) -> RealizationCapability {
         let elements = self
             .data

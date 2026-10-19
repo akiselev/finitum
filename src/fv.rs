@@ -34,7 +34,7 @@ use scientia::{
 };
 use serde::Serialize;
 
-use crate::execution::{PreparedExecutable, run_batch};
+use crate::execution::{ExecutionReceipt, PreparedExecutable, run_batch};
 use crate::fv_reconstruction::{FvLimiter, FvReconstruction};
 use crate::{
     FinitumError, FvCellShape, FvFaceBlock, FvTopology, InputEvaluationError, InputOrigin,
@@ -178,13 +178,8 @@ impl BoundKernel {
             count += 1;
         }
         let mut writes = [WriteBinding::strided(written, &mut output[..points], 1)];
-        run_batch(
-            self.executable.prepared(),
-            points,
-            &reads[..count],
-            &mut writes,
-        )
-        .map_err(|error| FinitumError::KernelExecution(error.to_string()))
+        run_batch(&self.executable, points, &reads[..count], &mut writes)
+            .map_err(|error| FinitumError::KernelExecution(error.to_string()))
     }
 }
 
@@ -829,6 +824,28 @@ impl FvRealization {
 
     pub fn dimension(&self) -> usize {
         self.topology.cell_count()
+    }
+
+    /// Which backend executed this realization's kernels (face flux, speed, boundary and
+    /// source kernels and their JVPs), with per-kernel engines and JIT fallbacks.
+    pub fn execution_receipt(&self) -> ExecutionReceipt {
+        fn tangent(tangent: &Tangent) -> Option<&PreparedExecutable> {
+            match tangent {
+                Tangent::Kernel(kernel) => Some(&kernel.executable),
+                _ => None,
+            }
+        }
+        let mut kernels = vec![&self.face.executable, &self.speed.executable];
+        kernels.extend(tangent(&self.face_tangent));
+        for boundary in &self.boundaries {
+            kernels.push(&boundary.kernel.executable);
+            kernels.extend(tangent(&boundary.tangent));
+        }
+        if let Some((source, source_tangent)) = &self.source {
+            kernels.push(&source.executable);
+            kernels.extend(tangent(source_tangent));
+        }
+        ExecutionReceipt::collect(kernels)
     }
 
     pub fn receipt(&self) -> FvRealizationReceipt {

@@ -4,7 +4,7 @@ use crate::element::{
     barycenter_quadrature, rt0_basis_count, rt0_reference_basis, simplex_basis,
     simplex_basis_count, simplex_quadrature,
 };
-use crate::execution::{PreparedExecutableComposition, PreparedExecutableModule};
+use crate::execution::{ExecutionReceipt, PreparedExecutableComposition, PreparedExecutableModule};
 use crate::mesh::CellId;
 use crate::mixed::{
     BlockNullspaceCandidate, BlockVariableEssentialValue, essential_constraints_for_variables,
@@ -3139,6 +3139,26 @@ pub struct SystemOperator {
 }
 
 impl SystemOperator {
+    /// Which backend executes this operator's kernels (every bound bundle, bind producer and
+    /// kernel-input composition stage), with per-kernel engines and JIT fallbacks. Not part of
+    /// any capability or digest.
+    pub fn execution_receipt(&self) -> ExecutionReceipt {
+        let bundles = self
+            .data
+            .bindings
+            .values()
+            .flat_map(BTreeMap::values)
+            .chain(self.data.binds.iter().map(|bind| &bind.bound))
+            .flat_map(|bound| bound.executable.kernels());
+        let stages = self
+            .data
+            .binds
+            .iter()
+            .flat_map(|bind| &bind.compositions)
+            .flat_map(|composition| composition.executable.stages());
+        ExecutionReceipt::collect(bundles.chain(stages))
+    }
+
     pub fn plan(&self) -> &SystemRealizationPlan {
         &self.data.plan
     }

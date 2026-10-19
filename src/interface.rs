@@ -23,7 +23,7 @@
 //! `SystemOperator`); composition across plans is Krasis's.
 
 use crate::element::{gauss_legendre_unit_interval, simplex_basis, triangle_degree4_quadrature};
-use crate::execution::PreparedExecutable;
+use crate::execution::{ExecutionReceipt, PreparedExecutable};
 use crate::realization::{component_count, execute, validate_finite};
 use crate::space::{DofMap, ElementRestriction, cell_constant_dof_map};
 use crate::{
@@ -535,6 +535,16 @@ enum Action<'a> {
 }
 
 impl InterfaceOperator {
+    /// Which backend executes this operator's facet-pair kernels (primal, JVP and VJP), with
+    /// per-kernel engines and JIT fallbacks. Not part of [`Self::digest`].
+    pub fn execution_receipt(&self) -> ExecutionReceipt {
+        ExecutionReceipt::collect(self.kernels.iter().flat_map(|kernel| {
+            std::iter::once(&kernel.primal)
+                .chain(kernel.jvp.iter().map(|(_, jvp)| jvp))
+                .chain(kernel.vjp.iter().map(|(_, vjp)| vjp))
+        }))
+    }
+
     pub fn new(
         space: InterfaceSpace,
         measure: InterfaceMeasure,
