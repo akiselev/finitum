@@ -34,7 +34,10 @@ tests across 35 targets with a documented external-fixture target retry) at the
   outputs before the first refusal plus that refusal, so callers keep the
   point-by-point error and accumulation order. Batched: the system cell loop
   (`SystemOperator::apply_block_cell`, primal + JVP; bind compositions stay per
-  point). Not yet batched (open): single-field realization point loops, facet and
+  point). Batching the single-field `RealizationPlan::apply_cell` loop too (outputs
+  replayed in point-major order) passed all 262 tests but changed no target time
+  measurably (sv2_elasticity 3.9 -> 4.5, planar_p1 4.6 -> 4.3, load 28), so it was
+  not landed. Not yet batched (open): single-field realization point loops, facet and
   interface loops, VJP paths, the one-shot scalar property kernels (still allocate
   their operand vectors), and Finitum's per-point `BTreeMap` gathers, which now
   dominate.
