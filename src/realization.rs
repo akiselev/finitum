@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
-use malleus::{
-    AccessMode, BufferBinding, Executable, ExecutableModule, Interpreter, OperandId,
-    validate_module,
-};
+use malleus::{AccessMode, Executable, ExecutableModule, OperandId, validate_module};
 use methodus::{
     CsrMatrix, EvaluationContext, LinearOperator, NumericError, OperatorSymmetry,
     TransposableOperator,
@@ -18,6 +15,7 @@ use scientia::{
 };
 use serde::Serialize;
 
+use crate::execution::{PreparedExecutable, PreparedExecutableModule, run_buffers, run_strided};
 use crate::optimized::{ElementAssemblyOperator, PartialAssemblyOperator, PartialPointAction};
 use crate::profile::{
     FieldSource, PartitionReport, RegionMap, RegionTags, evaluate_kernel_partial,
@@ -830,6 +828,7 @@ pub fn external_inputs_from_at(
             );
             match source {
                 FieldSource::Kernel { kernel, executable } => {
+                    let executable = &PreparedExecutableModule::new(executable)?;
                     let state_names = kernel
                         .inputs
                         .iter()
@@ -1158,7 +1157,7 @@ pub struct GeometryParameterSensitivity {
 #[derive(Clone, Debug)]
 pub(crate) struct BoundBundle {
     pub(crate) bundle: StructuredPointKernelBundle,
-    pub(crate) executable: ExecutableModule,
+    pub(crate) executable: PreparedExecutableModule,
 }
 
 #[derive(Clone, Debug)]
@@ -4904,10 +4903,10 @@ pub(crate) fn bind_kernels(
                 bundle.integral_index, bundle.output_index
             )));
         }
-        let executable = ExecutableModule::reference(
+        let executable = PreparedExecutableModule::new(&ExecutableModule::reference(
             validate_module(bundle.module.clone())
                 .map_err(|error| FinitumError::KernelValidation(error.to_string()))?,
-        );
+        ))?;
         if bundle.primal_kernel_index >= executable.kernels().len()
             || bundle.jvp.kernel_index >= executable.kernels().len()
             || bundle.vjp.kernel_index >= executable.kernels().len()
@@ -5383,6 +5382,89 @@ pub(crate) fn execute_jvp_values(
     inputs: &BTreeMap<TensorInputId, Vec<f64>>,
     directions: &BTreeMap<TensorInputId, Vec<f64>>,
 ) -> Result<Vec<f64>, FinitumError> {
+    single_point(execute_jvp_values_batch(
+        bound,
+        std::iter::once((inputs, directions)),
+    ))
+}
+
+/// The one output of a one-point batch, or its refusal.
+fn single_point(
+    (mut outputs, failure): (Vec<Vec<f64>>, Option<FinitumError>),
+) -> Result<Vec<f64>, FinitumError> {
+    match (failure, outputs.pop()) {
+        (Some(error), _) => Err(error),
+        (None, Some(output)) => Ok(output),
+        (None, None) => Err(FinitumError::InvalidRealization(
+            "a one-point kernel batch produced no output".into(),
+        )),
+    }
+}
+
+/// W11 F1: [`execute_jvp_values`] at every point of `points`, in point order, with one
+/// `run_batch` per kernel. Returns the outputs of the points before the first refusal, and
+/// that refusal: what calling [`execute_jvp_values`] point by point yields up to its first
+/// error (every per-point check runs in the same order; prepared execution cannot fail after
+/// its binding checks, and `run_batch` is exactly the sequential calls).
+pub(crate) fn execute_jvp_values_batch<'a>(
+    bound: &BoundBundle,
+    points: impl IntoIterator<
+        Item = (
+            &'a BTreeMap<TensorInputId, Vec<f64>>,
+            &'a BTreeMap<TensorInputId, Vec<f64>>,
+        ),
+    >,
+) -> (Vec<Vec<f64>>, Option<FinitumError>) {
+    let jvp = &bound.executable.kernels()[bound.bundle.jvp.kernel_index];
+    let parameter = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+    let jvp_output = bound.bundle.jvp.dependent_operands[0].derivative;
+    let parameter_output = bound.bundle.parameter.dependent_operands[0].derivative;
+    let mut jvp_batch = PointBatch::new(jvp);
+    let mut parameter_batch = PointBatch::new(parameter);
+    let mut failure = None;
+    for (inputs, directions) in points {
+        if let Err(error) = push_jvp_point(
+            bound,
+            inputs,
+            directions,
+            &mut jvp_batch,
+            &mut parameter_batch,
+        ) {
+            jvp_batch.truncate(parameter_batch.points());
+            failure = Some(error);
+            break;
+        }
+    }
+    let outputs = (|| {
+        jvp_batch.run(jvp)?;
+        parameter_batch.run(parameter)?;
+        (0..jvp_batch.points())
+            .map(|point| {
+                let mut output = jvp_batch.operand_values(jvp, point, jvp_output)?;
+                let parameter_values =
+                    parameter_batch.operand_values(parameter, point, parameter_output)?;
+                for (value, parameter) in output.iter_mut().zip(parameter_values) {
+                    *value += parameter;
+                }
+                Ok(output)
+            })
+            .collect::<Result<Vec<_>, FinitumError>>()
+    })();
+    match outputs {
+        Ok(outputs) => (outputs, failure),
+        Err(error) => (Vec::new(), Some(error)),
+    }
+}
+
+/// Packs one point of [`execute_jvp_values_batch`]: the JVP kernel's operands, then the
+/// parameter-JVP kernel's, with the checks [`execute_jvp_values`] has always run, in its order.
+fn push_jvp_point(
+    bound: &BoundBundle,
+    inputs: &BTreeMap<TensorInputId, Vec<f64>>,
+    directions: &BTreeMap<TensorInputId, Vec<f64>>,
+    jvp_batch: &mut PointBatch,
+    parameter_batch: &mut PointBatch,
+) -> Result<(), FinitumError> {
     let input_by_operand = bound
         .bundle
         .primal_inputs
@@ -5391,7 +5473,7 @@ pub(crate) fn execute_jvp_values(
         .collect::<BTreeMap<_, _>>();
     let mut values = BTreeMap::new();
     for binding in &bound.bundle.primal_inputs {
-        values.insert(binding.operand, inputs[&binding.input].clone());
+        values.insert(binding.operand, inputs[&binding.input].as_slice());
     }
     for pair in &bound.bundle.jvp.independent_operands {
         let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
@@ -5400,21 +5482,17 @@ pub(crate) fn execute_jvp_values(
                 pair.primal
             ))
         })?;
-        values.insert(pair.derivative, directions[input].clone());
+        values.insert(pair.derivative, directions[input].as_slice());
     }
-    let executable = &bound.executable.kernels()[bound.bundle.jvp.kernel_index];
-    let buffers = execute(executable, &values)?;
-    let mut output = operand_values(
-        executable,
-        &buffers,
-        bound.bundle.jvp.dependent_operands[0].derivative,
-    )?;
+    let jvp = &bound.executable.kernels()[bound.bundle.jvp.kernel_index];
+    jvp_batch.push(jvp, &values)?;
+    output_window(jvp, bound.bundle.jvp.dependent_operands[0].derivative)?;
 
     let mut parameter_values = bound
         .bundle
         .primal_inputs
         .iter()
-        .map(|binding| (binding.operand, inputs[&binding.input].clone()))
+        .map(|binding| (binding.operand, inputs[&binding.input].as_slice()))
         .collect::<BTreeMap<_, _>>();
     for pair in &bound.bundle.parameter.independent_operands {
         let input = input_by_operand.get(&pair.primal).ok_or_else(|| {
@@ -5423,19 +5501,15 @@ pub(crate) fn execute_jvp_values(
                 pair.primal
             ))
         })?;
-        parameter_values.insert(pair.derivative, directions[input].clone());
+        parameter_values.insert(pair.derivative, directions[input].as_slice());
     }
-    let parameter_executable = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
-    let parameter_buffers = execute(parameter_executable, &parameter_values)?;
-    let parameter_output = operand_values(
-        parameter_executable,
-        &parameter_buffers,
+    let parameter = &bound.executable.kernels()[bound.bundle.parameter.kernel_index];
+    parameter_batch.push(parameter, &parameter_values)?;
+    output_window(
+        parameter,
         bound.bundle.parameter.dependent_operands[0].derivative,
     )?;
-    for (value, parameter) in output.iter_mut().zip(parameter_output) {
-        *value += parameter;
-    }
-    Ok(output)
+    Ok(())
 }
 
 /// SV1-C3: execute one bound bundle's frozen-input (parameter) JVP kernel with `direction`
@@ -5513,87 +5587,181 @@ pub(crate) fn execute_primal_values(
     bound: &BoundBundle,
     inputs: &BTreeMap<TensorInputId, Vec<f64>>,
 ) -> Result<Vec<f64>, FinitumError> {
-    let values = bound
-        .bundle
-        .primal_inputs
-        .iter()
-        .map(|binding| {
-            inputs
-                .get(&binding.input)
-                .cloned()
-                .map(|values| (binding.operand, values))
-                .ok_or_else(|| {
-                    FinitumError::InvalidRealization(format!(
-                        "bundle input {:?} is absent from the gathered point inputs",
-                        binding.input
-                    ))
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let buffers = execute(
-        &bound.executable.kernels()[bound.bundle.primal_kernel_index],
-        &values,
-    )?;
-    operand_values(
-        &bound.executable.kernels()[bound.bundle.primal_kernel_index],
-        &buffers,
-        bound.bundle.primal_output,
-    )
+    single_point(execute_primal_values_batch(bound, std::iter::once(inputs)))
+}
+
+/// W11 F1: [`execute_primal_values`] at every point of `points`, in point order, as one
+/// `run_batch`; returns the outputs before the first refusal and that refusal (see
+/// [`execute_jvp_values_batch`]).
+pub(crate) fn execute_primal_values_batch<'a>(
+    bound: &BoundBundle,
+    points: impl IntoIterator<Item = &'a BTreeMap<TensorInputId, Vec<f64>>>,
+) -> (Vec<Vec<f64>>, Option<FinitumError>) {
+    let executable = &bound.executable.kernels()[bound.bundle.primal_kernel_index];
+    let mut batch = PointBatch::new(executable);
+    let mut failure = None;
+    for inputs in points {
+        let pushed = bound
+            .bundle
+            .primal_inputs
+            .iter()
+            .map(|binding| {
+                inputs
+                    .get(&binding.input)
+                    .map(|values| (binding.operand, values.as_slice()))
+                    .ok_or_else(|| {
+                        FinitumError::InvalidRealization(format!(
+                            "bundle input {:?} is absent from the gathered point inputs",
+                            binding.input
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .and_then(|values| batch.push(executable, &values))
+            .and_then(|()| output_window(executable, bound.bundle.primal_output));
+        if let Err(error) = pushed {
+            failure = Some(error);
+            break;
+        }
+    }
+    let outputs = batch.run(executable).and_then(|()| {
+        (0..batch.points())
+            .map(|point| batch.operand_values(executable, point, bound.bundle.primal_output))
+            .collect::<Result<Vec<_>, _>>()
+    });
+    match outputs {
+        Ok(outputs) => (outputs, failure),
+        Err(error) => (Vec::new(), Some(error)),
+    }
 }
 
 pub(crate) fn execute(
-    executable: &Executable,
+    executable: &PreparedExecutable,
     values: &BTreeMap<OperandId, Vec<f64>>,
 ) -> Result<Vec<Vec<f64>>, FinitumError> {
-    let kernel = executable.kernel().as_kernel();
-    let mut buffers = kernel
-        .operands
-        .iter()
-        .map(|operand| vec![0.0; operand.region.offset + operand.region.length])
-        .collect::<Vec<_>>();
-    for (index, operand) in kernel.operands.iter().enumerate() {
-        if matches!(operand.access, AccessMode::Read | AccessMode::ReadWrite)
-            && !values.contains_key(&OperandId::new(index))
-        {
-            return Err(FinitumError::InvalidRealization(format!(
-                "kernel read operand {index} has no realization binding"
-            )));
-        }
-    }
-    for (operand, values) in values {
-        let definition = kernel.operands.get(operand.index()).ok_or_else(|| {
-            FinitumError::InvalidRealization(format!(
-                "input references absent kernel operand {:?}",
-                operand
-            ))
-        })?;
-        let count = component_count(&definition.shape)?;
-        if values.len() != count {
-            return Err(FinitumError::InvalidRealization(format!(
-                "kernel operand {:?} received {} values, expected {count}",
-                operand,
-                values.len()
-            )));
-        }
-        let start = definition.region.offset;
-        buffers[operand.index()][start..start + count].copy_from_slice(values);
-    }
-    let mut bindings = buffers
-        .iter_mut()
-        .enumerate()
-        .map(|(index, values)| BufferBinding::new(OperandId::new(index), values))
-        .collect::<Vec<_>>();
-    Interpreter::run(executable, &mut bindings)
-        .map_err(|error| FinitumError::KernelExecution(error.to_string()))?;
-    drop(bindings);
-    Ok(buffers)
+    let mut batch = PointBatch::new(executable);
+    batch.push(executable, values)?;
+    batch.run(executable)?;
+    Ok(batch.buffers)
 }
 
-pub(crate) fn operand_values(
+/// Operand buffers for `points` calls of one kernel, laid out for `run_batch`: operand `i`
+/// holds point `p`'s window (`region.offset + region.length` values, zero except the bound
+/// values at the operand's region) at `p * strides[i]`.
+pub(crate) struct PointBatch {
+    buffers: Vec<Vec<f64>>,
+    strides: Vec<usize>,
+    points: usize,
+}
+
+impl PointBatch {
+    pub(crate) fn new(executable: &Executable) -> Self {
+        let strides = executable
+            .kernel()
+            .as_kernel()
+            .operands
+            .iter()
+            .map(|operand| operand.region.offset + operand.region.length)
+            .collect::<Vec<_>>();
+        Self {
+            buffers: vec![Vec::new(); strides.len()],
+            strides,
+            points: 0,
+        }
+    }
+
+    pub(crate) fn points(&self) -> usize {
+        self.points
+    }
+
+    /// Appends one point bound to `values`, refusing (before any effect) a missing read
+    /// operand, an absent operand or a wrong value count.
+    pub(crate) fn push<V: AsRef<[f64]>>(
+        &mut self,
+        executable: &Executable,
+        values: &BTreeMap<OperandId, V>,
+    ) -> Result<(), FinitumError> {
+        let kernel = executable.kernel().as_kernel();
+        for (index, operand) in kernel.operands.iter().enumerate() {
+            if matches!(operand.access, AccessMode::Read | AccessMode::ReadWrite)
+                && !values.contains_key(&OperandId::new(index))
+            {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "kernel read operand {index} has no realization binding"
+                )));
+            }
+        }
+        for (operand, values) in values {
+            let definition = kernel.operands.get(operand.index()).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!(
+                    "input references absent kernel operand {:?}",
+                    operand
+                ))
+            })?;
+            let count = component_count(&definition.shape)?;
+            let values = values.as_ref();
+            if values.len() != count {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "kernel operand {:?} received {} values, expected {count}",
+                    operand,
+                    values.len()
+                )));
+            }
+            if count > definition.region.length {
+                return Err(FinitumError::InvalidRealization(format!(
+                    "kernel operand {:?} region holds {} values, received {count}",
+                    operand, definition.region.length
+                )));
+            }
+        }
+        for (buffer, stride) in self.buffers.iter_mut().zip(&self.strides) {
+            buffer.resize(buffer.len() + stride, 0.0);
+        }
+        for (operand, values) in values {
+            let values = values.as_ref();
+            let start = self.points * self.strides[operand.index()]
+                + kernel.operands[operand.index()].region.offset;
+            self.buffers[operand.index()][start..start + values.len()].copy_from_slice(values);
+        }
+        self.points += 1;
+        Ok(())
+    }
+
+    /// Drops every point from `points` on.
+    pub(crate) fn truncate(&mut self, points: usize) {
+        for (buffer, stride) in self.buffers.iter_mut().zip(&self.strides) {
+            buffer.truncate(points * stride);
+        }
+        self.points = self.points.min(points);
+    }
+
+    /// Runs every pushed point: one call, or one strided `run_batch` (n sequential calls).
+    pub(crate) fn run(&mut self, executable: &PreparedExecutable) -> Result<(), FinitumError> {
+        match self.points {
+            0 => Ok(()),
+            1 => run_buffers(executable, &mut self.buffers),
+            points => run_strided(executable, points, &mut self.buffers, &self.strides),
+        }
+    }
+
+    /// `operand`'s declared values at `point` (as [`operand_values`] reads one call's buffers).
+    pub(crate) fn operand_values(
+        &self,
+        executable: &Executable,
+        point: usize,
+        operand: OperandId,
+    ) -> Result<Vec<f64>, FinitumError> {
+        let (offset, count) = output_window(executable, operand)?;
+        let start = point * self.strides[operand.index()] + offset;
+        Ok(self.buffers[operand.index()][start..start + count].to_vec())
+    }
+}
+
+/// The region offset and component count [`operand_values`] reads for `operand`.
+fn output_window(
     executable: &Executable,
-    buffers: &[Vec<f64>],
     operand: OperandId,
-) -> Result<Vec<f64>, FinitumError> {
+) -> Result<(usize, usize), FinitumError> {
     let definition = executable
         .kernel()
         .as_kernel()
@@ -5605,8 +5773,18 @@ pub(crate) fn operand_values(
                 operand
             ))
         })?;
-    let count = component_count(&definition.shape)?;
-    let start = definition.region.offset;
+    Ok((
+        definition.region.offset,
+        component_count(&definition.shape)?,
+    ))
+}
+
+pub(crate) fn operand_values(
+    executable: &Executable,
+    buffers: &[Vec<f64>],
+    operand: OperandId,
+) -> Result<Vec<f64>, FinitumError> {
+    let (start, count) = output_window(executable, operand)?;
     Ok(buffers[operand.index()][start..start + count].to_vec())
 }
 

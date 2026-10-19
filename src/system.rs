@@ -4,6 +4,7 @@ use crate::element::{
     barycenter_quadrature, rt0_basis_count, rt0_reference_basis, simplex_basis,
     simplex_basis_count, simplex_quadrature,
 };
+use crate::execution::{PreparedExecutableComposition, PreparedExecutableModule};
 use crate::mesh::CellId;
 use crate::mixed::{
     BlockNullspaceCandidate, BlockVariableEssentialValue, essential_constraints_for_variables,
@@ -20,9 +21,10 @@ use crate::realization::{
     PointEvaluation, RealizationCapability, RealizationExternalInput, RealizationReceipt,
     RepresentationKind, active_probe_inputs, active_values, apply_basis_adjoint, bind_kernels,
     build_capability, component_count, evaluate_basis_input, execute_jvp_values,
-    execute_parameter_jvp_values, execute_primal_values, execute_vjp_values, gather_test_adjoint,
-    locate_failure, point_parameter_cotangents, probe_direction_evaluation, property_unavailable,
-    table_axis_point, tangent_unavailable, transpose_scatter_shape, validate_finite,
+    execute_jvp_values_batch, execute_parameter_jvp_values, execute_primal_values,
+    execute_primal_values_batch, execute_vjp_values, gather_test_adjoint, locate_failure,
+    point_parameter_cotangents, probe_direction_evaluation, property_unavailable, table_axis_point,
+    tangent_unavailable, transpose_scatter_shape, validate_finite,
 };
 use crate::space::{
     DofMap, ElementRestriction, cell_constant_dof_map, quadratic_simplex_dof_map,
@@ -3032,7 +3034,9 @@ impl SystemRealizationPlan {
                     integral_index: composition.consumer_integral_index,
                     output_index: composition.consumer_output_index,
                     composition: composition.clone(),
-                    executable: malleus::ExecutableComposition::reference(validated),
+                    executable: PreparedExecutableComposition::new(
+                        malleus::ExecutableComposition::reference(validated),
+                    )?,
                 });
             }
             binds.push(BoundBind {
@@ -3071,7 +3075,7 @@ struct BoundComposition {
     integral_index: usize,
     output_index: usize,
     composition: scientia::BindComposition,
-    executable: malleus::ExecutableComposition,
+    executable: PreparedExecutableComposition,
 }
 
 #[derive(Debug)]
@@ -4970,84 +4974,109 @@ impl SystemOperator {
                                 })
                                 .map(|composition| (bind, composition))
                         });
-                        for (point, quadrature_point) in quadrature.iter().enumerate() {
-                            let reference_point = &quadrature_point.coordinates;
-                            let scale = quadrature_point.weight * geometry.determinant();
-                            let bound_values = self.bound_point_values(
-                                cell,
-                                point,
-                                geometry,
-                                affine,
-                                reference_point,
-                                time,
-                                &local_state,
-                                &local_rate,
-                                directions.as_ref().map(|(state, rate)| (state, rate)),
-                            )?;
-                            let point_bindings =
-                                self.row_bindings(row_index, row.instance, &bound_values);
-                            let (inputs, evaluation) = point_inputs_system(
-                                fields,
-                                integral,
-                                cell,
-                                point,
-                                geometry,
-                                affine,
-                                reference_point,
-                                time,
-                                &local_state,
-                                &local_rate,
-                                &point_bindings,
-                            )?;
-                            let point_output = match &directions {
-                                None => match composition {
-                                    Some((bind, composition)) => {
-                                        let producer = bound_values
-                                            .iter()
-                                            .find(|value| {
-                                                std::ptr::eq(&self.data.binds[value.bind], bind)
-                                            })
-                                            .expect("every bind has a point value");
-                                        execute_bind_composition(
-                                            composition,
-                                            &bind.bound,
-                                            &producer.producer_inputs,
-                                            bound,
-                                            &inputs,
-                                        )?
+                        // W11 F1: gather every point first, run the bundle's kernel once per
+                        // cell as a batch, then accumulate in point order. Outputs before the
+                        // first refusal are accumulated before it is returned, exactly as the
+                        // point-by-point loop did; a composition still runs per point.
+                        let gather =
+                            |point: usize,
+                             quadrature_point: &QuadraturePoint|
+                             -> Result<CellPointWork, FinitumError> {
+                                let reference_point = &quadrature_point.coordinates;
+                                let bound_values = self.bound_point_values(
+                                    cell,
+                                    point,
+                                    geometry,
+                                    affine,
+                                    reference_point,
+                                    time,
+                                    &local_state,
+                                    &local_rate,
+                                    directions.as_ref().map(|(state, rate)| (state, rate)),
+                                )?;
+                                let point_bindings =
+                                    self.row_bindings(row_index, row.instance, &bound_values);
+                                let (inputs, evaluation) = point_inputs_system(
+                                    fields,
+                                    integral,
+                                    cell,
+                                    point,
+                                    geometry,
+                                    affine,
+                                    reference_point,
+                                    time,
+                                    &local_state,
+                                    &local_rate,
+                                    &point_bindings,
+                                )?;
+                                Ok(match &directions {
+                                    None => match composition {
+                                        Some((bind, composition)) => {
+                                            let producer = bound_values
+                                                .iter()
+                                                .find(|value| {
+                                                    std::ptr::eq(&self.data.binds[value.bind], bind)
+                                                })
+                                                .expect("every bind has a point value");
+                                            CellPointWork::Done(execute_bind_composition(
+                                                composition,
+                                                &bind.bound,
+                                                &producer.producer_inputs,
+                                                bound,
+                                                &inputs,
+                                            )?)
+                                        }
+                                        None => CellPointWork::Primal(inputs),
+                                    },
+                                    Some((local_state_direction, local_rate_direction)) => {
+                                        let directions = point_directions_system(
+                                            fields,
+                                            integral,
+                                            cell,
+                                            point,
+                                            geometry,
+                                            affine,
+                                            reference_point,
+                                            time,
+                                            local_state_direction,
+                                            local_rate_direction,
+                                            &point_bindings,
+                                            &evaluation,
+                                        )?;
+                                        CellPointWork::Jvp(inputs, directions)
                                     }
-                                    None => execute_primal_values(bound, &inputs)?,
-                                },
-                                Some((local_state_direction, local_rate_direction)) => {
-                                    let directions = point_directions_system(
-                                        fields,
-                                        integral,
-                                        cell,
-                                        point,
-                                        geometry,
-                                        affine,
-                                        reference_point,
-                                        time,
-                                        local_state_direction,
-                                        local_rate_direction,
-                                        &point_bindings,
-                                        &evaluation,
-                                    )?;
-                                    execute_jvp_values(bound, &inputs, &directions)?
-                                }
+                                })
                             };
+                        let mut works = Vec::with_capacity(quadrature.len());
+                        let mut failure = None;
+                        for (point, quadrature_point) in quadrature.iter().enumerate() {
+                            match gather(point, quadrature_point) {
+                                Ok(work) => works.push(work),
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        let (point_outputs, batch_failure) = cell_point_outputs(bound, works);
+                        for (point, point_output) in point_outputs.iter().enumerate() {
+                            let quadrature_point = &quadrature[point];
+                            let scale = quadrature_point.weight * geometry.determinant();
                             apply_field_basis_adjoint(
                                 row_field,
                                 geometry,
                                 affine,
                                 cell,
                                 point,
-                                reference_point,
+                                &quadrature_point.coordinates,
                                 &qoutput.binding.evaluation.derivative,
-                                &point_output,
+                                point_output,
                                 scale,
                                 &mut local_output,
                             )?;
+                        }
+                        if let Some(error) = batch_failure.or(failure) {
+                            return Err(error);
                         }
                     }
                 }
@@ -7015,6 +7044,7 @@ pub fn system_constitutive_from_sources(
                 );
                 let built = match source {
                     FieldSource::Kernel { kernel, executable } => {
+                        let executable = &PreparedExecutableModule::new(executable)?;
                         let names = kernel
                             .inputs
                             .iter()
@@ -7782,6 +7812,52 @@ fn point_directions_system(
     Ok(directions)
 }
 
+/// One gathered cell quadrature point of `SystemOperator::apply_block_cell`: an output a
+/// composition already produced, or the inputs (and directions) its bound bundle runs on.
+enum CellPointWork {
+    Done(Vec<f64>),
+    Primal(BTreeMap<TensorInputId, Vec<f64>>),
+    Jvp(
+        BTreeMap<TensorInputId, Vec<f64>>,
+        BTreeMap<TensorInputId, Vec<f64>>,
+    ),
+}
+
+/// Runs a cell's gathered points in point order: primal and JVP points as one batch per kernel
+/// (they are never mixed within a cell integral output). Returns the outputs before the first
+/// refusal and that refusal.
+fn cell_point_outputs(
+    bound: &BoundBundle,
+    works: Vec<CellPointWork>,
+) -> (Vec<Vec<f64>>, Option<FinitumError>) {
+    match works.first() {
+        Some(CellPointWork::Primal(_)) => execute_primal_values_batch(
+            bound,
+            works.iter().map_while(|work| match work {
+                CellPointWork::Primal(inputs) => Some(inputs),
+                _ => None,
+            }),
+        ),
+        Some(CellPointWork::Jvp(..)) => execute_jvp_values_batch(
+            bound,
+            works.iter().map_while(|work| match work {
+                CellPointWork::Jvp(inputs, directions) => Some((inputs, directions)),
+                _ => None,
+            }),
+        ),
+        _ => (
+            works
+                .into_iter()
+                .map_while(|work| match work {
+                    CellPointWork::Done(output) => Some(output),
+                    _ => None,
+                })
+                .collect(),
+            None,
+        ),
+    }
+}
+
 /// Runs one kernel-input bind composition at a quadrature point (W8 F-MI, the Malleus
 /// contract for `BoundChain::Composed`): stage 0 is the producer output's primal kernel over
 /// `producer_inputs`, stage 1 the consumer's primal kernel over `consumer_inputs`; the shared
@@ -7834,8 +7910,7 @@ fn execute_bind_composition(
         .iter_mut()
         .map(|(target, values)| malleus::CompositionBinding::operand(*target, values))
         .collect::<Vec<_>>();
-    malleus::Interpreter::run_composition(&composition.executable, &mut bindings)
-        .map_err(|error| FinitumError::KernelExecution(error.to_string()))?;
+    composition.executable.run(&mut bindings)?;
     drop(bindings);
     let output = malleus::StageOperand::new(1, consumer.bundle.primal_output);
     let definition =

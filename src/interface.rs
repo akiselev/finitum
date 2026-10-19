@@ -23,6 +23,7 @@
 //! `SystemOperator`); composition across plans is Krasis's.
 
 use crate::element::{gauss_legendre_unit_interval, simplex_basis, triangle_degree4_quadrature};
+use crate::execution::PreparedExecutable;
 use crate::realization::{component_count, execute, validate_finite};
 use crate::space::{DofMap, ElementRestriction, cell_constant_dof_map};
 use crate::{
@@ -473,11 +474,11 @@ impl InterfaceKernel {
 #[derive(Debug)]
 struct BoundKernel {
     kernel: InterfaceKernel,
-    primal: Executable,
+    primal: PreparedExecutable,
     /// JVP/VJP products over every `Trace` input and every `Residual` output; `None` when
     /// the kernel reads no trace (its derivative is identically zero).
-    jvp: Option<(FacetPairDerivativeProduct, Executable)>,
-    vjp: Option<(FacetPairDerivativeProduct, Executable)>,
+    jvp: Option<(FacetPairDerivativeProduct, PreparedExecutable)>,
+    vjp: Option<(FacetPairDerivativeProduct, PreparedExecutable)>,
 }
 
 #[derive(Clone, Debug)]
@@ -559,7 +560,8 @@ impl InterfaceOperator {
         let mut bound = Vec::with_capacity(kernels.len());
         for kernel in kernels {
             validate_operand_shapes(&space, &kernel)?;
-            let primal = Executable::reference(kernel.validated.kernel().clone());
+            let primal =
+                PreparedExecutable::new(Executable::reference(kernel.validated.kernel().clone()))?;
             let independent = kernel
                 .operands
                 .iter()
@@ -575,7 +577,7 @@ impl InterfaceOperator {
                 .map(|(index, _)| OperandId::new(index))
                 .collect::<Vec<_>>();
             let derive = |mode: DerivativeMode| -> Result<
-                Option<(FacetPairDerivativeProduct, Executable)>,
+                Option<(FacetPairDerivativeProduct, PreparedExecutable)>,
                 FinitumError,
             > {
                 if independent.is_empty() {
@@ -592,7 +594,10 @@ impl InterfaceOperator {
                 .map_err(|error| FinitumError::KernelValidation(error.to_string()))?;
                 let validated = validate(product.product.kernel.clone())
                     .map_err(|error| FinitumError::KernelValidation(error.to_string()))?;
-                Ok(Some((product, Executable::reference(validated))))
+                Ok(Some((
+                    product,
+                    PreparedExecutable::new(Executable::reference(validated))?,
+                )))
             };
             let jvp = derive(DerivativeMode::Jvp)?;
             let vjp = derive(DerivativeMode::Vjp)?;

@@ -194,7 +194,7 @@ pub struct PointPullback {
 struct Node {
     source: PointExpressionNode,
     bundle: BoundBundle,
-    parameter_reverse: malleus::Executable,
+    parameter_reverse: crate::execution::PreparedExecutable,
     read_inputs: BTreeSet<TensorInputId>,
 }
 impl Node {
@@ -396,10 +396,13 @@ impl BoundPointExpression {
                     source: source.clone(),
                     read_inputs,
                     bundle,
-                    parameter_reverse: malleus::Executable::reference(
-                        malleus::validate(source.parameter_vjp[0].kernel.clone())
-                            .map_err(|error| FinitumError::KernelValidation(error.to_string()))?,
-                    ),
+                    parameter_reverse: crate::execution::PreparedExecutable::new(
+                        malleus::Executable::reference(
+                            malleus::validate(source.parameter_vjp[0].kernel.clone()).map_err(
+                                |error| FinitumError::KernelValidation(error.to_string()),
+                            )?,
+                        ),
+                    )?,
                 },
             );
         }

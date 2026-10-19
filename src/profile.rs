@@ -17,8 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::execution::{PreparedExecutable, PreparedExecutableModule, run_buffers};
 use cadabra_provider::{AnalyticProvider, RectangleProvider};
-use malleus::{BufferBinding, ExecutableModule, Interpreter, OperandId, validate_module};
+use malleus::{ExecutableModule, validate_module};
 use scientia::Digest;
 use serde::Serialize;
 
@@ -447,10 +448,7 @@ impl FieldSource {
 
 /// Runs one scalar-in/scalar-out Malleus kernel: `inputs.len()` leading read operands followed
 /// by one write operand, matching the layout `lower_property_kernel` emits (contract C7).
-fn run_scalar_kernel(
-    executable: &malleus::Executable,
-    inputs: &[f64],
-) -> Result<f64, FinitumError> {
+fn run_scalar_kernel(executable: &PreparedExecutable, inputs: &[f64]) -> Result<f64, FinitumError> {
     let kernel = executable.kernel().as_kernel();
     if kernel.operands.len() != inputs.len() + 1 {
         return Err(FinitumError::InvalidRealization(format!(
@@ -468,14 +466,7 @@ fn run_scalar_kernel(
         let definition = &kernel.operands[index];
         buffers[index][definition.region.offset] = *value;
     }
-    let mut bindings = buffers
-        .iter_mut()
-        .enumerate()
-        .map(|(index, values)| BufferBinding::new(OperandId::new(index), values))
-        .collect::<Vec<_>>();
-    Interpreter::run(executable, &mut bindings)
-        .map_err(|error| FinitumError::KernelExecution(error.to_string()))?;
-    drop(bindings);
+    run_buffers(executable, &mut buffers)?;
     let output_index = kernel.operands.len() - 1;
     let output_definition = &kernel.operands[output_index];
     Ok(buffers[output_index][output_definition.region.offset])
@@ -487,7 +478,7 @@ fn run_scalar_kernel(
 /// `SlotInput` carries no role marker distinguishing them (contract C7).
 pub(crate) fn evaluate_kernel_value(
     kernel: &scientia::PropertyKernel,
-    executable: &ExecutableModule,
+    executable: &PreparedExecutableModule,
     inputs_by_name: &BTreeMap<String, f64>,
 ) -> Result<f64, FinitumError> {
     let ordered = ordered_kernel_inputs(kernel, inputs_by_name)?;
@@ -510,7 +501,7 @@ pub(crate) fn evaluate_kernel_value(
 /// than trust an absent tangent (`REALIZATION_TANGENT_UNAVAILABLE`).
 pub(crate) fn evaluate_kernel_partial(
     kernel: &scientia::PropertyKernel,
-    executable: &ExecutableModule,
+    executable: &PreparedExecutableModule,
     inputs_by_name: &BTreeMap<String, f64>,
     with_respect_to: &str,
 ) -> Result<Option<f64>, FinitumError> {
@@ -903,11 +894,17 @@ pub fn essential_constraints_from_selected_at(
             .next()
             .map(RegionTagId::to_string)
             .unwrap_or_default();
+        let prepared = match source {
+            FieldSource::Kernel { executable, .. } => {
+                Some(PreparedExecutableModule::new(executable)?)
+            }
+            _ => None,
+        };
         for vertex in vertices {
             let coordinates = &mesh.mesh.vertices()[vertex.0];
-            let evaluated = match source {
-                FieldSource::Constant(constant) => constant.clone(),
-                FieldSource::Nodal(nodal) => {
+            let evaluated = match (source, &prepared) {
+                (FieldSource::Constant(constant), _) => constant.clone(),
+                (FieldSource::Nodal(nodal), _) => {
                     let start = vertex.0 * components;
                     if nodal.len() < start + components {
                         return Err(FinitumError::InvalidRealization(
@@ -917,18 +914,23 @@ pub fn essential_constraints_from_selected_at(
                     nodal[start..start + components].to_vec()
                 }
 
-                FieldSource::Fallible(sampler) => {
+                (FieldSource::Fallible(sampler), _) => {
                     sampler(coordinates, time).map_err(|failure| {
                         FinitumError::from(failure.at(None, coordinates, Some(time)))
                     })?
                 }
-                FieldSource::Table(table) => {
+                (FieldSource::Table(table), _) => {
                     let point = named_axis_point(&table.axes, coordinates, time)?;
                     vec![evaluate_table_value(table, &point)?]
                 }
-                FieldSource::Kernel { kernel, executable } => {
+                (FieldSource::Kernel { kernel, .. }, Some(executable)) => {
                     let inputs = named_coordinate_inputs(coordinates, time);
                     vec![evaluate_kernel_value(kernel, executable, &inputs)?]
+                }
+                (FieldSource::Kernel { .. }, None) => {
+                    return Err(FinitumError::InvalidRealization(
+                        "kernel field source has no prepared executable".into(),
+                    ));
                 }
             };
             if evaluated.len() != components {

@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-10-09
+Updated: 2026-10-19
 
 ## Role and frontier
 
@@ -15,6 +15,40 @@ SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
 across 38 at the W9 head `a75baeb`); final Sinbad consumer coverage passed (210
 tests across 35 targets with a documented external-fixture target retry) at the
 2026-09-29 head, before the 2026-10-08 fixes and this landing.
+
+## W11 F1 (2026-10-19): prepared and batched Malleus execution
+
+- Every Malleus call site runs prepared (`malleus::prepared`, M1 head `51aa9d3`):
+  `src/execution.rs` holds `PreparedExecutable` / `PreparedExecutableModule` /
+  `PreparedExecutableComposition` next to the executable in its owning struct
+  (`BoundBundle`, interface `BoundKernel`, functional `Node`, method
+  `AffineExecutable`, `BoundComposition`; field-source kernels are prepared once
+  where their closures are built). No address-keyed cache. Calls bind positionally
+  over inline (<=16 operand) binding tables and a per-thread `PreparedState` /
+  `CompositionState`; a positional refusal re-runs `PreparedKernel::run`, which
+  returns the interpreter's exact `ExecutionError`, so `KernelExecution` text is
+  unchanged. No `Interpreter::run`/`run_composition` call remains in `src/`.
+- `PointBatch` (realization.rs) packs per-point operand windows strided by
+  `region.offset + region.length`; `execute` is its one-point case.
+  `execute_{primal,jvp}_values_batch` run one `run_batch` per kernel and return the
+  outputs before the first refusal plus that refusal, so callers keep the
+  point-by-point error and accumulation order. Batched: the system cell loop
+  (`SystemOperator::apply_block_cell`, primal + JVP; bind compositions stay per
+  point). Not yet batched (open): single-field realization point loops, facet and
+  interface loops, VJP paths, the one-shot scalar property kernels (still allocate
+  their operand vectors), and Finitum's per-point `BTreeMap` gathers, which now
+  dominate.
+- No serialized type, digest or public API changed; Sinbad needs no change.
+- Timing (wall s per test binary, opt-level 2, 4 build jobs, shared host;
+  before = `e415d8d` load 37-52, P1 = prepared load 33, after = +batching load 31):
+  w7_system_path_parity 45.5 / 19.0 / 16.1; gx_c4_facet_integrals 26.7 / 5.7 / 5.2;
+  planar_p1 15.9 / 4.6 / 4.6; sv2_elasticity 15.3 / 4.0 / 3.9;
+  sv2b4_system_stokes 10.8 / 4.4 / 4.4; w7_rt0_essential 9.5 / 3.0 / 2.3.
+  Load was higher for the baseline; the 2-5x ratios exceed what load explains.
+- perf (`perf record -F 199`, w7_system_path_parity): before, `malleus::*` 33% and
+  malloc/free 18% of samples; after, `malleus::*` 23% (point program 7%, columnar
+  blocks 4%) and malloc/free 16%; the rest is Finitum gather (`PointBatch::push`
+  5%, `point_inputs_system`, BTreeMap traffic).
 
 ## W10 package 3 (2026-10-09): planar non-nested coverage and mortar-type P1 constraints
 

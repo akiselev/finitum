@@ -1,9 +1,8 @@
 //! Concrete realizations for Resolvent sibling method-family programs.
 
+use crate::execution::{PreparedExecutable, run_buffers};
 use crate::{FinitumError, RealizationPlan};
-use malleus::{
-    BufferBinding, Executable, ExecutableModule, Interpreter, OperandId, validate_module,
-};
+use malleus::{ExecutableModule, validate_module};
 use methodus::{DaeOperator, EvaluationContext, NumericError};
 use scientia::{MethodFamily, MethodProgram, MethodProgramKind};
 use serde::Serialize;
@@ -17,7 +16,7 @@ pub struct FiniteVolumeFace {
 
 #[derive(Clone, Debug)]
 struct AffineExecutable {
-    executable: Executable,
+    executable: PreparedExecutable,
     input_count: usize,
     constant: f64,
 }
@@ -42,6 +41,7 @@ impl AffineExecutable {
             .first()
             .cloned()
             .ok_or_else(|| FinitumError::KernelValidation("method module is empty".into()))?;
+        let executable = PreparedExecutable::new(executable)?;
         Ok(Self {
             executable,
             input_count: kernel.spec.inputs.len(),
@@ -57,22 +57,11 @@ impl AffineExecutable {
                 self.input_count
             )));
         }
-        let mut owned = inputs.to_vec();
-        let mut output = [0.0];
-        let mut bindings = owned
-            .iter_mut()
-            .enumerate()
-            .map(|(index, value)| {
-                BufferBinding::new(OperandId::new(index), std::slice::from_mut(value))
-            })
-            .collect::<Vec<_>>();
-        bindings.push(BufferBinding::new(
-            OperandId::new(self.input_count),
-            &mut output,
-        ));
-        Interpreter::run(&self.executable, &mut bindings)
-            .map_err(|error| FinitumError::KernelExecution(error.to_string()))?;
-        Ok(output[0])
+        let mut values = inputs.to_vec();
+        values.push(0.0);
+        let mut buffers = values.chunks_mut(1).collect::<Vec<_>>();
+        run_buffers(&self.executable, &mut buffers)?;
+        Ok(values[self.input_count])
     }
 
     fn run_direction(&self, inputs: &[f64]) -> Result<f64, FinitumError> {
