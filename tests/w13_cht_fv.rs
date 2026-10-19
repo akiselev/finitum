@@ -398,21 +398,70 @@ fn graetz_isothermal_walls_reach_the_fully_developed_nusselt_number() {
     assert!((fine - NU_T).abs() / NU_T <= 0.02, "MUSCL Nu {fine}");
 }
 
-/// RECORDED FAILING (W13 A4, pre-registered bar kept unchanged): "MUSCL's error against 7.541
-/// decreases from ny = 16 to ny = 64". Measured 7.53882 (16), 7.54555 (32, diagnostic),
-/// 7.54727 (64), and 7.54729 at 240x64: second-order cross-stream convergence (difference ratio
-/// 3.9) to a discrete limit of about 7.548, +0.09% above 7.541 (upwind converges to about 7.549
-/// likewise). The window 4 <= x <= 5 is at x/(D_h Pe) = 0.02-0.025, which is not yet fully
-/// developed, and Pe = 100 has axial conduction, so the coarse mesh's negative discretization
-/// error happens to cancel the offset. The bar's premise (limit = 7.541 in this window) was
-/// wrong; the 2% bars above hold.
+/// Pre-registered W13 A4 bar, kept unchanged: "MUSCL's error against 7.541 strictly decreases
+/// from ny = 16 to 32 to 64". A4's setup (Pe = 100, window 4 <= x <= 5, i.e. x/(D_h Pe) =
+/// 0.02-0.025) converged at second order to about 7.548, so its premise failed. W13 A7 changed
+/// only the physical SETUP (user decision 2026-10-19), chosen from theory before running once:
+/// - Pe = Ū D_h/α = 1000 (α = 0.002). Axial conduction enters the fully developed parallel-plate
+///   Nu_T as O(Pe⁻²) (Shah & London; the Pe = 100 shift is below 0.1%), so at Pe = 1000 it is
+///   below 1e-5 relative, far under the ny = 64 discretization error (~1e-4).
+/// - Window 200 <= x <= 250, x* = x/(D_h Pe) = 0.10-0.125, well past the thermal entrance
+///   (Shah & London: fully developed for x* ≳ 0.1). With H = Ū = 1 the bulk decays as
+///   exp(−4 Nu x*); the second Graetz mode (λ₁²/λ₀² ≈ 9) decays as exp(−4·60·x*) relative to
+///   the first, ≈ e^{−24} at x* = 0.1.
+/// - Channel length 260 (outlet 10 cells past the window; the outflow influence length α/Ū =
+///   0.002 is far below a cell), nx = 260 (Δx = 1). In the developed region T = φ(y)e^{−kx};
+///   unlimited MUSCL advection and TPFA axial diffusion are linear and act on e^{−kx} as exact
+///   multiples, so the axial grid only rescales k and leaves the cross-stream eigenfunction
+///   (hence Nu) unchanged up to the O(αk/Ū) ≈ 3e-5 axial-conduction term.
 #[test]
 fn muscl_isothermal_nusselt_error_decreases_under_refinement() {
-    let (coarse, _, _) =
-        graetz_isothermal(NumericalFluxIntent::LocalLaxFriedrichs, muscl(), 120, 16);
-    let (fine, _, _) = graetz_isothermal(NumericalFluxIntent::LocalLaxFriedrichs, muscl(), 120, 64);
-    println!("isothermal Nu, MUSCL LSQ: ny=16 {coarse:.5}, ny=64 {fine:.5}");
-    assert!((fine - NU_T).abs() < (coarse - NU_T).abs());
+    const ALPHA_DEVELOPED: f64 = 0.002;
+    const LENGTH_DEVELOPED: f64 = 260.0;
+    const NX_DEVELOPED: usize = 260;
+    let nusselt = |ny: usize| {
+        let (system, program) = law("Graetz2D", NumericalFluxIntent::LocalLaxFriedrichs, muscl());
+        let topology = Arc::new(
+            FvTopology::from_tensor_box(&TensorBox {
+                axes: vec![
+                    TensorAxis::uniform(0.0, LENGTH_DEVELOPED, NX_DEVELOPED),
+                    TensorAxis::uniform(0.0, H, ny),
+                ],
+            })
+            .unwrap(),
+        );
+        let mut fluid = fluid_only(&topology);
+        for properties in fluid.properties.values_mut() {
+            properties.conductivity = ALPHA_DEVELOPED;
+        }
+        let operator = FvRealization::with_face_fields(
+            &system,
+            program,
+            topology.clone(),
+            &regions(&system),
+            &data(&[("t_in", 1.0), ("t_wall", 0.0)]),
+            &velocity(),
+        )
+        .unwrap()
+        .with_regions(fluid)
+        .unwrap();
+        let state = steady(&operator, 0.5);
+        let c = columns(&operator, &state, NX_DEVELOPED, ny);
+        let local = (0..NX_DEVELOPED)
+            .map(|i| c.wall_flux[i] * D_H / (ALPHA_DEVELOPED * c.bulk[i]))
+            .collect::<Vec<_>>();
+        mean_over(&c.x, &local, 200.0..=250.0)
+    };
+    let values = [16, 32, 64].map(nusselt);
+    println!("developed isothermal Nu (Pe = 1000), MUSCL LSQ, ny = 16/32/64: {values:?}");
+    assert!(
+        (values[1] - NU_T).abs() < (values[0] - NU_T).abs(),
+        "{values:?}"
+    );
+    assert!(
+        (values[2] - NU_T).abs() < (values[1] - NU_T).abs(),
+        "{values:?}"
+    );
 }
 
 #[test]

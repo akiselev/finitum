@@ -10,8 +10,10 @@ owns local executable kernels, Krasis owns state/history, and Methodus owns
 numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
-SHOW-3 / bounded SC-W3 additions are accepted. W13 A4 owner battery (2026-10-19, before the V8
-rebase): 293 passed, 1 recorded failing (below) across 46 targets. The complete owner gate passed
+SHOW-3 / bounded SC-W3 additions are accepted. W13 A7 owner battery (default features,
+2026-10-19, before the V8 rebase): 300 passed, 0 failed across 46 targets (A4's recorded
+Graetz failure now passes after its setup was changed, below); with `cranelift`, `w13_euler_fv`
+adds 1 passing and 1 recorded failing JIT test. The complete owner gate passed
 (286 tests across 43 targets after the V8 CAD-body landing below; 281 across 42 after the W12 L6 landing; 272 across 41 after L4; 262 across 39 after W10
 package 3; 254
 across 38 at the W9 head `a75baeb`); final Sinbad consumer coverage passed (210
@@ -85,114 +87,77 @@ Artifactum `2c016f1` for the consumer run. Not yet integrated.
   (lattice threshold, rim sample counts) are skipped, not differentiated; debug-mode CG on ~6k
   vertices is ~8 s per solve, so `J_c` runs its full campaign at the coarse level only.
 
-## W12 L4 SV2-C2a (2026-10-19): FV topology and first-order realization
 
-Working clone, not yet integrated or consumer-accepted. Siblings: Scientia L1 `7819884`
-(`conservation.rs`), Methodus L2 `8bd8333` (`ExplicitOperator`), Malleus `3005489`.
+## W13 A7 (2026-10-19): compressible Euler FV systems + Zhang–Shu (SV2C L8c)
 
-- `MeshProfile::TensorBox(TensorBox{axes: Vec<TensorAxis{spacing: AxisSpacing::{Uniform{min,
-  max,cells} | Nodes{nodes}}, periodic}>})`, 1-D/2-D (D2). Existing profiles, their
-  `realize` output and identities are unchanged; `realize(TensorBox)` refuses
-  (`MeshProfileUnsupported`: a rectangle is not a simplex `Mesh` cell).
-- `FvTopology` (`finitum-fv-topology/1`, `src/fv_topology.rs`): `from_tensor_box`,
-  `from_tagged_mesh` (simplex 1-3-D via `FacetTopology`; every exterior facet needs exactly
-  one tag: `FV_BOUNDARY_UNTAGGED`/`_TAG_OVERLAP`/`_TAG_INVALID`), `from_profile`. Cells:
-  volume, centroid. `FvFaceBlock` SoA: `minus`, `plus` (empty on boundary), `area`,
-  `normal[axis][face]` (unit, minus->plus / outward), `centroid`, `delta`, `translation`
-  (periodic only). Blocks: `interior`, `periodic` (last cell -> first across the wrap),
-  `boundary: BTreeMap<RegionTagId, _>` (`x_min/x_max/y_min/y_max`, SimplexBox names). Tensor
-  cells are axis-0-fastest; faces by axis, row, position. `check_invariants` ->
-  `FvTopologyInvariants` (positive measures, unit normals, every cell on exactly
-  `faces_per_cell` face sides, closure `‖Σ s|f|n‖∞/Σ|f| ≤ 8·faces·ε`; tensor closure is 0).
-  `digest()` over every column; `source_digest()` = tagged-mesh or tensor-profile digest.
-- `FvRealization::new(system, Arc<ConservationLawProgram>, Arc<FvTopology>, &RegionMap,
-  &BTreeMap<String,f64>)` (`finitum-fv-realization/1`, `src/fv.rs`). Binds kernels by
-  `FvOperandMeaning` (minus = owner, plus = neighbour or the region's `Ghost` output;
-  `PrescribedBoundaryFlux` replaces the face flux). Every declared boundary region must map to
-  existing tags and every tag be claimed once (`FV_BOUNDARY_UNMAPPED`, `_TAG_UNKNOWN`,
-  `_OVERLAP`, `_UNCLOSED`). Data: one finite uniform value per non-time datum
-  (`FV_DATUM_MISSING`/`_UNKNOWN`); `Time` data bind `t`. Refuses MUSCL
-  (`FV_RECONSTRUCTION_UNSUPPORTED`, L6), positivity, dimension and identity mismatches.
-- Evaluation: per face block, gather into reusable `Mutex` scratch, one `run_batch` (state,
-  normal, output stride 1; data stride 0), scatter in fixed order interior, periodic,
-  boundary tags (owner `+= |f|F*`, neighbour `-=` the same value). Residual
-  `R = |Ω|u̇ + Σ s|f|F* − |Ω|S`; `rhs = −(Σ s|f|F* − |Ω|S)/|Ω|`. Diagnostics
-  (`face_fluxes`, `conservation_receipt`) allocate; the operator paths reuse scratch.
-- `DaeOperator` (residual, JVP) and `methodus::ExplicitOperator` (`rhs`, `stable_step` =
-  `min_i |Ω_i|/Σ_f |f|λ_f`, λ_f the larger `characteristic_speed` of the two face states — a
-  sufficient bound, half the sharp 1-D upwind step; `linear_invariants` = [cell volumes];
-  `invariant_rates` = −Σ_b|f|F_b + Σ|Ω|S, Neumaier). JVPs via `FvKernel::differentiate`:
-  a refused kernel (D6) makes the JVP a typed `FinitumError::InputEvaluation` ->
-  `NumericError::Evaluation{code: "FV_NONSMOOTH_DERIVATIVE_REFUSED", origin: "fv/face_flux"}`;
-  primal unaffected.
-- `cfl() -> FvCfl{stable_step, limiting_cell, max_face_speed}`; `receipt() ->
-  FvRealizationReceipt{digest, program/intent/topology digests, kernels[{role, tag,
-  kernel_digest, derivative: Smooth|Zero|NotDifferentiated|Refused{code}}]}`; `digest()` over program, topology,
-  data values and boundary binding (for Krasis `OperatorIdentity`).
-- Conservation: `discrete_flux_balance(topology, &FvFaceFluxes, cell_flux_residual) ->
-  FvConservationReceipt` (`finitum-fv-conservation/1`): Neumaier Σ cells vs Σ boundary
-  `|f|F*`, `balanced` iff relative imbalance `≤ (faces_per_cell+2)·ε` of `Σ|terms|`;
-  `scatter_face_fluxes` is the residual's own scatter.
-- FC10 `FiniteVolumeRealization` (`finitum-finite-volume/1`) untouched. `Cargo.lock` gains
-  `libm 0.2.16` only through the Malleus pin (no new Finitum dependency).
-- Evidence: `tests/sv2c2a_fv.rs` (9): tensor numbering/periodic pairing/graded 2-D/invariants
-  /identity/`realize` refusal; simplex 1-3-D invariants; residual bitwise equal to a hand
-  first-order LLF scatter and within 16ε of pure upwind; ghost/prescribed boundaries; receipt
-  balanced and a leaking scatter (1e-3, 1e-9) refused; 2-D free stream to round-off;
-  `integrate_explicit` FE and SSP-RK3 on periodic 1-D advection with per-step balance
-  residual `≤ (cells+4·stages)ε·scale`, mass drift ≤ 1e-13, TVD bounds; JVP exact for linear
-  LLF, O(h²) for central Burgers, refused for LLF Burgers; BDF1 step mass `m/(1+kΔt)`;
-  binding refusals. `tests/sv2c2a_fv_measure.rs` (1): repeated evaluation bitwise identical.
-- Measurement: residual of 1-D LLF advection, 100 000 cells, 20 repeats, opt-level 2, host
-  thinkpadx1 (12 threads, shared with other builds): 106 ns/face. Not optimized; no claim.
-- Open: simplex periodic pairing; spatially varying data/provider fields; systems
-  (multi-component); admissibility hooks; a zero-allocation proof (the crate forbids
-  `unsafe`, so no counting allocator). MUSCL/limiters/LSQ/diffusion/VJP: L6 below.
+Working clone on A4 `13bcf45`, Scientia A2 `4c34a4c`. Not yet integrated or consumer-accepted.
 
-## W12 L6 SV2-C2b (2026-10-19): MUSCL, limiters, TPFA diffusion, derivative chain
+- `FvSystemRealization::new(&MultiComponentConservationLaw, Arc<MultiComponentProgram>,
+  Arc<FvTopology>, &RegionMap, &BTreeMap<String,f64>)` (`finitum-fv-system-realization/1`,
+  `src/fv_system.rs`). State **component-major** (`state[k·cells + i]`); kernels bound by
+  meaning (`StateComponent{component, side}`, `OutputComponent`, normals, data, `QuantityMean/Min`);
+  one batched multi-output call per face block for ghost (m outputs = plus state) or prescribed
+  flux, then the facet-pair face flux; scatter per component in topology block order. Generic
+  LLF/HLL/central and authored HLLC/Chandrashekar run unchanged (D3). Boundaries: transmissive
+  and slip-wall ghosts from `.res` (1-D `-momentum`; 2-D `m − 2(m·n)n`); periodic tensor boxes.
+- Reconstruction: constant or MUSCL on conserved variables (per-component `FvReconstruction`:
+  LSQ/axis gradients, Sweby/BJ/Venkatakrishnan). Primitive is refused
+  (`FV_PRIMITIVE_RECONSTRUCTION_UNSUPPORTED`; Scientia refuses it first, `FV_PRIMITIVE_MAP_MISSING`).
+- Zhang–Shu: per quantity in order, `q_min` over the cell's (already scaled) face points, θ from
+  Scientia's `theta` kernel, slope ×θ (≡ `U_f ← Ū + θ(U_f − Ū)`). Cell averages need `q > ε`
+  (else `FV_STATE_INADMISSIBLE` at `fv/admissibility`); every face state incl. ghosts is checked
+  before the flux (`fv/face_state`), never a NaN flux. `ExplicitOperator::admissibility` reports
+  inadmissible averages (Methodus/Krasis reject the stage and retry). Stable step
+  `min|Ω|/Σ|f|λ_f` at the (scaled) face states, λ from `characteristic_speed`.
+- Diagnostics: `face_fluxes` (per component `FvFaceFluxes`), `conservation_receipts` (per
+  component `FvConservationReceipt`), `cfl() -> FvSystemCfl`, `receipt() ->
+  FvSystemRealizationReceipt` (kernels + derivative dispositions, muscl, admissible, positivity
+  thresholds/θ digests, `residual_derivative`), `execution_receipt()`, `digest()`.
+- D6: `DaeOperator` JVP realized for constant/unlimited MUSCL with smooth kernels
+  (Chandrashekar); LLF/HLL/HLLC faces refuse `FV_NONSMOOTH_DERIVATIVE_REFUSED` at `fv/face_flux`,
+  limiters at `fv/limiter`, Zhang–Shu at `fv/positivity`. No VJP for systems yet.
+- Evidence `tests/w13_euler_fv.rs` (6 + 2 `cranelift`) + `fixtures/fv-euler.res`:
+  Sod 400 cells t = 0.2, window [0.55, 0.80] vs Toro p* = 0.30313, u* = 0.92745: first order
+  5.2e-3/4.1e-3 (bar 2e-2), MUSCL minmod 2.0e-4/1.6e-4 (bar 1e-2), HLLC MUSCL (2-D strip)
+  1.6e-4/1.3e-4 (bar 1e-2); per-step balance ≤ (cells+4s)ε·scale, mass/energy drift within the
+  summed bound, momentum 0.18. Toro 2: unlimited MUSCL refused typed at t = 0; with Zhang–Shu
+  (unlimited, minmod) 185 steps, 0 rejections, min ρ 5.8e-3, min p 1.2e-3. Isentropic vortex
+  (β = 5, [0,10]², t = 1, MUSCL unlimited LLF SSP-RK3): L1(ρ) 1.71e-3/3.76e-4/7.56e-5 at
+  32/64/128, orders 2.19, 2.31 (bar ≥ 1.8). Chandrashekar free stream ≤ 16ε·max|F|/h; JVP vs
+  central difference ≤ 1.4e-10 (bar 1e-6·scale). Slip walls: rest bitwise steady (1-D/2-D),
+  wall mass/energy flux exactly 0. Identity and binding refusals.
+- Disclosed bar changes (assumptions found wrong, not tolerances): Sod/HLLC "no rejected
+  step" became "only CFL retries, ≤ 2" (Methodus retries step 0 when the opening Riemann fan
+  raises λ; 1-2 retries seen, no inadmissible stage); Chandrashekar free stream "bitwise zero"
+  became the round-off bound above (faces are bitwise equal but the 4-term cell sum is not
+  associative). Toro-2 "no rejection" bar held as written.
+- JIT (`cranelift`): rhs, CFL, face fluxes and JVP bitwise equal to the interpreter on 5 cases
+  (LLF/HLL + Zhang–Shu, HLLC, Chandrashekar, slip walls). RECORDED FAILING
+  `every_new_system_kernel_runs_natively`: malleus-cranelift refuses the authored HLLC face
+  kernel and the Chandrashekar face JVP (`unsupported backend capability: "expression budget"`;
+  they run interpreted). Malleus cross-repo need.
+- Graetz (A4 test, user decision): `muscl_isothermal_nusselt_error_decreases_under_refinement`
+  keeps its bar; setup changed once, from theory before the run: Pe = 1000 (α = 0.002), length
+  260, nx = 260, window 200 ≤ x ≤ 250 (x/(D_h Pe) = 0.10-0.125). Result 7.53051 / 7.53814 /
+  7.54007 (ny 16/32/64): passes, 2nd-order approach to ≈ 7.541.
+- Performance not measured (the Euler target runs ~6 min at opt-level 2, 2 threads; no claim).
+  Open: primitive reconstruction (needs a Scientia primitive map), system VJP, simplex
+  multi-component runs beyond the generic path (untested), positivity for prescribed-flux faces.
 
-Working clone on L4 `b935dd2`; siblings Malleus `7a43e7f` (`malleus::ad`), Scientia L1
-`7819884`. Not yet integrated or consumer-accepted.
+## W12 L4/L6 SV2-C2a/C2b (2026-10-19): scalar FV (condensed; full text at `13bcf45`)
 
-- `FvReconstruction` (`src/fv_reconstruction.rs`): unweighted linear LSQ gradients over face
-  neighbours in topology face order (periodic translated), CSR weights `M⁻¹d`; rank-deficient
-  cells (simplex corners) extend to neighbours' neighbours, else zero slope and counted
-  (`degenerate_cells`). `FvLimiter::{Unlimited, Sweby(FvKernel), BarthJespersen,
-  Venkatakrishnan{k}}`. Sweby (tensor only, else `FV_LIMITER_UNSUPPORTED`): the Scientia
-  `Limiter` kernel over `SlopeRatio`, one `run_batch` over all cell-axis pairs, `σ=φ(r)s⁻`,
-  `r=0` when `s⁻=0`, zero slope at non-periodic boundaries; non-finite `φ` ->
-  `FV_LIMITER_INVALID`. BJ/Venkatakrishnan (`ε²=(k|Ω|^{1/d})³`, clamped to 1) on any mesh.
-  Diagnostics `slopes`, `face_states`; `derivative_refusal()` (Sweby via `malleus::ad`
-  `NonsmoothPolicy::Refuse`, `FV_NONSMOOTH_DERIVATIVE_REFUSED` with kink sites).
-- `FvRealization` takes `Muscl` intents: conserved variables only (`Primitive` ->
-  `FV_PRIMITIVE_RECONSTRUCTION_UNSUPPORTED`), `LeastSquares` anywhere, `Axis1D` tensor only,
-  `GreenGauss` -> `FV_GRADIENT_UNSUPPORTED`. Face, ghost (reads the reconstructed interior
-  state) and speed kernels read reconstructed face states; CFL uses them too.
-- `with_diffusion(FvDiffusion{coefficient})`: TPFA `−κ(u⁺−u⁻)/(δ·n)` with cell values on
-  interior/periodic/ghost faces (half-cell `δ` at a ghost; prescribed flux is total).
-  Refuses `max_nonorthogonality() > 1e-10` rad (`FV_TPFA_NONORTHOGONAL`, all 2-D/3-D simplex
-  boxes) and bad coefficients (`FV_DIFFUSION_INVALID`). CFL sums `|f|(λ_f+κ/(δ·n))`.
-  Identity `blake3(schema, base digest, "two_point", κ)`; without diffusion unchanged.
-- Derivatives: JVP through unlimited reconstruction (linear); `state_vjp(t,u,w,out)` =
-  `(∂R/∂u)ᵀw` from unit-tangent face/ghost/source JVP partials and the exact transpose of
-  reconstruction (allocates per call). Any limited reconstruction refuses JVP and VJP
-  (`InputEvaluation`, origin `fv/limiter`); primal unaffected.
-- Receipt adds skip-if-none `muscl{variables, gradient, limiter, limiter_kernel_digest,
-  degenerate_gradient_cells, derivative}`, `diffusion{scheme, coefficient,
-  max_nonorthogonality}`, `max_nonorthogonality`; `reconstruction` = `muscl`. L4 first-order
-  digests and receipt bytes pinned (`first_order_identities_are_pinned`).
-- Evidence `tests/sv2c2b_fv.rs` (9) + fixture `fv-muscl.res`: LSQ exact for linear fields
-  (graded tensor, simplex) at cells and faces; BJ strictly bounded, Venkatakrishnan within
-  O(ε²) on a simplex step; transpose identity ≤ 64ε·scale (Burgers central periodic, inflow
-  LLF + diffusion, 2-D simplex LLF) and Taylor order 1.9–2.1 (Burgers); D6 refusals for the
-  four Sweby kernels, Scientia agreeing; TVD + min/max on a 100-cell square wave, 120
-  SSP-RK3 steps at the stable step, each Sweby limiter (unlimited control fails); L1 orders
-  128->256 on sin(2πx), t=0.5, SSP-RK3: first 0.97, unlimited 2.00, van Leer 2.05, MC 1.99;
-  TPFA linear profile exact, Pe=10 boundary layer (central + TPFA) max error 1.75e-3 ->
-  4.57e-4 (order 1.94); simplex refusals. L4's MUSCL refusal assertion now asserts success.
-- Not measured (no performance claim). Open: Scientia lowering of `div(-k grad u)` and of
-  BJ/Venkatakrishnan intents (Finitum realizes both once programs carry them); limited-slope
-  frozen-active-set derivatives; non-orthogonal diffusion correction; spatially varying κ.
+- `MeshProfile::TensorBox` 1-D/2-D (periodic per axis); `FvTopology` (`finitum-fv-topology/1`,
+  tensor and tagged simplex; SoA face blocks interior/periodic/boundary tags; invariants, digest).
+- `FvRealization` (`finitum-fv-realization/1`) over Scientia `ConservationLawProgram`: boundary
+  binding refusals (`FV_BOUNDARY_*`), uniform data (`FV_DATUM_*`), batched face kernels, residual
+  `|Ω|u̇ + Σ s|f|F* − |Ω|S`, `DaeOperator` + `ExplicitOperator` (stable step `min|Ω|/Σ|f|λ`,
+  linear invariants, invariant rates), `cfl`, `receipt`, `digest`; `discrete_flux_balance`
+  receipt (`finitum-fv-conservation/1`, `(faces_per_cell+2)ε`).
+- MUSCL (`FvReconstruction`): LSQ/axis gradients, Sweby/BJ/Venkatakrishnan limiters; TPFA
+  diffusion (`with_diffusion`, refuses non-orthogonal meshes); JVP through unlimited
+  reconstruction, `state_vjp`; D6 refusals for limiters and flux kinks. L4 identities pinned
+  (`first_order_identities_are_pinned`). Evidence `sv2c2a_fv.rs` (9), `sv2c2a_fv_measure.rs`
+  (1: 106 ns/face LLF advection, 100k cells, thinkpadx1, no claim), `sv2c2b_fv.rs` (9).
 
 ## W13 A1 (2026-10-19): JIT execution backend (W11 F2)
 
@@ -295,9 +260,8 @@ Working clone on A1 `38556d3`; Scientia A2 `4c34a4c`. Not integrated or consumer
   transpose ≤ 64ε; refusals. `tests/w13_face_flux_exchange.rs` (4) + `fixtures/fe-solid.res`:
   FV slab + P1 solid exact (≤ 1e-9; trace 320, flux 160, imbalance exactly 0), Robin series
   resistance exact, JVP/VJP transpose, refusals.
-- RECORDED FAILING: `muscl_isothermal_nusselt_error_decreases_under_refinement` (pre-registered
-  "|Nu−7.541| decreases ny 16 -> 64"): 7.53882 / 7.54555 / 7.54727 (ny 16/32/64; 240x64
-  7.54729): 2nd-order convergence to ≈ 7.548 (+0.09%; window not fully developed, Pe = 100).
+- `muscl_isothermal_nusselt_error_decreases_under_refinement` failed under A4's setup (7.53882
+  / 7.54555 / 7.54727, limit ≈ 7.548: window not developed, Pe = 100); setup fixed in A7 (above).
 - Not measured (no performance claim). Open: time-dependent face fields; Scientia lowering
   of capacity and `div(−k grad u)`; exchange on non-matching facets and P2; Sinbad Graetz
   cases and the FEniCSx `conjugate_graetz` oracle; Krasis composition (A5).
@@ -337,7 +301,7 @@ recorded sliver-floor limitation.
 - Cell-centred FV: `TensorBox` profiles, `FvTopology` (tensor/simplex, periodic tensor
   axes) and `FvRealization` (DaeOperator + ExplicitOperator, CFL, conservation receipt,
   MUSCL, TPFA, per-face data, multi-region CHT) over Scientia conservation-law programs, and
-  the FV <-> P1 `FaceFluxExchange`.
+  the FV <-> P1 `FaceFluxExchange`; multi-component `FvSystemRealization` (Euler; Zhang–Shu, W13 A7).
 - Reference 1-D mortar/nonmatching transfer and FV/FD/network/particle/boundary method
   programs (not a claim of production execution for every method family).
 - Source-aware realization, conservation, transfer and constraint-work verification
