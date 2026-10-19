@@ -242,7 +242,16 @@ Working clone, not yet integrated. Siblings: Malleus `7a43e7f` (`crates/malleus-
   cranelift: w7_system_path_parity 7.50/6.02, gx_c4_facet_integrals 1.91/1.75, planar_p1
   1.44/1.06, sv2b4_system_stokes 1.55/1.07, w7_infsup 2.43/1.15, sv2_elasticity 1.64/0.35.
   Includes ~0.2-0.3 ms compile per distinct kernel; remaining time is Finitum gathers.
-- Open: SIMD across points, batching the remaining per-point loops, a disk cache.
+- Sinbad (read-only clone `0123f8d` built against this Finitum with `--features
+  finitum/cranelift`, env toggled, same binaries): sv2c7_scalar_fv 51.6, 54.6 -> 30.2, 35.5 s
+  (two reps, alternating order); benchmark_ladder 108.4 -> 95.7 s (one rep each);
+  show2_component not measured to completion: > 280 s interpreter and > 585 s with Cranelift
+  (two tests still running; beyond the lane's 10-minute command limit).
+- Default off: the gain on consumer targets is 1.1-1.7x, while the feature adds 49 lockfile crates (16
+  Cranelift) of native code generation and unsafe JIT code to every consumer build and needs Rust 1.93
+  (`malleus-cranelift` rust-version; Finitum's own is 1.85). Consumers opt in.
+- Open: SIMD across points, batching the remaining per-point loops, a disk cache; Sinbad
+  opt-in and recording `ExecutionReceipt` in run evidence (Sinbad's change).
 
 ## W11 F1 (2026-10-19): prepared and batched Malleus execution
 
