@@ -37,8 +37,8 @@ use serde::Serialize;
 use crate::execution::{ExecutionReceipt, PreparedExecutable, run_batch};
 use crate::fv_reconstruction::{FvLimiter, FvReconstruction};
 use crate::{
-    FinitumError, FvCellShape, FvFaceBlock, FvTopology, InputEvaluationError, InputOrigin,
-    RegionMap, RegionTagId,
+    FieldSource, FinitumError, FvCellShape, FvFaceBlock, FvTopology, InputEvaluationError,
+    InputOrigin, RegionMap, RegionTagId,
 };
 
 pub const FV_REALIZATION_SCHEMA: &str = "finitum-fv-realization/1";
@@ -78,6 +78,8 @@ pub(crate) struct Io<'a> {
     pub(crate) plus_tangent: &'a [f64],
     pub(crate) normal: &'a [Vec<f64>],
     pub(crate) data: &'a [f64],
+    /// Per-face values replacing uniform data: `(datum index, one value per face)`.
+    pub(crate) face: &'a [(usize, Vec<f64>)],
 }
 
 /// A prepared kernel with every operand bound by meaning.
@@ -168,7 +170,10 @@ impl BoundKernel {
                 Column::Tangent(Side::Minus) => (&io.minus_tangent[..points], 1),
                 Column::Tangent(Side::Plus) => (&io.plus_tangent[..points], 1),
                 Column::Normal(axis) => (&io.normal[axis][..points], 1),
-                Column::Datum(datum) => (&io.data[datum..datum + 1], 0),
+                Column::Datum(datum) => match io.face.iter().find(|(index, _)| *index == datum) {
+                    Some((_, values)) => (&values[..points], 1),
+                    None => (&io.data[datum..datum + 1], 0),
+                },
                 Column::Write => {
                     written = operand;
                     continue;
@@ -389,6 +394,12 @@ pub struct FvRealizationReceipt {
     /// Largest face non-orthogonality in radians (recorded with MUSCL or diffusion).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_nonorthogonality: Option<f64>,
+    /// Per-face data fields (W13 A4; absent when every datum is uniform).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub face_fields: Vec<FvFaceFieldReceipt>,
+    /// Cell regions with per-region properties (W13 A4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regions: Option<FvRegionsReceipt>,
 }
 
 /// The realized MUSCL reconstruction in an [`FvRealizationReceipt`].
@@ -422,9 +433,81 @@ pub struct FvDiffusionReceipt {
     pub max_nonorthogonality: f64,
 }
 
+/// One per-face datum field bound by [`FvRealization::with_face_fields`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FvFaceFieldReceipt {
+    pub datum: String,
+    pub faces: usize,
+    /// blake3 of the sampled values' little-endian IEEE bits, in topology block order.
+    pub values_digest: Digest,
+}
+
+/// Per-region material data of [`FvRealization::with_regions`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct FvRegionProperties {
+    /// Diffusion coefficient `k` (thermal conductivity), finite and non-negative.
+    pub conductivity: f64,
+    /// Volumetric capacity `C` (`ρc_p`) multiplying the rate, finite and positive.
+    pub capacity: f64,
+    /// A solid: the face-flux data (the prescribed velocity) must vanish next to it.
+    pub stagnant: bool,
+}
+
+/// Cell region tags (one per cell, topology cell order) and their properties.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FvRegions {
+    pub cell_regions: Vec<RegionTagId>,
+    pub properties: BTreeMap<RegionTagId, FvRegionProperties>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FvRegionReceipt {
+    pub cells: usize,
+    pub properties: FvRegionProperties,
+}
+
+/// The realized regions in an [`FvRealizationReceipt`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FvRegionsReceipt {
+    /// Always `two_point_harmonic`.
+    pub scheme: String,
+    pub regions: BTreeMap<RegionTagId, FvRegionReceipt>,
+    /// Interior and periodic faces between two different regions.
+    pub interface_faces: usize,
+    pub max_nonorthogonality: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RegionState {
+    cell_regions: Vec<RegionTagId>,
+    conductivity: Vec<f64>,
+    receipt: FvRegionsReceipt,
+}
+
+pub const FV_REGION_INTERFACE_SCHEMA: &str = "finitum-fv-region-interface/1";
+
+/// The flow across one region interface, positive from `from` into `to`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FvRegionInterfaceFlux {
+    pub from: RegionTagId,
+    pub to: RegionTagId,
+    pub faces: usize,
+    pub area: f64,
+    /// `Σ|f|F*` over the interface faces, oriented `from -> to` (Neumaier).
+    pub flow: f64,
+}
+
+/// The interface flux receipt of a multi-region realization at one state.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FvRegionInterfaceReceipt {
+    pub schema: String,
+    pub interfaces: Vec<FvRegionInterfaceFlux>,
+}
+
 #[derive(Debug)]
 struct Diffusion {
-    coefficient: f64,
+    /// The uniform coefficient (`None` for per-region harmonic transmissibilities).
+    coefficient: Option<f64>,
     /// `κ/(δ·n)` per face, per block in topology order (empty for prescribed-flux blocks).
     transmissibility: Vec<Vec<f64>>,
 }
@@ -483,6 +566,12 @@ pub struct FvRealization {
     diffusion: Option<Diffusion>,
     data: Vec<f64>,
     time_data: Vec<usize>,
+    /// Per-face data per block in topology block order (empty without face fields).
+    face_data: Vec<Vec<(usize, Vec<f64>)>>,
+    face_fields: Vec<FvFaceFieldReceipt>,
+    /// The rate coefficient `C_i|Ω_i|` (the cell volumes without regions).
+    mass: Vec<f64>,
+    regions: Option<RegionState>,
     invariants: Vec<Vec<f64>>,
     scratch: Mutex<Scratch>,
     digest: Digest,
@@ -499,6 +588,51 @@ impl FvRealization {
         topology: Arc<FvTopology>,
         regions: &RegionMap,
         data: &BTreeMap<String, f64>,
+    ) -> Result<Self, FinitumError> {
+        Self::bind(system, program, topology, regions, data, &BTreeSet::new())
+    }
+
+    /// [`FvRealization::new`] with spatially varying data (W13 A4): every datum named in
+    /// `fields` is read per face instead of uniformly (a prescribed velocity, say), sampled once
+    /// at construction at each face centroid (time 0) from a [`FieldSource`]: `Constant` (one
+    /// component), `Nodal` (one value per face in topology block order: interior, periodic,
+    /// boundary tags) or `Fallible` (coordinate sampler; a refusal is returned as
+    /// [`FinitumError::InputEvaluation`]). `Table`/`Kernel` sources are refused
+    /// (`FV_FACE_FIELD_UNSUPPORTED`), a non-finite value is `FV_FACE_FIELD_INVALID`, and a datum
+    /// read by the cell source kernel cannot vary per face (`FV_FACE_FIELD_CELL_KERNEL`).
+    /// `data` gives every other datum. The identity gains each field's sampled-value digest.
+    pub fn with_face_fields(
+        system: &ConservationLawSystem,
+        program: Arc<ConservationLawProgram>,
+        topology: Arc<FvTopology>,
+        regions: &RegionMap,
+        data: &BTreeMap<String, f64>,
+        fields: &BTreeMap<String, FieldSource>,
+    ) -> Result<Self, FinitumError> {
+        if fields.is_empty() {
+            return Err(fv_error(
+                "FV_FACE_FIELD_INVALID",
+                "with_face_fields needs at least one field",
+            ));
+        }
+        if let Some(name) = fields.keys().find(|name| data.contains_key(*name)) {
+            return Err(fv_error(
+                "FV_FACE_FIELD_INVALID",
+                format!("datum `{name}` is given both uniformly and per face"),
+            ));
+        }
+        let names = fields.keys().cloned().collect::<BTreeSet<_>>();
+        let realization = Self::bind(system, program, topology, regions, data, &names)?;
+        realization.bind_face_fields(fields)
+    }
+
+    fn bind(
+        system: &ConservationLawSystem,
+        program: Arc<ConservationLawProgram>,
+        topology: Arc<FvTopology>,
+        regions: &RegionMap,
+        data: &BTreeMap<String, f64>,
+        face_names: &BTreeSet<String>,
     ) -> Result<Self, FinitumError> {
         program
             .validate_identity()
@@ -595,6 +729,11 @@ impl FvRealization {
                 values.push(0.0);
                 continue;
             }
+            if face_names.contains(&datum.name) {
+                // Placeholder; the per-face values replace it in every kernel call.
+                values.push(0.0);
+                continue;
+            }
             match data.get(&datum.name) {
                 Some(value) if value.is_finite() => values.push(*value),
                 _ => {
@@ -611,7 +750,11 @@ impl FvRealization {
             .filter(|datum| datum.source != FvDatumSource::Time)
             .map(|datum| datum.name.as_str())
             .collect::<BTreeSet<_>>();
-        if let Some(extra) = data.keys().find(|name| !known.contains(name.as_str())) {
+        if let Some(extra) = data
+            .keys()
+            .chain(face_names)
+            .find(|name| !known.contains(name.as_str()))
+        {
             return Err(fv_error(
                 "FV_DATUM_UNKNOWN",
                 format!("datum `{extra}` is not read by the law"),
@@ -724,6 +867,10 @@ impl FvRealization {
         );
         Ok(Self {
             invariants: vec![topology.cell_volumes().to_vec()],
+            mass: topology.cell_volumes().to_vec(),
+            face_data: Vec::new(),
+            face_fields: Vec::new(),
+            regions: None,
             program,
             topology,
             face,
@@ -802,10 +949,402 @@ impl FvRealization {
             .expect("FV diffusion identity is serializable"),
         );
         self.diffusion = Some(Diffusion {
-            coefficient,
+            coefficient: Some(coefficient),
             transmissibility,
         });
         Ok(self)
+    }
+
+    /// Sample and bind the per-face fields of [`FvRealization::with_face_fields`].
+    fn bind_face_fields(
+        mut self,
+        fields: &BTreeMap<String, FieldSource>,
+    ) -> Result<Self, FinitumError> {
+        let dimension = self.topology.dimension();
+        let blocks = self.topology.blocks().collect::<Vec<_>>();
+        let total = blocks.iter().map(|block| block.len()).sum::<usize>();
+        let mut per_block = vec![Vec::new(); blocks.len()];
+        let mut receipts = Vec::with_capacity(fields.len());
+        for (name, source) in fields {
+            let datum = self
+                .program
+                .data
+                .iter()
+                .position(|datum| datum.name == *name && datum.source != FvDatumSource::Time)
+                .ok_or_else(|| {
+                    fv_error(
+                        "FV_DATUM_UNKNOWN",
+                        format!("datum `{name}` is not read by the law"),
+                    )
+                })?;
+            if self
+                .source
+                .as_ref()
+                .is_some_and(|(kernel, _)| kernel.columns.contains(&Column::Datum(datum)))
+            {
+                return Err(fv_error(
+                    "FV_FACE_FIELD_CELL_KERNEL",
+                    format!(
+                        "datum `{name}` is read by the cell source kernel and cannot vary per face"
+                    ),
+                ));
+            }
+            let values = match source {
+                FieldSource::Constant(values) if values.len() == 1 => vec![values[0]; total],
+                FieldSource::Nodal(values) if values.len() == total => values.clone(),
+                FieldSource::Fallible(sampler) => {
+                    let mut values = Vec::with_capacity(total);
+                    for block in &blocks {
+                        for face in 0..block.len() {
+                            let point = &block.centroid[face * dimension..(face + 1) * dimension];
+                            let sample = sampler(point, 0.0)
+                                .map_err(|error| FinitumError::InputEvaluation(Box::new(error)))?;
+                            if sample.len() != 1 {
+                                return Err(fv_error(
+                                    "FV_FACE_FIELD_INVALID",
+                                    format!(
+                                        "field `{name}` returned {} components, expected 1",
+                                        sample.len()
+                                    ),
+                                ));
+                            }
+                            values.push(sample[0]);
+                        }
+                    }
+                    values
+                }
+                FieldSource::Constant(_) | FieldSource::Nodal(_) => {
+                    return Err(fv_error(
+                        "FV_FACE_FIELD_INVALID",
+                        format!(
+                            "field `{name}` needs one constant component or one value per face ({total})"
+                        ),
+                    ));
+                }
+                FieldSource::Table(_) | FieldSource::Kernel { .. } => {
+                    return Err(fv_error(
+                        "FV_FACE_FIELD_UNSUPPORTED",
+                        format!(
+                            "field `{name}`: table and kernel sources are not sampled on faces"
+                        ),
+                    ));
+                }
+            };
+            if let Some(face) = values.iter().position(|value| !value.is_finite()) {
+                return Err(fv_error(
+                    "FV_FACE_FIELD_INVALID",
+                    format!("field `{name}` is not finite at face {face}"),
+                ));
+            }
+            let mut offset = 0;
+            for (slot, block) in per_block.iter_mut().zip(&blocks) {
+                slot.push((datum, values[offset..offset + block.len()].to_vec()));
+                offset += block.len();
+            }
+            receipts.push(FvFaceFieldReceipt {
+                datum: name.clone(),
+                faces: total,
+                values_digest: Digest::blake3(
+                    &values
+                        .iter()
+                        .flat_map(|value| value.to_bits().to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            });
+        }
+        self.face_data = per_block;
+        self.digest = Digest::blake3(
+            &serde_json::to_vec(&(
+                FV_REALIZATION_SCHEMA,
+                &self.digest,
+                "face_fields",
+                &receipts,
+            ))
+            .expect("FV face-field identity is serializable"),
+        );
+        self.face_fields = receipts;
+        Ok(self)
+    }
+
+    /// The per-face data of block `index` (empty without face fields).
+    fn face_data(&self, index: usize) -> &[(usize, Vec<f64>)] {
+        self.face_data.get(index).map_or(&[], Vec::as_slice)
+    }
+
+    fn require_orthogonal(&self) -> Result<(), FinitumError> {
+        let worst = self.topology.max_nonorthogonality();
+        if worst.is_nan() || worst > FV_TPFA_NONORTHOGONALITY_TOLERANCE {
+            return Err(fv_error(
+                "FV_TPFA_NONORTHOGONAL",
+                format!(
+                    "face non-orthogonality {worst:e} rad exceeds {FV_TPFA_NONORTHOGONALITY_TOLERANCE:e}; two-point diffusion is inconsistent on this mesh"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether topology block `index` is a prescribed-flux boundary.
+    fn prescribed_block(&self, index: usize) -> bool {
+        index >= 2
+            && matches!(
+                self.boundaries[index - 2].action,
+                BoundaryAction::Prescribed
+            )
+    }
+
+    /// Single-mesh multi-region realization (W13 A4, decision D5 gate 1b): every cell carries a
+    /// region tag with a conductivity `k`, a volumetric capacity `C` and a stagnation flag.
+    /// The residual becomes `R_i = C_i|Ω_i|u̇_i + Σ_f s_if|f|F*_f − |Ω_i|S_i`, and the face flux
+    /// gains the two-point diffusive flux `−T_f(u⁺ − u⁻)` with the harmonic transmissibility
+    /// `T_f = 1/(d⁻/k⁻ + d⁺/k⁺)`, `d⁻ = (x_f − x⁻)·n`, `d⁺ = (δ − (x_f − x⁻))·n` (the
+    /// series resistance of the two half cells, exact for piecewise-linear profiles with the
+    /// material jump on a face), `T_f = k⁻/(δ·n)` at a ghost face; prescribed fluxes stay total.
+    /// A `stagnant` region (a solid) requires every datum the face-flux kernel reads (the
+    /// prescribed velocity) to be exactly zero on every face of its cells, per face for a face
+    /// field, uniformly otherwise (`FV_REGION_NOT_STAGNANT`). Refuses a second diffusion term
+    /// (`FV_DIFFUSION_INVALID`), non-orthogonal meshes (`FV_TPFA_NONORTHOGONAL`), a cell count
+    /// mismatch (`FV_REGION_SHAPE`), a tag without properties (`FV_REGION_UNKNOWN`) and
+    /// non-finite, negative `k` or non-positive `C` (`FV_REGION_PROPERTY_INVALID`). Capacity and
+    /// conductivity are realization data until Scientia lowers `div(−k grad u)` and capacities.
+    pub fn with_regions(mut self, regions: FvRegions) -> Result<Self, FinitumError> {
+        if self.diffusion.is_some() || self.regions.is_some() {
+            return Err(fv_error(
+                "FV_DIFFUSION_INVALID",
+                "regions carry the diffusion; a second diffusion term is refused",
+            ));
+        }
+        let cells = self.topology.cell_count();
+        if regions.cell_regions.len() != cells {
+            return Err(fv_error(
+                "FV_REGION_SHAPE",
+                format!(
+                    "{} cell region tags for {cells} cells",
+                    regions.cell_regions.len()
+                ),
+            ));
+        }
+        for (tag, properties) in &regions.properties {
+            let FvRegionProperties {
+                conductivity,
+                capacity,
+                ..
+            } = *properties;
+            if !(conductivity.is_finite()
+                && conductivity >= 0.0
+                && capacity.is_finite()
+                && capacity > 0.0)
+            {
+                return Err(fv_error(
+                    "FV_REGION_PROPERTY_INVALID",
+                    format!(
+                        "region `{tag}`: conductivity {conductivity} must be finite and non-negative, capacity {capacity} finite and positive"
+                    ),
+                ));
+            }
+        }
+        let mut cell_properties = Vec::with_capacity(cells);
+        let mut counts = BTreeMap::<RegionTagId, usize>::new();
+        for (cell, tag) in regions.cell_regions.iter().enumerate() {
+            let properties = regions.properties.get(tag).ok_or_else(|| {
+                fv_error(
+                    "FV_REGION_UNKNOWN",
+                    format!("cell {cell} has region `{tag}` without properties"),
+                )
+            })?;
+            *counts.entry(tag.clone()).or_default() += 1;
+            cell_properties.push(*properties);
+        }
+        self.require_orthogonal()?;
+        let dimension = self.topology.dimension();
+        let centroids = self.topology.cell_centroids();
+        let flux_data = self
+            .face
+            .columns
+            .iter()
+            .filter_map(|column| match column {
+                Column::Datum(datum) => Some(*datum),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut interface_faces = 0;
+        let mut transmissibility = Vec::new();
+        for (index, block) in self.topology.blocks().enumerate() {
+            let boundary = index >= 2;
+            for face in 0..block.len() {
+                let minus = block.minus[face];
+                let plus = block.plus.get(face).copied();
+                let stagnant = cell_properties[minus].stagnant
+                    || plus.is_some_and(|cell| cell_properties[cell].stagnant);
+                if plus
+                    .is_some_and(|cell| regions.cell_regions[cell] != regions.cell_regions[minus])
+                {
+                    interface_faces += 1;
+                }
+                if !stagnant {
+                    continue;
+                }
+                for datum in &flux_data {
+                    let value = match self.face_data(index).iter().find(|(d, _)| d == datum) {
+                        Some((_, values)) => values[face],
+                        None if self.time_data.contains(datum) => f64::NAN,
+                        None => self.data[*datum],
+                    };
+                    if value != 0.0 {
+                        return Err(fv_error(
+                            "FV_REGION_NOT_STAGNANT",
+                            format!(
+                                "datum `{}` is {value} on face {face} of block {index}, next to a stagnant region",
+                                self.program.data[*datum].name
+                            ),
+                        ));
+                    }
+                }
+            }
+            if self.prescribed_block(index) {
+                transmissibility.push(Vec::new());
+                continue;
+            }
+            transmissibility.push(
+                (0..block.len())
+                    .map(|face| {
+                        let minus = block.minus[face];
+                        let projected = (0..dimension)
+                            .map(|axis| {
+                                block.delta[face * dimension + axis] * block.normal[axis][face]
+                            })
+                            .sum::<f64>();
+                        let k_minus = cell_properties[minus].conductivity;
+                        if boundary {
+                            return k_minus / projected;
+                        }
+                        let near = (0..dimension)
+                            .map(|axis| {
+                                (block.centroid[face * dimension + axis]
+                                    - centroids[minus * dimension + axis])
+                                    * block.normal[axis][face]
+                            })
+                            .sum::<f64>();
+                        let k_plus = cell_properties[block.plus[face]].conductivity;
+                        1.0 / (near / k_minus + (projected - near) / k_plus)
+                    })
+                    .collect(),
+            );
+        }
+        self.mass = self
+            .topology
+            .cell_volumes()
+            .iter()
+            .zip(&cell_properties)
+            .map(|(volume, properties)| properties.capacity * volume)
+            .collect();
+        self.invariants = vec![self.mass.clone()];
+        let receipt = FvRegionsReceipt {
+            scheme: "two_point_harmonic".into(),
+            regions: counts
+                .into_iter()
+                .map(|(tag, cells)| {
+                    let properties = regions.properties[&tag];
+                    (tag, FvRegionReceipt { cells, properties })
+                })
+                .collect(),
+            interface_faces,
+            max_nonorthogonality: self.topology.max_nonorthogonality(),
+        };
+        self.digest = Digest::blake3(
+            &serde_json::to_vec(&(
+                FV_REALIZATION_SCHEMA,
+                &self.digest,
+                "regions",
+                &receipt,
+                &regions.cell_regions,
+            ))
+            .expect("FV region identity is serializable"),
+        );
+        self.diffusion = Some(Diffusion {
+            coefficient: None,
+            transmissibility,
+        });
+        self.regions = Some(RegionState {
+            cell_regions: regions.cell_regions,
+            conductivity: cell_properties
+                .iter()
+                .map(|properties| properties.conductivity)
+                .collect(),
+            receipt,
+        });
+        Ok(self)
+    }
+
+    /// The conductivity of `cell`: its region's, the uniform diffusion coefficient, or `None`
+    /// without diffusion.
+    pub fn cell_conductivity(&self, cell: usize) -> Option<f64> {
+        match (&self.regions, &self.diffusion) {
+            (Some(regions), _) => regions.conductivity.get(cell).copied(),
+            (None, Some(diffusion)) => diffusion.coefficient,
+            (None, None) => None,
+        }
+    }
+
+    /// Whether boundary `tag` is bound to a prescribed-flux kernel.
+    pub fn is_prescribed_boundary(&self, tag: &RegionTagId) -> bool {
+        self.boundaries.iter().any(|binding| {
+            binding.tag == *tag && matches!(binding.action, BoundaryAction::Prescribed)
+        })
+    }
+
+    /// The flow `Σ|f|F*` across every face between two different regions at `(time, state)`,
+    /// one entry per ordered region pair `from < to`, positive from `from` into `to`
+    /// (face-ordered Neumaier sums of the residual's own face fluxes). Refused without regions
+    /// (`FV_REGION_SHAPE`).
+    pub fn region_interface_fluxes(
+        &self,
+        time: f64,
+        state: &[f64],
+    ) -> Result<FvRegionInterfaceReceipt, FinitumError> {
+        let regions = self
+            .regions
+            .as_ref()
+            .ok_or_else(|| fv_error("FV_REGION_SHAPE", "the realization has no regions"))?;
+        let fluxes = self.face_fluxes(time, state)?;
+        let mut flows = BTreeMap::<(RegionTagId, RegionTagId), (usize, f64, Neumaier)>::new();
+        for (block, values) in [
+            (self.topology.interior(), &fluxes.interior),
+            (self.topology.periodic(), &fluxes.periodic),
+        ] {
+            for (face, value) in values.iter().enumerate() {
+                let (minus, plus) = (
+                    &regions.cell_regions[block.minus[face]],
+                    &regions.cell_regions[block.plus[face]],
+                );
+                if minus == plus {
+                    continue;
+                }
+                let flow = block.area[face] * value;
+                let (key, signed) = if minus < plus {
+                    ((minus.clone(), plus.clone()), flow)
+                } else {
+                    ((plus.clone(), minus.clone()), -flow)
+                };
+                let entry = flows.entry(key).or_insert((0, 0.0, Neumaier::default()));
+                entry.0 += 1;
+                entry.1 += block.area[face];
+                entry.2.add(signed);
+            }
+        }
+        Ok(FvRegionInterfaceReceipt {
+            schema: FV_REGION_INTERFACE_SCHEMA.into(),
+            interfaces: flows
+                .into_iter()
+                .map(|((from, to), (faces, area, flow))| FvRegionInterfaceFlux {
+                    from,
+                    to,
+                    faces,
+                    area,
+                    flow: flow.total(),
+                })
+                .collect(),
+        })
     }
 
     pub fn program(&self) -> &ConservationLawProgram {
@@ -916,12 +1455,18 @@ impl FvRealization {
             reconstruction: if muscl.is_some() { "muscl" } else { "constant" }.into(),
             kernels,
             muscl,
-            diffusion: self.diffusion.as_ref().map(|diffusion| FvDiffusionReceipt {
-                scheme: "two_point".into(),
-                coefficient: diffusion.coefficient,
-                max_nonorthogonality: self.topology.max_nonorthogonality(),
-            }),
+            diffusion: self
+                .diffusion
+                .as_ref()
+                .and_then(|diffusion| diffusion.coefficient)
+                .map(|coefficient| FvDiffusionReceipt {
+                    scheme: "two_point".into(),
+                    coefficient,
+                    max_nonorthogonality: self.topology.max_nonorthogonality(),
+                }),
             max_nonorthogonality,
+            face_fields: self.face_fields.clone(),
+            regions: self.regions.as_ref().map(|regions| regions.receipt.clone()),
         }
     }
 
@@ -1065,6 +1610,7 @@ impl FvRealization {
                     plus_tangent: &[],
                     normal: &block.normal,
                     data,
+                    face: self.face_data(index),
                 },
                 flux,
             ),
@@ -1079,6 +1625,7 @@ impl FvRealization {
                             plus_tangent: &[],
                             normal: &block.normal,
                             data,
+                            face: self.face_data(index),
                         },
                         plus,
                     )?;
@@ -1092,6 +1639,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &block.normal,
                         data,
+                        face: self.face_data(index),
                     },
                     flux,
                 )?;
@@ -1128,6 +1676,7 @@ impl FvRealization {
                 plus_tangent: &[],
                 normal: &[],
                 data: &scratch.data,
+                face: &[],
             },
             &mut scratch.cell,
         )?;
@@ -1204,6 +1753,7 @@ impl FvRealization {
                     plus_tangent: &[],
                     normal: &block.normal,
                     data,
+                    face: self.face_data(index),
                 };
                 let tangent = binding
                     .tangent
@@ -1236,6 +1786,7 @@ impl FvRealization {
                         plus_tangent,
                         normal: &block.normal,
                         data,
+                        face: self.face_data(index),
                     },
                     flux_tangent,
                 )?,
@@ -1272,6 +1823,7 @@ impl FvRealization {
                     plus_tangent: &[],
                     normal: &[],
                     data: &scratch.data,
+                    face: &[],
                 },
                 &mut scratch.cell,
             )?;
@@ -1342,6 +1894,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &block.normal,
                         data,
+                        face: self.face_data(index),
                     };
                     let tangent = binding
                         .tangent
@@ -1375,6 +1928,7 @@ impl FvRealization {
                                     plus_tangent,
                                     normal: &block.normal,
                                     data,
+                                    face: self.face_data(index),
                                 },
                                 out,
                             ),
@@ -1451,6 +2005,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &[],
                         data: &scratch.data,
+                        face: &[],
                     },
                     &mut scratch.cell,
                 )?;
@@ -1516,9 +2071,7 @@ impl FvRealization {
             };
             if let Ok(max_speed) = &result {
                 cfl.max_face_speed = *max_speed;
-                for (cell, (volume, sum)) in
-                    self.topology.cell_volumes().iter().zip(&sums).enumerate()
-                {
+                for (cell, (volume, sum)) in self.mass.iter().zip(&sums).enumerate() {
                     if *sum > 0.0 && volume / sum < cfl.stable_step {
                         cfl.stable_step = volume / sum;
                         cfl.limiting_cell = Some(cell);
@@ -1573,6 +2126,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &block.normal,
                         data,
+                        face: self.face_data(index),
                     },
                     output,
                 )
@@ -1592,6 +2146,7 @@ impl FvRealization {
                                 plus_tangent: &[],
                                 normal: &block.normal,
                                 data,
+                                face: self.face_data(index),
                             },
                             plus,
                         )?;
@@ -1661,11 +2216,7 @@ impl FvRealization {
         self.require_state("FV state", state)?;
         self.require_state("FV state rate", rate)?;
         self.require_state("FV residual", output)?;
-        for ((out, volume), rate) in output
-            .iter_mut()
-            .zip(self.topology.cell_volumes())
-            .zip(rate)
-        {
+        for ((out, volume), rate) in output.iter_mut().zip(&self.mass).zip(rate) {
             *out = volume * rate;
         }
         self.with_scratch(time, |scratch| self.accumulate(scratch, state, output))
@@ -1683,11 +2234,7 @@ impl FvRealization {
         self.require_state("FV state direction", state_direction)?;
         self.require_state("FV rate direction", rate_direction)?;
         self.require_state("FV residual direction", output)?;
-        for ((out, volume), rate) in output
-            .iter_mut()
-            .zip(self.topology.cell_volumes())
-            .zip(rate_direction)
-        {
+        for ((out, volume), rate) in output.iter_mut().zip(&self.mass).zip(rate_direction) {
             *out = volume * rate;
         }
         self.with_scratch(time, |scratch| {
@@ -1700,7 +2247,7 @@ impl FvRealization {
         self.require_state("FV right-hand side", output)?;
         output.fill(0.0);
         self.with_scratch(time, |scratch| self.accumulate(scratch, state, output))?;
-        for (out, volume) in output.iter_mut().zip(self.topology.cell_volumes()) {
+        for (out, volume) in output.iter_mut().zip(&self.mass) {
             *out = -*out / volume;
         }
         Ok(())
@@ -1836,13 +2383,13 @@ pub fn discrete_flux_balance(
 
 /// Neumaier compensated summation in insertion order.
 #[derive(Default)]
-struct Neumaier {
+pub(crate) struct Neumaier {
     sum: f64,
     compensation: f64,
 }
 
 impl Neumaier {
-    fn add(&mut self, value: f64) {
+    pub(crate) fn add(&mut self, value: f64) {
         let total = self.sum + value;
         if self.sum.abs() >= value.abs() {
             self.compensation += (self.sum - total) + value;
@@ -1852,7 +2399,7 @@ impl Neumaier {
         self.sum = total;
     }
 
-    fn total(&self) -> f64 {
+    pub(crate) fn total(&self) -> f64 {
         self.sum + self.compensation
     }
 }

@@ -10,7 +10,8 @@ owns local executable kernels, Krasis owns state/history, and Methodus owns
 numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
-SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
+SHOW-3 / bounded SC-W3 additions are accepted. W13 A4 owner battery (2026-10-19, before the V8
+rebase): 293 passed, 1 recorded failing (below) across 46 targets. The complete owner gate passed
 (286 tests across 43 targets after the V8 CAD-body landing below; 281 across 42 after the W12 L6 landing; 272 across 41 after L4; 262 across 39 after W10
 package 3; 254
 across 38 at the W9 head `a75baeb`); final Sinbad consumer coverage passed (210
@@ -253,61 +254,70 @@ Working clone, not yet integrated. Siblings: Malleus `7a43e7f` (`crates/malleus-
 - Open: SIMD across points, batching the remaining per-point loops, a disk cache; Sinbad
   opt-in and recording `ExecutionReceipt` in run evidence (Sinbad's change).
 
+## W13 A4 (2026-10-19): conjugate heat transfer on FV (SV2C L9a, SV9 E5 stage 1)
+
+Working clone on A1 `38556d3`; Scientia A2 `4c34a4c`. Not integrated or consumer-accepted.
+- Per-face data: `FvRealization::with_face_fields(system, program, topology, regions, data,
+  &BTreeMap<String, FieldSource>)` reads the named datums per face (`Constant`, `Nodal` = one
+  value per face in block order, `Fallible` sampled once at face centroids, t = 0); `Table`/
+  `Kernel` -> `FV_FACE_FIELD_UNSUPPORTED`; source-kernel datums -> `FV_FACE_FIELD_CELL_KERNEL`;
+  `FV_FACE_FIELD_INVALID` (shape, non-finite, given twice). Bound as a stride-1 column in the
+  face/ghost/prescribed/speed `run_batch`. Identity adds each field's value-bits digest.
+- Regions (D5 gate 1b): `with_regions(FvRegions{cell_regions, properties: {tag ->
+  FvRegionProperties{conductivity, capacity, stagnant}}})`: rate `C_i|Ω_i|u̇`, harmonic TPFA
+  `T_f = 1/(d⁻/k⁻ + d⁺/k⁺)` (`k⁻/(δ·n)` at ghosts; prescribed fluxes total), invariants and CFL
+  on `C|Ω|`; `stagnant` requires every face-flux datum (velocity) to be 0 next to the region
+  (`FV_REGION_NOT_STAGNANT`). Refusals `FV_REGION_SHAPE/_UNKNOWN/_PROPERTY_INVALID`,
+  `FV_DIFFUSION_INVALID` (second diffusion), `FV_TPFA_NONORTHOGONAL`.
+  `region_interface_fluxes(t,u) -> FvRegionInterfaceReceipt` (`finitum-fv-region-interface/1`,
+  Neumaier flow per region pair `from < to`). `cell_conductivity`, `is_prescribed_boundary`.
+  Receipt adds skip-if-empty `face_fields`, `regions`; `new` digests/receipt bytes unchanged
+  (`first_order_identities_are_pinned`, `w13_execution_backend` pass).
+- `FaceFluxExchange` (`src/fv_exchange.rs`, `finitum-face-flux-exchange/1`), the Krasis A5 API:
+  `new(&FvRealization, &RegionTagId, fe_mesh: &Mesh, fe_facets: &[FacetId],
+  FaceFluxExchangeLaw::{DirichletNeumann | Robin{coefficient}}, tolerance)`; the FV tag must
+  be a prescribed-flux boundary with zero flux (`FV_EXCHANGE_BOUNDARY`), each FV face matches
+  one FE exterior facet (centroid, measure, opposite normal; `FV_EXCHANGE_NONMATCHING`),
+  `FV_EXCHANGE_LAW`, `FV_EXCHANGE_SHAPE`. `q_f = g_f(T_P − T_s(x_f))`, `g_f = k_P/(δ·n)` or
+  `h`, `T_s` = facet-vertex mean. `residual(fv, fe, fv_out, fe_out)` ADDS `+|f|q_f` to the
+  owner cell and `−|f|q_f/n_v` to each facet vertex (FE state = P1 vertex values, the field
+  block); `jacobian_vector_product` (= residual of the direction), `vector_jacobian_product`
+  (exact transpose, adds), `face_fluxes`, `fe_trace`, `balance -> InterfaceBalance`
+  (`finitum-interface-balance/1`, `balanced` iff `|Σfv + Σfe| ≤ 4·n_v·ε·Σ|f||q|`),
+  `receipt()` (`enforcement: weak_flux`), `digest`, `fv_dimension`, `fe_dimension`, `faces`.
+  FE sign: Finitum's `div(q)=0, q=−k grad T` residual `∫k∇T·∇φ`; verified by the coupled solve.
+- Evidence `tests/w13_cht_fv.rs` (8) + `fixtures/fv-cht.res`: Graetz Pe = 100, 120x64, Nu over
+  4 ≤ x ≤ 5: isothermal LLF upwind 7.549, MUSCL-LSQ 7.547 (bar 2% of 7.541); uniform flux 8.297
+  (bar 2% of 8.235); Newton-GMRES steady, boundary flows cancel ≤ 1e-8, conservation receipts
+  balanced; BDF1 (adaptive) to t = 400 within 4.6e-10 of steady; two-slab 1-D uniform and graded
+  exact ≤ 1e-9 (320 K, 160 W/m²), capacity BDF storage balance; 2-D zero-velocity limit exact;
+  conjugate Graetz with stagnant walls: fluid->wall flow = wall boundary outflow ≤ 1e-8, VJP
+  transpose ≤ 64ε; refusals. `tests/w13_face_flux_exchange.rs` (4) + `fixtures/fe-solid.res`:
+  FV slab + P1 solid exact (≤ 1e-9; trace 320, flux 160, imbalance exactly 0), Robin series
+  resistance exact, JVP/VJP transpose, refusals.
+- RECORDED FAILING: `muscl_isothermal_nusselt_error_decreases_under_refinement` (pre-registered
+  "|Nu−7.541| decreases ny 16 -> 64"): 7.53882 / 7.54555 / 7.54727 (ny 16/32/64; 240x64
+  7.54729): 2nd-order convergence to ≈ 7.548 (+0.09%; window not fully developed, Pe = 100).
+- Not measured (no performance claim). Open: time-dependent face fields; Scientia lowering
+  of capacity and `div(−k grad u)`; exchange on non-matching facets and P2; Sinbad Graetz
+  cases and the FEniCSx `conjugate_graetz` oracle; Krasis composition (A5).
+
 ## W11 F1 (2026-10-19): prepared and batched Malleus execution
 
-Condensed 2026-10-19 (full text at `90c4789`). Every Malleus call runs prepared
-(`src/execution.rs`: `PreparedExecutable`/`Module`/`Composition` held by the owning struct, no
-address-keyed cache; positional binding over inline tables and per-thread state; a refusal
-re-runs `PreparedKernel::run` for the interpreter's exact error). `PointBatch` packs strided
-per-point windows; the system cell loop runs one `run_batch` per kernel. Not batched (open):
-single-field point loops, facet/interface loops, VJP paths, scalar property kernels; Finitum's
-per-point `BTreeMap` gathers dominate profiles. Timing before/after (s, opt 2, loaded host):
-w7_system_path_parity 45.5/16.1, gx_c4 26.7/5.2, planar_p1 15.9/4.6, sv2_elasticity 15.3/3.9.
+Condensed (full text at `90c4789`): every Malleus call runs prepared (`src/execution.rs`); the
+system cell loop runs one `run_batch` per kernel; single-field, facet/interface and VJP loops
+are not batched (open). Timing w7_system_path_parity 45.5 -> 16.1 s (opt 2, loaded host).
 
-## W10 package 3 (2026-10-09): planar non-nested coverage and mortar-type P1 constraints
+## Earlier landings (condensed 2026-10-19; full text at `38556d3`)
 
-Condensed 2026-10-19 (full text in git history at `16dbdf3`).
-- `ConnectionRealizationPlan::planar_p1(system, relation, meshes, facets, tolerance)` (beside
-  `nested_p1`; Sinbad policy `InterfaceTransferPolicy::PlanarP1`, serialized `planar_p1`)
-  admits two arbitrary planar triangulations of the same polygon.
-- The constructor proves coverage (area floor `tolerance × diameter`; degenerate triangles,
-  empty opposite-side and overlapping same-side intersections refused) and builds the mortar
-  projection of the master P1 trace against the biorthogonal dual basis `ψ_i = 4λ_i − 1`,
-  every integral exact over the intersection polygons.
-- Refusals are `InvalidRealization` with a `CONNECTION_TRACE:` prefix, each asserted by
-  message in `tests/planar_p1.rs` (8 tests: coverage defects ≤ 3.4e-16 relative, row sums,
-  reproduction and transpose checks over the `tests/support/planar_meshes.rs` fixtures).
-- Open: curved/moving interfaces, multiplier/Nitsche stability, the multi-relation diagonal,
-  n-way junctions, transient nonmatching composition (Krasis); the recorded sliver-floor
-  limitation from the 2026-10-09 review stands.
-
-## W9 SC-W3 packages 1-2 (2026-09-29; details in git history)
-
-- Package 1: `ConnectionRealizationPlan::system_linearized_diagonal` gives the reduced
-  Jacobian diagonal `diag(Rᵀ J R)` of a `matching`/`nested_p1` connected pair (essential and
-  connection-target rows are identity rows since the 2026-10-08 fix; interface-adjacent
-  master rows gain the transpose-scattered cross term). Krasis must route weighted-map Jacobi
-  through it for `nested_p1`.
-- Package 2: proof-only (no production change) that Krasis `ConnectedSystemOperator` row
-  kinds, residual and JVP are generic over `ConstraintSet`, so `nested_p1` transient coupling
-  behaves as `matching`; two real coarse/fine `Conduction` operators over
-  `two-material-conduction.res`. Package 3 landed in W10 as `planar_p1`.
-
-## Current additions
-
-Condensed 2026-10-19 (text at `90c4789`): `ConnectionRealizationPlan::system_constraints`
-(flat equivalence classes across matching relations), `SystemOperator::linearized_diagonal`
-(cell-local JVP columns; facet kernels and affine constraints give no diagonal, no probing
-fallback), `SurfaceTransfer::p1` (3-D surface interpolation with exact dual transpose),
-`nested_p1` coverage proofs and weighted constraints. Owner gate 262 tests/39 targets on
-2026-10-09; consumer acceptance 210 tests/35 targets at the 2026-09-29 head.
-
-## Accepted recent gates
-
-Condensed 2026-10-19 (text at `90c4789`): SC-W2 matching interface (246 tests, 2026-09-17,
-[evidence](docs/validation/2026-09-17-sc-w2/README.md)); SHOW-1 portable meshes and exact P1
-sampling ([evidence](docs/validation/2026-09-17-show1/README.md)); M-CPU-S cell-local CSR
-assembly ([evidence](docs/validation/2026-09-17-mcpu-s/README.md)).
+W10 package 3 `ConnectionRealizationPlan::planar_p1` (two planar triangulations of one polygon,
+proved coverage, biorthogonal dual-basis mortar rows; `tests/planar_p1.rs`); W9 SC-W3
+`system_linearized_diagonal` (reduced `diag(RᵀJR)` for `matching`/`nested_p1`) and the
+transient `nested_p1` proofs (`tests/nested_p1_transient.rs`); `system_constraints`,
+`SystemOperator::linearized_diagonal`, `SurfaceTransfer::p1`. Accepted gates: SC-W2 matching
+interface, SHOW-1 portable meshes, M-CPU-S CSR assembly (`docs/validation/2026-09-17-*`).
+Open there: curved/moving interfaces, multiplier/Nitsche stability, n-way junctions, the
+recorded sliver-floor limitation.
 
 ## Library surface
 
@@ -325,11 +335,11 @@ assembly ([evidence](docs/validation/2026-09-17-mcpu-s/README.md)).
 - Exterior/interface trace and mixed/exact-sequence/condensation primitives;
   affine constraint prolongation, equation rows and transpose work.
 - Cell-centred FV: `TensorBox` profiles, `FvTopology` (tensor/simplex, periodic tensor
-  axes) and the first-order `FvRealization` (DaeOperator + ExplicitOperator, CFL,
-  conservation receipt) over Scientia conservation-law programs (SV2-C2a).
-- Reference 1-D mortar/nonmatching transfer, variable-order segment, clipped-segment,
-  FV/FD/network/particle/boundary method programs and fixtures. These are not a
-  claim of complete production execution for every method family.
+  axes) and `FvRealization` (DaeOperator + ExplicitOperator, CFL, conservation receipt,
+  MUSCL, TPFA, per-face data, multi-region CHT) over Scientia conservation-law programs, and
+  the FV <-> P1 `FaceFluxExchange`.
+- Reference 1-D mortar/nonmatching transfer and FV/FD/network/particle/boundary method
+  programs (not a claim of production execution for every method family).
 - Source-aware realization, conservation, transfer and constraint-work verification
   reports. Callers must use the validating APIs, not merely rehash acceptance flags.
 - CADabra provider identity/maps are consumed directly for bounded geometry paths; a
@@ -341,17 +351,10 @@ assembly ([evidence](docs/validation/2026-09-17-mcpu-s/README.md)).
 - General hp/AMR topology, geometric hanging-node construction, curved high-order
   realization, moving/remeshed interfaces and production embedded-domain semantics
   remain open. Reference segment tables are not multidimensional hp support.
-- Connected product admission includes matching scalar P1 and one steady planar
-  nested P1 pair; weighted-map Jacobi has a proved diagonal for that same
-  bounded shape, essential rows included only since the 2026-10-08 review fix
-  (above), and the transient/rate proof checks Krasis needs for
-  a `nested_p1` connection (fine-side continuity, dual-residual balance, both
-  at any state and rate) are proved in `tests/nested_p1_transient.rs`.
-  Planar non-nested triangulations of the same polygon are admitted by
-  `planar_p1` with a proved coverage and dual-basis mortar rows (W10, above);
-  curved or moving nonmatching coupling and multiplier/Nitsche stability remain
-  open; actual time stepping/history for a transient nonmatching connection is
-  Krasis's own composition, not built here.
+- Connected product admission: matching scalar P1, steady/transient `nested_p1` and
+  `planar_p1` (proved diagonal and transient checks above); FV <-> P1 face-flux exchange
+  (W13 A4). Curved/moving nonmatching coupling and time stepping of transient connections
+  (Krasis) are not built here.
 - Full-coordinate affine constraint rows are generally nonsymmetric even when
   the free-coordinate `P^T A P` block is symmetric; symmetry declarations and solver
   refusals must retain that distinction.
@@ -360,8 +363,6 @@ assembly ([evidence](docs/validation/2026-09-17-mcpu-s/README.md)).
 - General SIMD/GPU execution, material/scientific parsing, coupled transactions,
   solver selection and support promotion belong outside this repository.
 
-Detailed FC/GX/W8 history and superseded audit findings remain in Git history.
-This compact ledger replaces the accumulated historical work log; recorded gate
-artifacts remain in `docs/validation/`.
+Detailed history is in Git; recorded gate artifacts remain in `docs/validation/`.
 
 Final cross-repository evidence: [September 18 acceptance](../sinbad/docs/validation/2026-09-18-assembly/README.md).

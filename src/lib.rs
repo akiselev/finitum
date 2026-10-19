@@ -13,6 +13,7 @@ mod embedded;
 mod error;
 mod execution;
 mod fv;
+mod fv_exchange;
 mod fv_reconstruction;
 mod fv_topology;
 mod infsup;
@@ -54,10 +55,16 @@ pub use execution::{
     with_execution_backend,
 };
 pub use fv::{
-    FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FV_TPFA_NONORTHOGONALITY_TOLERANCE,
-    FvCfl, FvConservationReceipt, FvDerivativeDisposition, FvDiffusion, FvDiffusionReceipt,
-    FvFaceFluxes, FvKernelReceipt, FvRealization, FvRealizationReceipt, FvReconstructionReceipt,
+    FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FV_REGION_INTERFACE_SCHEMA,
+    FV_TPFA_NONORTHOGONALITY_TOLERANCE, FvCfl, FvConservationReceipt, FvDerivativeDisposition,
+    FvDiffusion, FvDiffusionReceipt, FvFaceFieldReceipt, FvFaceFluxes, FvKernelReceipt,
+    FvRealization, FvRealizationReceipt, FvReconstructionReceipt, FvRegionInterfaceFlux,
+    FvRegionInterfaceReceipt, FvRegionProperties, FvRegionReceipt, FvRegions, FvRegionsReceipt,
     discrete_flux_balance, scatter_face_fluxes,
+};
+pub use fv_exchange::{
+    FACE_FLUX_EXCHANGE_SCHEMA, FaceFluxExchange, FaceFluxExchangeLaw, FaceFluxExchangeReceipt,
+    INTERFACE_BALANCE_SCHEMA, InterfaceBalance,
 };
 pub use fv_reconstruction::{
     FV_NONSMOOTH_DERIVATIVE_REFUSED, FvBlockStates, FvLimiter, FvReconstruction,
