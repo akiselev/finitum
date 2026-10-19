@@ -10,6 +10,8 @@ mod element;
 mod embedded;
 mod error;
 mod execution;
+mod fv;
+mod fv_topology;
 mod infsup;
 mod interface;
 mod mapping;
@@ -39,6 +41,15 @@ pub use constraint::{AffineConstraint, ConstraintSet, WeightedDof};
 pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::{FinitumError, InputEvaluationError, InputLocation, InputOrigin};
+pub use fv::{
+    FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FvCfl, FvConservationReceipt,
+    FvDerivativeDisposition, FvFaceFluxes, FvKernelReceipt, FvRealization, FvRealizationReceipt,
+    discrete_flux_balance, scatter_face_fluxes,
+};
+pub use fv_topology::{
+    AxisSpacing, FV_TOPOLOGY_SCHEMA, FvCellShape, FvFaceBlock, FvTopology, FvTopologyInvariants,
+    TensorAxis, TensorBox,
+};
 pub use infsup::{
     INF_SUP_DIMENSION_CAP, INF_SUP_REPORT_SCHEMA, InfSupConfig, InfSupEstimate, InfSupInstability,
     InfSupNorm, InfSupPairing, InfSupVerdict, estimate_inf_sup, require_inf_sup_stable,

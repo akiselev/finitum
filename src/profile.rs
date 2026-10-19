@@ -112,6 +112,10 @@ pub enum MeshProfile {
         expected_revision: u64,
         subdivisions: [usize; 2],
     },
+    /// Axis-aligned tensor-product cells with optional periodic axes (decision D2). It is a
+    /// cell-centred finite-volume profile: [`crate::FvTopology::from_profile`] realizes it, and
+    /// [`realize`] refuses it because a rectangle is not a simplex [`Mesh`] cell.
+    TensorBox(crate::TensorBox),
 }
 
 /// Realizes one [`MeshProfile`] into a [`TaggedMesh`].
@@ -143,6 +147,10 @@ pub fn realize(profile: &MeshProfile) -> Result<TaggedMesh, FinitumError> {
                 CadGeometryRealization::from_family(provider, *expected_revision, *subdivisions)?;
             cad_tagged_mesh(&geometry)
         }
+        MeshProfile::TensorBox(_) => Err(FinitumError::MeshProfileUnsupported(
+            "TensorBox realizes as an FvTopology (FvTopology::from_profile), not a simplex mesh"
+                .into(),
+        )),
     }
 }
 
