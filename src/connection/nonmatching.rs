@@ -20,7 +20,7 @@ const CONSTANT_REPRODUCTION_TOLERANCE: f64 = 1e-9;
 /// both, the worst relative defect of every comparison that held, the floor below which an
 /// intersection counts as empty (and a triangle as degenerate), and how many pairs were kept or
 /// classified as sub-floor slivers. `nested_p1` and `matching` plans carry none.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct PlanarCoverageReport {
     /// Physical area of each side's trace polygon (sum of its admitted triangles).
     pub area: [f64; 2],

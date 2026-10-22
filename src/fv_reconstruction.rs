@@ -399,6 +399,7 @@ impl FvReconstruction {
                         plus_tangent: &[],
                         normal: &[],
                         data: &[],
+                        fields: &[],
                     },
                     phi,
                 )?;

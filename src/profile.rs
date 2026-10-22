@@ -34,7 +34,7 @@ const MESH_PROFILE_ITEM_CAP: usize = 1_000_000;
 ///
 /// `RegionMap` maps Scientia [`scientia::RegionId`]s onto sets of these; the
 /// realized [`RegionTags`] never stores a Scientia region identity directly.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, serde::Deserialize)]
 pub struct RegionTagId(pub String);
 
 impl RegionTagId {

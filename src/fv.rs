@@ -19,6 +19,18 @@
 //! refusal for face kernels and `malleus::ad` `NonsmoothPolicy::Refuse` for limiters (decision
 //! D6): a JVP/VJP through a kink is a typed `FV_NONSMOOTH_DERIVATIVE_REFUSED` evaluation
 //! failure, never a silently differentiated value; the primal operator is unaffected.
+//!
+//! SV2-C2c (W13 lane `finitum-data`): a datum may carry one value per region of a
+//! partitioned topology ([`FvDatumValue::PerRegion`], bound through
+//! [`FvRealization::bind`]). Such a datum binds as a per-cell column at stride 1 for the
+//! cell-local source kernel and, for every face kernel (face flux, characteristic speed,
+//! ghost, prescribed flux), as the value of the face's owner cell `minus`, because Scientia's
+//! `Datum` operand has no side; a two-sided datum operand is a later Scientia phase. Uniform
+//! data bind exactly as before (stride 0) with the same identity. Diffusion may likewise be
+//! regionwise ([`FvRealization::with_region_diffusion`]): the face coefficient is the harmonic
+//! mean `2κ⁻κ⁺/(κ⁻ + κ⁺)` of the two cell coefficients (arithmetic as an explicit option), the
+//! owner's coefficient at a ghost boundary; the uniform form keeps its transmissibilities and
+//! identity bit for bit.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -32,7 +44,7 @@ use scientia::{
     FvKernel, FvKernelRole, FvOperandMeaning, GradientScheme, LimiterFamily, PositivityIntent,
     ReconstructionIntent, ReconstructionVariables,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::execution::{PreparedExecutable, run_batch};
 use crate::fv_reconstruction::{FvLimiter, FvReconstruction};
@@ -43,6 +55,8 @@ use crate::{
 
 pub const FV_REALIZATION_SCHEMA: &str = "finitum-fv-realization/1";
 pub const FV_CONSERVATION_RECEIPT_SCHEMA: &str = "finitum-fv-conservation/1";
+/// Schema of [`FvDatumValue`] (wire form: a number, or a map from region tag to number).
+pub const FV_DATUM_VALUE_SCHEMA: &str = "finitum-fv-datum-value/1";
 
 /// Operand count up to which a face call binds from the stack.
 const FV_INLINE_OPERANDS: usize = 24;
@@ -66,7 +80,10 @@ pub(crate) enum Column {
     State(Side),
     Tangent(Side),
     Normal(usize),
+    /// A uniform datum (stride 0).
     Datum(usize),
+    /// A per-region datum: slot into `Io::fields`, one value per point (stride 1).
+    Field(usize),
     Write,
 }
 
@@ -78,6 +95,8 @@ pub(crate) struct Io<'a> {
     pub(crate) plus_tangent: &'a [f64],
     pub(crate) normal: &'a [Vec<f64>],
     pub(crate) data: &'a [f64],
+    /// Per-region datum columns by slot: one value per point of this call.
+    pub(crate) fields: &'a [Vec<f64>],
 }
 
 /// A prepared kernel with every operand bound by meaning.
@@ -115,11 +134,13 @@ impl BoundKernel {
         })
     }
 
-    /// The primal kernel; `allowed` lists the column kinds its role may read.
+    /// The primal kernel; `allowed` lists the column kinds its role may read and `fields`
+    /// maps the per-region datum indices onto their column slots.
     fn primal(
         kernel: &FvKernel,
         plus_allowed: bool,
         normal_allowed: bool,
+        fields: &BTreeMap<usize, usize>,
     ) -> Result<Self, FinitumError> {
         let columns = kernel
             .operands
@@ -134,7 +155,10 @@ impl BoundKernel {
                 FvOperandMeaning::Normal { axis } if normal_allowed => {
                     Ok(Column::Normal(usize::from(*axis)))
                 }
-                FvOperandMeaning::Datum { datum } => Ok(Column::Datum(*datum)),
+                FvOperandMeaning::Datum { datum } => Ok(match fields.get(datum) {
+                    Some(slot) => Column::Field(*slot),
+                    None => Column::Datum(*datum),
+                }),
                 FvOperandMeaning::Output => Ok(Column::Write),
                 other => Err(fv_error(
                     "FV_KERNEL_SHAPE",
@@ -169,6 +193,7 @@ impl BoundKernel {
                 Column::Tangent(Side::Plus) => (&io.plus_tangent[..points], 1),
                 Column::Normal(axis) => (&io.normal[axis][..points], 1),
                 Column::Datum(datum) => (&io.data[datum..datum + 1], 0),
+                Column::Field(slot) => (&io.fields[slot][..points], 1),
                 Column::Write => {
                     written = operand;
                     continue;
@@ -351,7 +376,7 @@ impl Scratch {
 }
 
 /// How the state derivative of one kernel is realized.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FvDerivativeDisposition {
     Smooth,
@@ -365,18 +390,18 @@ pub enum FvDerivativeDisposition {
 }
 
 /// One bound kernel in an [`FvRealizationReceipt`].
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvKernelReceipt {
     pub role: FvKernelRole,
     /// The topology boundary tag a boundary kernel is bound to.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<RegionTagId>,
     pub kernel_digest: Digest,
     pub derivative: FvDerivativeDisposition,
 }
 
 /// What an [`FvRealization`] bound, for run evidence.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvRealizationReceipt {
     pub schema: String,
     pub digest: Digest,
@@ -387,24 +412,56 @@ pub struct FvRealizationReceipt {
     pub reconstruction: String,
     pub kernels: Vec<FvKernelReceipt>,
     /// The MUSCL reconstruction (absent for constant reconstruction).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muscl: Option<FvReconstructionReceipt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Uniform two-point diffusion (absent without it, and for the regionwise form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion: Option<FvDiffusionReceipt>,
+    /// Regionwise two-point diffusion (absent without it, and for the uniform form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_diffusion: Option<FvRegionDiffusionReceipt>,
+    /// The per-region data bound (empty when every datum is uniform).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_data: Vec<FvRegionDatumReceipt>,
     /// Largest face non-orthogonality in radians (recorded with MUSCL or diffusion).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nonorthogonality: Option<f64>,
 }
 
+/// One per-region datum in an [`FvRealizationReceipt`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FvRegionDatumReceipt {
+    pub name: String,
+    pub values: BTreeMap<RegionTagId, f64>,
+}
+
+/// The value bound to one datum of a [`ConservationLawProgram`]
+/// (`finitum-fv-datum-value/1`). `Uniform` is the W12 form (a number on the wire, stride 0 in
+/// every kernel, identity unchanged); `PerRegion` gives one finite value per region tag of a
+/// partitioned [`FvTopology`] (a map on the wire) and binds per cell: stride 1 for the source
+/// kernel, the owner cell's value for face kernels (the `Datum` operand has no side).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FvDatumValue {
+    Uniform(f64),
+    PerRegion(BTreeMap<RegionTagId, f64>),
+}
+
+impl From<f64> for FvDatumValue {
+    fn from(value: f64) -> Self {
+        Self::Uniform(value)
+    }
+}
+
 /// The realized MUSCL reconstruction in an [`FvRealizationReceipt`].
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvReconstructionReceipt {
     /// Always `conserved`: a primitive map is refused until systems exist.
     pub variables: ReconstructionVariables,
     pub gradient: GradientScheme,
     pub limiter: LimiterFamily,
     /// The Scientia Sweby kernel identity (`None` for unlimited and multidimensional limiters).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limiter_kernel_digest: Option<Digest>,
     /// Cells with a rank-deficient least-squares stencil (zero slope).
     pub degenerate_gradient_cells: usize,
@@ -415,27 +472,82 @@ pub struct FvReconstructionReceipt {
 /// A uniform isotropic diffusion `−∇·(κ∇u)` realized by two-point flux approximation: the
 /// face flux gains `−κ(u⁺ − u⁻)/(δ·n)` with cell values (`u⁺` the ghost state and `δ` the
 /// half-cell distance at a ghost boundary; a prescribed boundary flux is the total flux).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvDiffusion {
     pub coefficient: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvDiffusionReceipt {
     pub scheme: String,
     pub coefficient: f64,
     pub max_nonorthogonality: f64,
 }
 
+/// How the diffusion coefficients of the two cells of a face combine into the face value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FvFaceAveraging {
+    /// `2κ⁻κ⁺/(κ⁻ + κ⁺)` (`0` when both vanish): the series conductance of two equal
+    /// half-cells, exact for piecewise-constant `κ` on a uniform 1-D mesh with the jump on a
+    /// face.
+    Harmonic,
+    /// `(κ⁻ + κ⁺)/2`: not exact across a jump; offered for comparison only.
+    Arithmetic,
+}
+
+impl FvFaceAveraging {
+    pub fn average(self, minus: f64, plus: f64) -> f64 {
+        match self {
+            Self::Harmonic => {
+                let sum = minus + plus;
+                if sum > 0.0 {
+                    2.0 * minus * plus / sum
+                } else {
+                    0.0
+                }
+            }
+            Self::Arithmetic => 0.5 * (minus + plus),
+        }
+    }
+}
+
+/// Isotropic diffusion `−∇·(κ∇u)` with one coefficient per region of a partitioned
+/// [`FvTopology`], realized by two-point flux approximation with the face coefficient from
+/// `averaging` (the owner cell's coefficient at a ghost boundary). Every region tag of the
+/// topology needs one finite non-negative coefficient (`FV_DIFFUSION_REGION_MISSING`,
+/// `FV_DIFFUSION_REGION_UNKNOWN`, `FV_DIFFUSION_INVALID`); an unpartitioned topology is
+/// refused (`FV_DIFFUSION_UNPARTITIONED`). This form never takes the uniform path, so equal
+/// coefficients in every region are not promised bit-identical to [`FvDiffusion`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FvRegionDiffusion {
+    pub coefficients: BTreeMap<RegionTagId, f64>,
+    pub averaging: FvFaceAveraging,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FvRegionDiffusionReceipt {
+    pub scheme: String,
+    pub averaging: FvFaceAveraging,
+    pub coefficients: BTreeMap<RegionTagId, f64>,
+    pub max_nonorthogonality: f64,
+}
+
+#[derive(Debug)]
+enum DiffusionKind {
+    Uniform(f64),
+    PerRegion(FvRegionDiffusion),
+}
+
 #[derive(Debug)]
 struct Diffusion {
-    coefficient: f64,
-    /// `κ/(δ·n)` per face, per block in topology order (empty for prescribed-flux blocks).
+    kind: DiffusionKind,
+    /// `κ_f/(δ·n)` per face, per block in topology order (empty for prescribed-flux blocks).
     transmissibility: Vec<Vec<f64>>,
 }
 
 /// Numerical flux `F*` per face (per unit area) in [`FvTopology`] block order.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvFaceFluxes {
     pub interior: Vec<f64>,
     pub periodic: Vec<f64>,
@@ -448,7 +560,7 @@ pub struct FvFaceFluxes {
 /// stored value `|f|F*`. Both sums are face/cell-ordered Neumaier sums; `balanced` holds when
 /// `|imbalance| ≤ (faces_per_cell + 2)·ε·scale`, `scale = Σ_cells Σ_f |f||F*|`. This is a
 /// round-off bound, not a bitwise claim.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvConservationReceipt {
     pub schema: String,
     pub cells: usize,
@@ -465,7 +577,7 @@ pub struct FvConservationReceipt {
 
 /// The forward-Euler step bound `min_i |Ω_i| / Σ_f |f| λ_f` with `λ_f` the larger
 /// `characteristic_speed` of the two face states.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FvCfl {
     /// `+∞` when every face speed is zero.
     pub stable_step: f64,
@@ -488,6 +600,13 @@ pub struct FvRealization {
     diffusion: Option<Diffusion>,
     data: Vec<f64>,
     time_data: Vec<usize>,
+    /// Per-region datum columns by slot: one value per cell.
+    field_cells: Vec<Vec<f64>>,
+    /// Per-region datum columns by block (topology order) then slot: the owner cell's value
+    /// per face.
+    field_faces: Vec<Vec<Vec<f64>>>,
+    /// The per-region data as bound, by datum index, for the receipt.
+    region_data: Vec<(usize, BTreeMap<RegionTagId, f64>)>,
     invariants: Vec<Vec<f64>>,
     scratch: Mutex<Scratch>,
     digest: Digest,
@@ -497,13 +616,31 @@ impl FvRealization {
     /// Bind `program` (lowered from `system`) to `topology`. `regions` maps each declared
     /// boundary region onto topology boundary tags; every tag must be claimed by exactly one
     /// declared boundary and every declared boundary must name existing tags. `data` gives a
-    /// uniform value for every datum but model time, keyed by [`scientia::FvDatum::name`].
+    /// uniform value for every datum but model time, keyed by [`scientia::FvDatum::name`]
+    /// (the W12 entry point; [`Self::bind`] also takes per-region values).
     pub fn new(
         system: &ConservationLawSystem,
         program: Arc<ConservationLawProgram>,
         topology: Arc<FvTopology>,
         regions: &RegionMap,
         data: &BTreeMap<String, f64>,
+    ) -> Result<Self, FinitumError> {
+        let data = data
+            .iter()
+            .map(|(name, value)| (name.clone(), FvDatumValue::Uniform(*value)))
+            .collect();
+        Self::bind(system, program, topology, regions, &data)
+    }
+
+    /// [`Self::new`] with an [`FvDatumValue`] per datum: a `PerRegion` value needs a
+    /// partitioned topology (`FV_DATUM_REGION_UNPARTITIONED`), one finite value for every
+    /// region tag (`FV_DATUM_REGION_MISSING`) and no other tag (`FV_DATUM_REGION_UNKNOWN`).
+    pub fn bind(
+        system: &ConservationLawSystem,
+        program: Arc<ConservationLawProgram>,
+        topology: Arc<FvTopology>,
+        regions: &RegionMap,
+        data: &BTreeMap<String, FvDatumValue>,
     ) -> Result<Self, FinitumError> {
         program
             .validate_identity()
@@ -593,23 +730,56 @@ impl FvRealization {
         )?;
 
         let mut values = Vec::with_capacity(program.data.len());
+        let mut bound = Vec::with_capacity(program.data.len());
         let mut time_data = Vec::new();
+        let mut field_slots = BTreeMap::<usize, usize>::new();
+        let mut field_cells = Vec::<Vec<f64>>::new();
+        let mut region_data = Vec::new();
         for (index, datum) in program.data.iter().enumerate() {
             if datum.source == FvDatumSource::Time {
                 time_data.push(index);
                 values.push(0.0);
+                bound.push(FvDatumValue::Uniform(0.0));
                 continue;
             }
             match data.get(&datum.name) {
-                Some(value) if value.is_finite() => values.push(*value),
+                Some(FvDatumValue::Uniform(value)) if value.is_finite() => {
+                    values.push(*value);
+                    bound.push(FvDatumValue::Uniform(*value));
+                }
+                Some(FvDatumValue::PerRegion(per_region)) => {
+                    field_cells.push(region_cell_values(
+                        &topology,
+                        "FV_DATUM",
+                        &format!("datum `{}`", datum.name),
+                        per_region,
+                        |value| value.is_finite(),
+                    )?);
+                    field_slots.insert(index, field_cells.len() - 1);
+                    region_data.push((index, per_region.clone()));
+                    values.push(0.0);
+                    bound.push(FvDatumValue::PerRegion(per_region.clone()));
+                }
                 _ => {
                     return Err(fv_error(
                         "FV_DATUM_MISSING",
-                        format!("datum `{}` needs a finite uniform value", datum.name),
+                        format!(
+                            "datum `{}` needs a finite uniform or per-region value",
+                            datum.name
+                        ),
                     ));
                 }
             }
         }
+        let field_faces = topology
+            .blocks()
+            .map(|block| {
+                field_cells
+                    .iter()
+                    .map(|cells| block.minus.iter().map(|cell| cells[*cell]).collect())
+                    .collect()
+            })
+            .collect::<Vec<Vec<Vec<f64>>>>();
         let known = program
             .data
             .iter()
@@ -623,9 +793,10 @@ impl FvRealization {
             ));
         }
 
-        let face = BoundKernel::primal(&program.face_flux, true, true)?;
+        let face = BoundKernel::primal(&program.face_flux, true, true, &field_slots)?;
         let face_tangent = Tangent::of(&program.face_flux, &face)?;
-        let speed = BoundKernel::primal(&program.characteristic_speed, false, true)?;
+        let speed =
+            BoundKernel::primal(&program.characteristic_speed, false, true, &field_slots)?;
 
         let mut claimed = BTreeMap::<&RegionTagId, usize>::new();
         for (index, semantics) in system.boundaries.iter().enumerate() {
@@ -682,7 +853,7 @@ impl FvRealization {
                     BoundaryAction::Prescribed
                 }
             };
-            let bound = BoundKernel::primal(kernel, false, true)?;
+            let bound = BoundKernel::primal(kernel, false, true, &field_slots)?;
             let tangent = Tangent::of(kernel, &bound)?;
             boundaries.push(BoundaryBinding {
                 tag: tag.clone(),
@@ -695,7 +866,7 @@ impl FvRealization {
         let source = match &program.source {
             Some(kernel) => {
                 role(kernel, FvKernelRole::Source)?;
-                let bound = BoundKernel::primal(kernel, false, false)?;
+                let bound = BoundKernel::primal(kernel, false, false, &field_slots)?;
                 let tangent = Tangent::of(kernel, &bound)?;
                 Some((bound, tangent))
             }
@@ -717,8 +888,8 @@ impl FvRealization {
                 program
                     .data
                     .iter()
-                    .zip(&values)
-                    .map(|(datum, value)| (&datum.name, *value))
+                    .zip(&bound)
+                    .map(|(datum, value)| (&datum.name, value))
                     .collect::<Vec<_>>(),
                 boundaries
                     .iter()
@@ -740,6 +911,9 @@ impl FvRealization {
             diffusion: None,
             data: values,
             time_data,
+            field_cells,
+            field_faces,
+            region_data,
             scratch: Mutex::new(scratch),
             digest,
         })
@@ -750,14 +924,44 @@ impl FvRealization {
     /// with a face non-orthogonality above [`FV_TPFA_NONORTHOGONALITY_TOLERANCE`]
     /// (`FV_TPFA_NONORTHOGONAL`: TPFA is inconsistent there, research Risk 1). The identity
     /// gains the scheme and coefficient.
-    pub fn with_diffusion(mut self, diffusion: FvDiffusion) -> Result<Self, FinitumError> {
+    pub fn with_diffusion(self, diffusion: FvDiffusion) -> Result<Self, FinitumError> {
         let coefficient = diffusion.coefficient;
-        if !(coefficient.is_finite() && coefficient >= 0.0) || self.diffusion.is_some() {
+        if !(coefficient.is_finite() && coefficient >= 0.0) {
             return Err(fv_error(
                 "FV_DIFFUSION_INVALID",
-                format!(
-                    "diffusion coefficient {coefficient} must be finite, non-negative and single"
-                ),
+                format!("diffusion coefficient {coefficient} must be finite and non-negative"),
+            ));
+        }
+        self.add_diffusion(DiffusionKind::Uniform(coefficient), Vec::new())
+    }
+
+    /// Add the regionwise two-point diffusive flux of `diffusion` (see [`FvRegionDiffusion`]):
+    /// the face transmissibility is `κ_f/(δ·n)` with `κ_f` the averaged coefficient of the two
+    /// cells, or the owner's at a ghost boundary. Refusals as [`Self::with_diffusion`] plus the
+    /// region checks; the identity gains the scheme, averaging and coefficients.
+    pub fn with_region_diffusion(
+        self,
+        diffusion: FvRegionDiffusion,
+    ) -> Result<Self, FinitumError> {
+        let cells = region_cell_values(
+            &self.topology,
+            "FV_DIFFUSION",
+            "diffusion coefficient",
+            &diffusion.coefficients,
+            |value| value.is_finite() && value >= 0.0,
+        )?;
+        self.add_diffusion(DiffusionKind::PerRegion(diffusion), cells)
+    }
+
+    fn add_diffusion(
+        mut self,
+        kind: DiffusionKind,
+        cell_coefficients: Vec<f64>,
+    ) -> Result<Self, FinitumError> {
+        if self.diffusion.is_some() {
+            return Err(fv_error(
+                "FV_DIFFUSION_INVALID",
+                "a realization carries at most one diffusion term",
             ));
         }
         let worst = self.topology.max_nonorthogonality();
@@ -792,22 +996,45 @@ impl FvRealization {
                                 block.delta[face * dimension + axis] * block.normal[axis][face]
                             })
                             .sum::<f64>();
+                        let coefficient = match &kind {
+                            DiffusionKind::Uniform(coefficient) => *coefficient,
+                            DiffusionKind::PerRegion(spec) => {
+                                let minus = cell_coefficients[block.minus[face]];
+                                match block.plus.get(face) {
+                                    Some(plus) => {
+                                        spec.averaging.average(minus, cell_coefficients[*plus])
+                                    }
+                                    None => minus,
+                                }
+                            }
+                        };
                         coefficient / projected
                     })
                     .collect()
             })
             .collect();
-        self.digest = Digest::blake3(
-            &serde_json::to_vec(&(
-                FV_REALIZATION_SCHEMA,
-                &self.digest,
-                "two_point",
-                coefficient,
-            ))
-            .expect("FV diffusion identity is serializable"),
-        );
+        self.digest = match &kind {
+            DiffusionKind::Uniform(coefficient) => Digest::blake3(
+                &serde_json::to_vec(&(
+                    FV_REALIZATION_SCHEMA,
+                    &self.digest,
+                    "two_point",
+                    *coefficient,
+                ))
+                .expect("FV diffusion identity is serializable"),
+            ),
+            DiffusionKind::PerRegion(spec) => Digest::blake3(
+                &serde_json::to_vec(&(
+                    FV_REALIZATION_SCHEMA,
+                    &self.digest,
+                    "two_point_regionwise",
+                    spec,
+                ))
+                .expect("FV regionwise diffusion identity is serializable"),
+            ),
+        };
         self.diffusion = Some(Diffusion {
-            coefficient,
+            kind,
             transmissibility,
         });
         Ok(self)
@@ -899,13 +1126,50 @@ impl FvRealization {
             reconstruction: if muscl.is_some() { "muscl" } else { "constant" }.into(),
             kernels,
             muscl,
-            diffusion: self.diffusion.as_ref().map(|diffusion| FvDiffusionReceipt {
-                scheme: "two_point".into(),
-                coefficient: diffusion.coefficient,
-                max_nonorthogonality: self.topology.max_nonorthogonality(),
-            }),
+            diffusion: match self.diffusion.as_ref().map(|diffusion| &diffusion.kind) {
+                Some(DiffusionKind::Uniform(coefficient)) => Some(FvDiffusionReceipt {
+                    scheme: "two_point".into(),
+                    coefficient: *coefficient,
+                    max_nonorthogonality: self.topology.max_nonorthogonality(),
+                }),
+                _ => None,
+            },
+            region_diffusion: match self.diffusion.as_ref().map(|diffusion| &diffusion.kind) {
+                Some(DiffusionKind::PerRegion(spec)) => Some(FvRegionDiffusionReceipt {
+                    scheme: "two_point".into(),
+                    averaging: spec.averaging,
+                    coefficients: spec.coefficients.clone(),
+                    max_nonorthogonality: self.topology.max_nonorthogonality(),
+                }),
+                _ => None,
+            },
+            region_data: self
+                .region_data
+                .iter()
+                .map(|(index, values)| FvRegionDatumReceipt {
+                    name: self.program.data[*index].name.clone(),
+                    values: values.clone(),
+                })
+                .collect(),
             max_nonorthogonality,
         }
+    }
+
+    /// The datum values as bound, by datum name (per-region values as given).
+    pub fn data(&self) -> BTreeMap<String, FvDatumValue> {
+        self.program
+            .data
+            .iter()
+            .enumerate()
+            .filter(|(_, datum)| datum.source != FvDatumSource::Time)
+            .map(|(index, datum)| {
+                let value = match self.region_data.iter().find(|(at, _)| *at == index) {
+                    Some((_, values)) => FvDatumValue::PerRegion(values.clone()),
+                    None => FvDatumValue::Uniform(self.data[index]),
+                };
+                (datum.name.clone(), value)
+            })
+            .collect()
     }
 
     /// The MUSCL reconstruction, when the intent asks for one.
@@ -1048,6 +1312,7 @@ impl FvRealization {
                     plus_tangent: &[],
                     normal: &block.normal,
                     data,
+                    fields: &self.field_faces[index],
                 },
                 flux,
             ),
@@ -1062,6 +1327,7 @@ impl FvRealization {
                             plus_tangent: &[],
                             normal: &block.normal,
                             data,
+                            fields: &self.field_faces[index],
                         },
                         plus,
                     )?;
@@ -1075,6 +1341,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &block.normal,
                         data,
+                        fields: &self.field_faces[index],
                     },
                     flux,
                 )?;
@@ -1111,6 +1378,7 @@ impl FvRealization {
                 plus_tangent: &[],
                 normal: &[],
                 data: &scratch.data,
+                fields: &self.field_cells,
             },
             &mut scratch.cell,
         )?;
@@ -1187,6 +1455,7 @@ impl FvRealization {
                     plus_tangent: &[],
                     normal: &block.normal,
                     data,
+                    fields: &self.field_faces[index],
                 };
                 let tangent = binding
                     .tangent
@@ -1219,6 +1488,7 @@ impl FvRealization {
                         plus_tangent,
                         normal: &block.normal,
                         data,
+                        fields: &self.field_faces[index],
                     },
                     flux_tangent,
                 )?,
@@ -1255,6 +1525,7 @@ impl FvRealization {
                     plus_tangent: &[],
                     normal: &[],
                     data: &scratch.data,
+                    fields: &self.field_cells,
                 },
                 &mut scratch.cell,
             )?;
@@ -1325,6 +1596,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &block.normal,
                         data,
+                        fields: &self.field_faces[index],
                     };
                     let tangent = binding
                         .tangent
@@ -1358,6 +1630,7 @@ impl FvRealization {
                                     plus_tangent,
                                     normal: &block.normal,
                                     data,
+                                    fields: &self.field_faces[index],
                                 },
                                 out,
                             ),
@@ -1434,6 +1707,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &[],
                         data: &scratch.data,
+                        fields: &self.field_cells,
                     },
                     &mut scratch.cell,
                 )?;
@@ -1556,6 +1830,7 @@ impl FvRealization {
                         plus_tangent: &[],
                         normal: &block.normal,
                         data,
+                        fields: &self.field_faces[index],
                     },
                     output,
                 )
@@ -1575,6 +1850,7 @@ impl FvRealization {
                                 plus_tangent: &[],
                                 normal: &block.normal,
                                 data,
+                                fields: &self.field_faces[index],
                             },
                             plus,
                         )?;
@@ -1688,6 +1964,48 @@ impl FvRealization {
         }
         Ok(())
     }
+}
+
+/// One value per cell from one value per region tag of `topology`: every tag of the topology
+/// needs an admissible value (`<prefix>_REGION_MISSING`), no other tag may appear
+/// (`<prefix>_REGION_UNKNOWN`), and the topology must be partitioned
+/// (`<prefix>_REGION_UNPARTITIONED`).
+fn region_cell_values(
+    topology: &FvTopology,
+    prefix: &str,
+    what: &str,
+    values: &BTreeMap<RegionTagId, f64>,
+    admissible: impl Fn(f64) -> bool,
+) -> Result<Vec<f64>, FinitumError> {
+    if !topology.has_regions() {
+        return Err(fv_error(
+            &format!("{prefix}_REGION_UNPARTITIONED"),
+            format!("{what} is given per region but the topology has no region partition"),
+        ));
+    }
+    let tags = topology.region_tags();
+    if let Some(tag) = values.keys().find(|tag| !tags.contains(tag)) {
+        return Err(fv_error(
+            &format!("{prefix}_REGION_UNKNOWN"),
+            format!("{what} names region `{tag}`, which has no cells"),
+        ));
+    }
+    for tag in &tags {
+        match values.get(*tag) {
+            Some(value) if admissible(*value) => {}
+            _ => {
+                return Err(fv_error(
+                    &format!("{prefix}_REGION_MISSING"),
+                    format!("{what} needs an admissible value for region `{tag}`"),
+                ));
+            }
+        }
+    }
+    Ok(topology
+        .cell_regions()
+        .iter()
+        .map(|tag| values[tag])
+        .collect())
 }
 
 /// Face states of block `index`: cell values, or the reconstruction from `slopes`.

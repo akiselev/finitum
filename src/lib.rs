@@ -43,17 +43,20 @@ pub use element::{PreparedElement, QuadraturePoint, simplex_basis};
 pub use embedded::{EmbeddedQuadraturePolicy, EmbeddedSegmentQuadrature};
 pub use error::{FinitumError, InputEvaluationError, InputLocation, InputOrigin};
 pub use fv::{
-    FV_CONSERVATION_RECEIPT_SCHEMA, FV_REALIZATION_SCHEMA, FV_TPFA_NONORTHOGONALITY_TOLERANCE,
-    FvCfl, FvConservationReceipt, FvDerivativeDisposition, FvDiffusion, FvDiffusionReceipt,
-    FvFaceFluxes, FvKernelReceipt, FvRealization, FvRealizationReceipt, FvReconstructionReceipt,
-    discrete_flux_balance, scatter_face_fluxes,
+    FV_CONSERVATION_RECEIPT_SCHEMA, FV_DATUM_VALUE_SCHEMA, FV_REALIZATION_SCHEMA,
+    FV_TPFA_NONORTHOGONALITY_TOLERANCE, FvCfl, FvConservationReceipt, FvDatumValue,
+    FvDerivativeDisposition, FvDiffusion, FvDiffusionReceipt, FvFaceAveraging, FvFaceFluxes,
+    FvKernelReceipt, FvRealization, FvRealizationReceipt, FvReconstructionReceipt,
+    FvRegionDatumReceipt, FvRegionDiffusion, FvRegionDiffusionReceipt, discrete_flux_balance,
+    scatter_face_fluxes,
 };
 pub use fv_reconstruction::{
     FV_NONSMOOTH_DERIVATIVE_REFUSED, FvBlockStates, FvLimiter, FvReconstruction,
 };
 pub use fv_topology::{
-    AxisSpacing, FV_TOPOLOGY_SCHEMA, FvCellShape, FvFaceBlock, FvTopology, FvTopologyInvariants,
-    TensorAxis, TensorBox,
+    AxisSpacing, FV_REGION_PARTITION_SCHEMA, FV_TOPOLOGY_SCHEMA, FvCellShape, FvFaceBlock,
+    FvInterface, FvTopology, FvTopologyInvariants, TensorAxis, TensorBox, TensorInterface,
+    TensorRegion, TensorRegionPartition,
 };
 pub use infsup::{
     INF_SUP_DIMENSION_CAP, INF_SUP_REPORT_SCHEMA, InfSupConfig, InfSupEstimate, InfSupInstability,
