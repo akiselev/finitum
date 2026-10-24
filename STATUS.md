@@ -1,6 +1,6 @@
 # Finitum status
 
-Updated: 2026-10-19
+Updated: 2026-10-24
 
 ## Role and frontier
 
@@ -11,11 +11,78 @@ numerical algorithms. Finitum implements Methodus operator contracts directly;
 it has no dependency on Solverang's constraint engine.
 
 SHOW-3 / bounded SC-W3 additions are accepted. The complete owner gate passes
-(281 tests across 42 targets after the W12 L6 landing below; 272 across 41 after L4; 262 across 39 after W10
+(286 tests across 43 targets after the V8 CAD-body landing below; 281 across 42 after the W12 L6 landing; 272 across 41 after L4; 262 across 39 after W10
 package 3; 254
 across 38 at the W9 head `a75baeb`); final Sinbad consumer coverage passed (210
 tests across 35 targets with a documented external-fixture target retry) at the
 2026-09-29 head, before the 2026-10-08 fixes and this landing.
+
+## R6D V8 (2026-10-24): tetrahedral realization of a committed CADabra body; the consumer gate
+
+Branch `claude/b7-finitum` from `90c4789` (CADabra batch 7, lane finitum). Siblings: cadabra3
+`claude/b7-finitum` (base `3e77160b`, provider unchanged), resolvent `b604f93`, Malleus `7a43e7f`,
+Scientia `84188ac`, Methodus `8bd8333`, Quantitas `0d682ac`; Sinbad `fb11d4a`, Krasis `d981980`,
+Artifactum `2c016f1` for the consumer run. Not yet integrated.
+
+- `CadBodyRealization::extruded(&BrepBodyProvider, &DisplayArtifact, ExtrusionRefinement{spacing,
+  layers})` (`src/cad_body.rs`, `finitum.cad-body-realization/v0`): a committed Provider V1 body
+  that is an extrusion (two planar caps with opposite normals, every other face perpendicular,
+  side samples only on the cap rims) becomes a P1 tetrahedral `Mesh`. The display artifact must
+  be of the provider's revision (`FinitumError::StaleBrepRevision`); a body that is not such an
+  extrusion is refused (`InvalidCadGeometry`), never mis-meshed.
+- Boundary from the published tessellation, interior from Finitum (`src/cad_profile.rs`): the
+  bottom cap's rim samples (numbered in the mesher's emission order); rim edges longer than the
+  spacing split evenly; a hexagonal lattice of interior points at least half a spacing from the
+  rim; Lawson flips to the Delaunay triangulation; triangles in canonical order; `layers` uniform
+  layers; three tetrahedra per prism split by global vertex order. The published cap triangulation
+  only seeds the topology (its fans of near-half-turn triangles do not converge for P1: compliance
+  on it moved 30-100% between refinements and gave `dJ/dx0 = 3042` where symmetry gives 0). No new
+  dependency; `cadabra` (the CADabra facade, path) is a dev-dependency only, to commit Booleans in
+  tests (its lock adds `cadabra`, `cadabra-ops`, `cadabra-ssi`, all path crates).
+- Association: every vertex has `CadBodySupport::{Interior, Face, Edge{edge, faces}, Vertex{vertex,
+  faces}}` (binding indices) and one `CadBoundaryIncidence{vertex, face, point, normal}` per face it
+  lies on; `face_vertices`, `nodal_dof_map`, `digest` (source revision, binding digest, mesh,
+  supports, incidences, motion), `require_source` (`StaleBrepRevision` /
+  `CadGeometrySourceMismatch`).
+- Parameter JVP/VJP: `boundary_velocity` (provider `V_n` per incidence; a snapped decision moving
+  along the seeds is `FinitumError::SnappedCadDesign{exit}`), `mesh_velocity` (the mesh-motion JVP)
+  and `mesh_velocity_transpose`, `design_velocity` (JVP), `design_gradient` (VJP through the
+  provider's `boundary_velocity_transpose`). The motion is the derivative of the generator: a
+  published bottom sample moves by the minimum-norm displacement meeting each of its faces' `V_n`
+  (no tangential gauge), a rim split by interpolation of its end points, a lattice point with its
+  cap only, layer `k` by `k/layers` of the extent rate.
+- `RealizationPlan::residual_geometry_sensitivity_transpose(time, state, adjoint, node_gradient)`
+  (`src/realization.rs`): the exact transpose of `residual_geometry_sensitivity` in the node
+  velocities for stored inputs whose design direction is zero (cell-local columns, one vertex
+  component at a time; constraint rows ignored as the forward zeroes them). The forward's support
+  checks moved to `require_geometry_sensitivity_support` (no behaviour change).
+- Evidence `tests/cad_body_campaign.rs` (5; log `docs/validation/2026-10-24-v8-cad-body/`): box
+  `[-2,2]^3` minus a through bore, two designs (r 0.6 at x0 0; r 1 at x0 0.3), objectives `J_w =
+  sum of the P1 load of -div grad u = 1 + x + 2y` (exact reference from the provider's volume and
+  centroid) and the compliance `J_c` of `-div grad u = 1`, `u = 0` on the bore (CG + Jacobi over
+  `element_assembly`), parameters bore radius, bore position, box width, refinements (chord 1e-2,
+  spacing 0.5, 8 layers: 891/927 vertices) and (1e-3, 0.25, 16: 5610/6086 vertices).
+  - Moved mesh (the Finitum chain): centred differences at 1e-2/1e-3/1e-4 second order and Taylor
+    remainders falling 100x per decade for every parameter, design, level (`J_c` at the coarse
+    level), down to rounding.
+  - Through the CAD (publish, tessellate, realize, assemble): `J_w` centred differences equal the
+    Finitum rate to 1e-10 for radius and width whenever the topology is unchanged; `J_c` to 8e-7
+    (radius, rate ~100-200) and 4e-8 (width) absolute at 1e-4, falling 100x per decade. The bore position differs by the tangential gauge
+    (published rim samples ride the tool's chart): `J_w` 0.089/0.153 -> 0.0098/0.016, `J_c`
+    0.18/0.63 -> 0.023/0.16 under refinement.
+  - Refinement: `J_w` error 0.091/0.202 -> 0.0098/0.021; rate errors radius 0.30/0.40 ->
+    0.033/0.043, position 0.18/0.31 -> 0.020/0.033 (first order in the sagitta); width exact.
+  - VJP = JVP per parameter to 1e-9; `<dJ/dX, X'(d)> = <dJ/dp, d>` to 1e-10; mesh-motion and
+    residual-sensitivity transpose identities to 1e-12/1e-11; assembled columns vs combined
+    direction to 1e-13; matrix-free vs element assembly to 1e-12.
+  - Refusals: flush cap (snapped, height seed) `SnappedCadDesign{exit: Some}` for JVP and VJP, radius
+    defined; stale revision `StaleBrepRevision` (provider of another revision; display of another
+    revision); the kernel's `WrongRevision`; blind bore refused as a non-extrusion.
+- Open: non-extruded bodies (blind bores, bosses, curved caps) need a general tetrahedral mesher
+  from the published surface; the bore position's tangential gauge needs a provider point velocity
+  in the face chart's gauge (requested); topology changes of the regenerated mesh at large steps
+  (lattice threshold, rim sample counts) are skipped, not differentiated; debug-mode CG on ~6k
+  vertices is ~8 s per solve, so `J_c` runs its full campaign at the coarse level only.
 
 ## W12 L4 SV2-C2a (2026-10-19): FV topology and first-order realization
 
@@ -261,7 +328,9 @@ Condensed 2026-10-19 (full text in git history at `16dbdf3`).
   claim of complete production execution for every method family.
 - Source-aware realization, conservation, transfer and constraint-work verification
   reports. Callers must use the validating APIs, not merely rehash acceptance flags.
-- CADabra provider identity/maps are consumed directly for bounded geometry paths.
+- CADabra provider identity/maps are consumed directly for bounded geometry paths; a
+  committed extruded B-rep body (Provider V1) is realized as a tetrahedral mesh with node
+  association and parameter JVP/VJP (V8).
 
 ## Limits and next work
 

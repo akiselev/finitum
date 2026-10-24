@@ -1,0 +1,75 @@
+
+running 5 tests
+test the_extruded_realization_associates_every_boundary_node_with_its_b_rep_entity ... ok
+test snapped_decisions_and_stale_revisions_are_refused ... ok
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_w rate -14.775270192 (exact -15.079644737) CAD centred -14.775270192 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_w rate -32.267693830 (exact -32.672563597) CAD centred -32.267693830 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_w rate -14.775270192 (exact -15.079644737) CAD centred -14.775270192 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_w rate -32.267693830 (exact -32.672563597) CAD centred -32.267693830 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_w rate -14.775270192 (exact -15.079644737) CAD centred -14.775270191 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_w rate -32.267693830 (exact -32.672563597) CAD centred -32.267693830 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_c CAD difference skipped: the tessellation topology changed
+test the_parameter_vjp_is_the_transpose_of_the_jvp ... ok
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_c rate -204.503612295 CAD centred -204.511341474
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_c rate -100.659113680 CAD centred -100.659139586
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_c rate -100.659113680 CAD centred -100.659113939
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_c rate -204.503612295 CAD centred -204.503689583
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_w rate -12.257244599 (exact -12.566370614) CAD centred -12.410651473 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_w rate -12.257244599 (exact -12.566370614) CAD centred -12.410651473 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_w rate -12.257244599 (exact -12.566370614) CAD centred -12.410651473 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_c rate -204.503612295 CAD centred -204.503613068
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_w rate -4.343475275 (exact -4.523893421) CAD centred -4.432581058 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_w rate -4.343475275 (exact -4.523893421) CAD centred -4.432581058 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_w rate -4.343475275 (exact -4.523893421) CAD centred -4.432581057 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_c CAD difference skipped: the tessellation topology changed
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_c rate 25.712180208 CAD centred 26.338044096
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_c rate 25.712180208 CAD centred 26.338048907
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_c rate 0.146102955 CAD centred 0.324140457
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_c rate 0.146102955 CAD centred 0.324901916
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_c rate 0.146102955 CAD centred 0.324909531
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_c CAD difference skipped: the tessellation topology changed
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_c rate 19.989511799 CAD centred 19.989515448
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_c rate 19.989511799 CAD centred 19.989511836
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Level { chord: 0.01, spacing: 0.5, layers: 8 }: 891 vertices, 3432 tetrahedra; J_w 47.86615308481 (exact 47.66371820133315), J_c 44.82369963467117
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-2: J_c rate 66.627496838 CAD centred 66.627858381
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-3: J_c rate 66.627496838 CAD centred 66.627500453
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.01, spacing: 0.5, layers: 8 } step 1e-4: J_c rate 66.627496838 CAD centred 66.627496874
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Level { chord: 0.01, spacing: 0.5, layers: 8 }: 927 vertices, 3744 tetrahedra; J_w 59.56741894249937 (exact 59.47610657883075), J_c 100.94897878546983
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-2: J_w rate -32.629934617 (exact -32.672563597) CAD centred -32.659979007 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-3: J_w rate -32.629934617 (exact -32.672563597) CAD centred -32.629934617 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Radius Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_w rate -32.629934617 (exact -32.672563597) CAD centred -32.629934617 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-2: J_w rate -12.533604758 (exact -12.566370614) CAD centred -12.549974853 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-2: J_w rate -15.046866106 (exact -15.079644737) CAD centred -15.064625514 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-3: J_w rate -12.533604758 (exact -12.566370614) CAD centred -12.549974853 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-3: J_w rate -15.046866106 (exact -15.079644737) CAD centred -15.046866106 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_w rate -12.533604758 (exact -12.566370614) CAD centred -12.549974853 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Radius Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_w rate -15.046866106 (exact -15.079644737) CAD centred -15.046866106 same topology false
+test the_r4_campaign_at_the_centred_bore has been running for over 60 seconds
+test the_r4_campaign_at_the_offset_bore has been running for over 60 seconds
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-2: J_w rate -4.504251886 (exact -4.523893421) CAD centred -4.514059832 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-3: J_w rate -4.504251886 (exact -4.523893421) CAD centred -4.514059832 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_w rate -4.504251886 (exact -4.523893421) CAD centred -4.514059831 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_c CAD difference skipped: the tessellation topology changed
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_c rate 26.245595911 CAD centred 26.407181738
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-2: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology false
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-3: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } ExtentX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_w rate 48.000000000 (exact 48.000000000) CAD centred 47.999999999 same topology true
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 } Level { chord: 0.001, spacing: 0.25, layers: 16 }: 5610 vertices, 25200 tetrahedra; J_w 47.6850326913307 (exact 47.66371820133315), J_c 46.013447754466576
+Design { width: 4.0, r: 1.0, x0: 0.3, h: 6.0 }: primal [0.20243488347685457, 0.021314489997550368] rate errors [[0.4048697669537731, 0.3091260152721258, 5.684341886080802e-14], [0.042628979995178895, 0.03276585638792184, 1.1368683772161603e-13]] gauge J_w [0.15340687388897045, 0.01637009457577676] J_c [0.6258686988248243, 0.16158582694905377]
+test the_r4_campaign_at_the_offset_bore ... ok
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } OriginX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-5: J_c rate 0.197212500 CAD centred 0.219960666
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-2: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology false
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-3: J_w rate 48.000000000 (exact 48.000000000) CAD centred 48.000000000 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } ExtentX Level { chord: 0.001, spacing: 0.25, layers: 16 } step 1e-4: J_w rate 48.000000000 (exact 48.000000000) CAD centred 47.999999998 same topology true
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 } Level { chord: 0.001, spacing: 0.25, layers: 16 }: 6086 vertices, 28656 tetrahedra; J_w 59.48594016833456 (exact 59.47610657883075), J_c 104.93179277821012
+Design { width: 4.0, r: 0.6, x0: 0.0, h: 6.0 }: primal [0.09131236366862083, 0.009833589503806195] rate errors [[0.3043745455620872, 0.18041814591260508, 3.552713678800501e-14], [0.03277863167962458, 0.019641535048989134, 1.2079226507921703e-13]] gauge J_w [0.08910578168229488, 0.009807945017407782] J_c [0.1788065761705931, 0.02274816596274984]
+test the_r4_campaign_at_the_centred_bore ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 103.67s
+

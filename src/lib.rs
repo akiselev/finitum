@@ -2,7 +2,9 @@
 
 mod adaptivity;
 mod block;
+mod cad_body;
 mod cad_geometry;
+mod cad_profile;
 mod condensation;
 mod connection;
 mod constraint;
@@ -32,6 +34,10 @@ mod verification;
 
 pub use adaptivity::{HangingNodeConstraint, VariableOrderSegmentElements};
 pub use block::{BlockLayout, FieldBlock};
+pub use cad_body::{
+    CadBodyNode, CadBodyRealization, CadBodySource, CadBodySupport, CadBoundaryIncidence,
+    ExtrusionRefinement,
+};
 pub use cad_geometry::{
     CadBoundaryAssociation, CadBoundaryCondition, CadCellAssociation, CadGeometryRealization,
     CadGeometrySource, CadNodeAssociation, CadParameterCoordinate, CadPrimalPlan,

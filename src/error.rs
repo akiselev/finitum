@@ -76,6 +76,15 @@ pub enum FinitumError {
     StaleGeometryRevision { expected: u64, actual: u64 },
     #[error("CAD provider source identity does not match the realized geometry")]
     CadGeometrySourceMismatch,
+    #[error(
+        "stale B-rep revision: the realization and the provider bind different committed revisions"
+    )]
+    StaleBrepRevision,
+    #[error(
+        "a snapped CAD decision moves along the design direction; no smooth derivative \
+         (band exit at {exit:?})"
+    )]
+    SnappedCadDesign { exit: Option<f64> },
     #[error("CAD boundary association is missing for {0}")]
     MissingCadBoundary(String),
     #[error("CAD boundary association is ambiguous for {0}")]

@@ -31,12 +31,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadabra"
+version = "0.1.0"
+dependencies = [
+ "cadabra-brep",
+ "cadabra-geometry",
+ "cadabra-math",
+ "cadabra-number",
+ "cadabra-numeric",
+ "cadabra-ops",
+ "cadabra-predicates",
+ "cadabra-provider",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "cadabra-arrangements"
 version = "0.1.0"
 dependencies = [
  "cadabra-math",
  "resolvent",
- "sha2",
  "slotmap",
  "smallvec",
  "thiserror",
@@ -49,7 +64,9 @@ dependencies = [
  "cadabra-arrangements",
  "cadabra-geometry",
  "cadabra-math",
+ "cadabra-numeric",
  "cadabra-predicates",
+ "resolvent",
  "serde",
  "serde_json",
  "sha2",
@@ -76,6 +93,7 @@ dependencies = [
  "cadabra-number",
  "resolvent",
  "serde",
+ "sha2",
  "thiserror",
 ]
 
@@ -96,6 +114,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadabra-ops"
+version = "0.1.0"
+dependencies = [
+ "cadabra-brep",
+ "cadabra-geometry",
+ "cadabra-math",
+ "cadabra-numeric",
+ "cadabra-predicates",
+ "cadabra-ssi",
+]
+
+[[package]]
 name = "cadabra-predicates"
 version = "0.1.0"
 dependencies = [
@@ -103,7 +133,6 @@ dependencies = [
  "cadabra-math",
  "cadabra-numeric",
  "resolvent",
- "sha2",
  "smallvec",
  "thiserror",
 ]
@@ -116,9 +145,21 @@ dependencies = [
  "cadabra-geometry",
  "cadabra-math",
  "cadabra-numeric",
+ "cadabra-predicates",
  "resolvent",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "cadabra-ssi"
+version = "0.1.0"
+dependencies = [
+ "cadabra-geometry",
+ "cadabra-math",
+ "cadabra-numeric",
+ "cadabra-predicates",
+ "resolvent",
 ]
 
 [[package]]
@@ -286,6 +327,7 @@ name = "finitum"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "cadabra",
  "cadabra-provider",
  "malleus",
  "methodus",

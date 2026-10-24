@@ -17,6 +17,7 @@ methodus = { path = "../methodus" }
 thiserror = "2"
 
 [dev-dependencies]
+cadabra = { path = "../cadabra3/crates/cadabra" }
 quantitas = { path = "../quantitas" }
 
 [lints.rust]

@@ -2532,14 +2532,102 @@ impl RealizationPlan {
         validate_finite("residual geometry sensitivity", output)
     }
 
-    fn apply_geometry_sensitivity_cells(
+    /// Transpose of [`Self::residual_geometry_sensitivity`] in the node velocities, for stored
+    /// inputs that do not move with the geometry (every external design direction zero, such as
+    /// constant material data): writes the vertex-major node gradient
+    /// `(dR/dX)^T adjoint` at a fixed expanded state.
+    ///
+    /// Constraint rows of `adjoint` are ignored, as the forward action zeroes them. Each cell's
+    /// action is linear in its vertex velocities, so the cell's columns are evaluated exactly,
+    /// one vertex component at a time, and contracted with the cell's adjoint values.
+    pub fn residual_geometry_sensitivity_transpose(
         &self,
         time: f64,
-        value_state: &[f64],
-        direction_state: &[f64],
-        sensitivity: &GeometryParameterSensitivity,
-        output: &mut [f64],
+        state: &[f64],
+        adjoint: &[f64],
+        node_gradient: &mut [f64],
     ) -> Result<(), FinitumError> {
+        self.validate_time_action(time, state, state, adjoint)?;
+        validate_finite("geometry sensitivity adjoint", adjoint)?;
+        self.require_geometry_sensitivity_support()?;
+        let dimension = self.data.mesh.dimension();
+        let vertex_count = self.data.mesh.vertices().len();
+        if node_gradient.len() != vertex_count * dimension {
+            return Err(FinitumError::InvalidRealization(format!(
+                "geometry node gradient has length {}, expected {}",
+                node_gradient.len(),
+                vertex_count * dimension
+            )));
+        }
+        let physical_state = self.data.constraints.expand(state)?;
+        let mut free_adjoint = adjoint.to_vec();
+        for constraint in self.data.constraints.constraints() {
+            free_adjoint[constraint.target.0] = 0.0;
+        }
+        let physical_adjoint = self.data.constraints.expand_homogeneous(&free_adjoint)?;
+        let frozen = GeometryParameterSensitivity {
+            parameter_index: 0,
+            node_velocities: Vec::new(),
+            external_directions: self
+                .data
+                .external
+                .iter()
+                .filter_map(|(key, binding)| match binding {
+                    ExternalBinding::Stored(stored) => Some(ExternalSensitivityInput {
+                        integral_index: key.0,
+                        input: key.1,
+                        component_count: stored.component_count,
+                        values: vec![0.0; stored.values.len()],
+                    }),
+                    ExternalBinding::Dynamic(_) => None,
+                })
+                .collect(),
+        };
+        let directions = validate_sensitivity_inputs(self, &frozen)?;
+        let mut probe = GeometryParameterSensitivity {
+            parameter_index: 0,
+            node_velocities: vec![0.0; vertex_count * dimension],
+            external_directions: Vec::new(),
+        };
+        let zero_rate = vec![0.0; self.dimension()];
+        let mut column = vec![0.0; self.dimension()];
+        node_gradient.fill(0.0);
+        for cell_index in 0..self.data.dofs.restrictions().len() {
+            let restriction = &self.data.dofs.restrictions()[cell_index];
+            let cell = self.data.mesh.cell(CellId(cell_index)).ok_or_else(|| {
+                FinitumError::InvalidRealization(format!("mesh has no cell {cell_index}"))
+            })?;
+            for vertex in &cell.vertices {
+                for axis in 0..dimension {
+                    let slot = vertex.0 * dimension + axis;
+                    probe.node_velocities[slot] = 1.0;
+                    for dof in &restriction.dofs {
+                        column[dof.0] = 0.0;
+                    }
+                    self.apply_cell_geometry_sensitivity(
+                        cell_index,
+                        time,
+                        &physical_state,
+                        &physical_state,
+                        &zero_rate,
+                        &probe,
+                        &directions,
+                        dimension,
+                        &mut column,
+                    )?;
+                    probe.node_velocities[slot] = 0.0;
+                    node_gradient[slot] += restriction
+                        .dofs
+                        .iter()
+                        .map(|dof| physical_adjoint[dof.0] * column[dof.0])
+                        .sum::<f64>();
+                }
+            }
+        }
+        validate_finite("residual geometry sensitivity transpose", node_gradient)
+    }
+
+    fn require_geometry_sensitivity_support(&self) -> Result<(), FinitumError> {
         if !self.data.facet_regions.is_empty() {
             return Err(FinitumError::UnsupportedRealization(
                 "geometry sensitivity does not yet cover exterior facet integrals (GX-C4)".into(),
@@ -2555,6 +2643,18 @@ impl RealizationPlan {
                 "geometry sensitivity requires stored external inputs; dynamic callbacks cannot declare an exact design derivative".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn apply_geometry_sensitivity_cells(
+        &self,
+        time: f64,
+        value_state: &[f64],
+        direction_state: &[f64],
+        sensitivity: &GeometryParameterSensitivity,
+        output: &mut [f64],
+    ) -> Result<(), FinitumError> {
+        self.require_geometry_sensitivity_support()?;
         let dimension = self.data.mesh.dimension();
         let vertex_count = self.data.mesh.vertices().len();
         if sensitivity.node_velocities.len() != vertex_count * dimension {
