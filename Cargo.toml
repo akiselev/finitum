@@ -8,7 +8,9 @@ description = "Concrete discretization and global operator realization for the S
 
 [dependencies]
 blake3 = "1"
+cadabra-analysis = { path = "../cadabra3/crates/cadabra-analysis" }
 cadabra-provider = { path = "../cadabra3/crates/cadabra-provider" }
+cadabra-tessellate = { path = "../cadabra3/crates/cadabra-tessellate" }
 malleus = { path = "../malleus" }
 malleus-cranelift = { path = "../malleus/crates/malleus-cranelift", optional = true }
 scientia = { path = "../scientia" }

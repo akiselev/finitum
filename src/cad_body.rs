@@ -26,10 +26,9 @@
 
 use std::collections::BTreeMap;
 
-use cadabra_provider::{
-    BodyClosure, BrepBodyProvider, DesignName, DesignSeed, DesignVelocity, DisplayArtifact,
-    DisplaySource, ProviderError,
-};
+use cadabra_analysis::{BrepBodyProvider, DesignName, DesignSeed, DesignVelocity};
+use cadabra_provider::ProviderError;
+use cadabra_tessellate::{BodyClosure, DisplayArtifact, DisplaySource};
 use serde::Serialize;
 
 use crate::cad_profile::{ProfileOrigin, PublishedProfile, mesh_profile};
@@ -817,7 +816,7 @@ fn invert_small(m: &[[f64; 3]; 3], k: usize) -> Option<[[f64; 3]; 3]> {
 /// the vertex at `position` where three meet.
 fn support_of(
     provider: &BrepBodyProvider,
-    body: &cadabra_provider::BodyDisplay,
+    body: &cadabra_tessellate::BodyDisplay,
     faces: &[usize],
     position: [f64; 3],
     tolerance: f64,
@@ -862,8 +861,8 @@ fn support_of(
 /// Of several edges between the same two faces, the one whose display polyline passes
 /// nearest `position`.
 fn nearest_edge(
-    body: &cadabra_provider::BodyDisplay,
-    binding: &cadabra_provider::BrepBodyBinding,
+    body: &cadabra_tessellate::BodyDisplay,
+    binding: &cadabra_analysis::BrepBodyBinding,
     candidates: &[usize],
     position: [f64; 3],
 ) -> Result<usize, FinitumError> {
